@@ -172,7 +172,7 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"room_id" => "general"}
       })
 
-    assert_reply(mount_ref, :ok, %{"root_id" => "alpha-1"})
+    assert_reply(mount_ref, :ok, %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
     assert_receive {:alpha_mount, alpha_pid, %{"room_id" => "general"}, "connect-user"}
     assert_receive {:alpha_init, "general"}
 
@@ -180,7 +180,7 @@ defmodule Musubi.Transport.ConnectionChannelTest do
                     %{peer_data: %{address: {127, 0, 0, 1}}}}
 
     assert_push("patch", %{
-      "root_id" => "alpha-1",
+      "root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1",
       "ops" => [
         %{
           op: "replace",
@@ -201,11 +201,11 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"label" => "secondary"}
       })
 
-    assert_reply(second_ref, :ok, %{"root_id" => "beta-1"})
+    assert_reply(second_ref, :ok, %{"root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1"})
     assert_receive {:beta_mount, beta_pid, %{"label" => "secondary"}, "connect-user"}
 
     assert_push("patch", %{
-      "root_id" => "beta-1",
+      "root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1",
       "ops" => [
         %{
           op: "replace",
@@ -231,15 +231,15 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"room_id" => "general"}
       })
 
-    assert_reply(mount_ref, :ok, %{"root_id" => "alpha-1"})
+    assert_reply(mount_ref, :ok, %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
     assert_receive {:alpha_mount, _pid, _params, _current_user}
     assert_receive {:alpha_init, "general"}
     assert_receive {:child_init, _session, _connect_info}
-    assert_push("patch", %{"root_id" => "alpha-1", "version" => 1})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1", "version" => 1})
 
     command_ref =
       push(socket, "command", %{
-        "root_id" => "alpha-1",
+        "root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1",
         "store_id" => [],
         "name" => "rename",
         "payload" => %{"room_id" => "random"}
@@ -248,7 +248,7 @@ defmodule Musubi.Transport.ConnectionChannelTest do
     assert_reply(command_ref, :ok, %{})
 
     assert_push("patch", %{
-      "root_id" => "alpha-1",
+      "root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1",
       "version" => 2,
       "ops" => ops
     })
@@ -268,15 +268,15 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"label" => "secondary"}
       })
 
-    assert_reply(mount_ref, :ok, %{"root_id" => "beta-1"})
+    assert_reply(mount_ref, :ok, %{"root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1"})
     assert_receive {:beta_mount, beta_pid, _params, _current_user}
-    assert_push("patch", %{"root_id" => "beta-1"})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1"})
 
     beta_down = Process.monitor(beta_pid)
 
     missing_name_ref =
       push(socket, "command", %{
-        "root_id" => "beta-1",
+        "root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1",
         "store_id" => [],
         "payload" => %{"label" => "bad"}
       })
@@ -286,14 +286,14 @@ defmodule Musubi.Transport.ConnectionChannelTest do
 
     command_ref =
       push(socket, "command", %{
-        "root_id" => "beta-1",
+        "root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1",
         "store_id" => [],
         "name" => "rename",
         "payload" => %{"label" => "still-mounted"}
       })
 
     assert_reply(command_ref, :ok, %{})
-    assert_push("patch", %{"root_id" => "beta-1", "ops" => [%{path: "/label"}]})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1", "ops" => [%{path: "/label"}]})
   end
 
   test "unknown command replies with an error without stopping mounted roots" do
@@ -307,17 +307,17 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"room_id" => "general"}
       })
 
-    assert_reply(mount_ref, :ok, %{"root_id" => "alpha-1"})
+    assert_reply(mount_ref, :ok, %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
     assert_receive {:alpha_mount, alpha_pid, _params, _current_user}
     assert_receive {:alpha_init, "general"}
     assert_receive {:child_init, _session, _connect_info}
-    assert_push("patch", %{"root_id" => "alpha-1"})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
 
     alpha_down = Process.monitor(alpha_pid)
 
     unknown_ref =
       push(socket, "command", %{
-        "root_id" => "alpha-1",
+        "root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1",
         "store_id" => ["child"],
         "name" => "missing",
         "payload" => %{}
@@ -328,14 +328,14 @@ defmodule Musubi.Transport.ConnectionChannelTest do
 
     command_ref =
       push(socket, "command", %{
-        "root_id" => "alpha-1",
+        "root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1",
         "store_id" => [],
         "name" => "rename",
         "payload" => %{"room_id" => "still-mounted"}
       })
 
     assert_reply(command_ref, :ok, %{})
-    assert_push("patch", %{"root_id" => "alpha-1", "ops" => ops})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1", "ops" => ops})
     assert %{op: "replace", path: "/room_id", value: "still-mounted"} in ops
   end
 
@@ -364,7 +364,7 @@ defmodule Musubi.Transport.ConnectionChannelTest do
     refute_receive {:alpha_mount, _pid, _params, _current_user}
   end
 
-  test "mount rejects duplicate root ids" do
+  test "mount rejects duplicate (module, id) on one connection" do
     {:ok, _reply, socket} = join_connection()
     assert_receive {:connection_join, _params, _current_user}
 
@@ -375,20 +375,52 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"room_id" => "general"}
       })
 
-    assert_reply(first_ref, :ok, %{"root_id" => "shared-root"})
+    composite = @alpha_module_str <> ":shared-root"
+    assert_reply(first_ref, :ok, %{"root_id" => ^composite})
     assert_receive {:alpha_mount, _pid, _params, _current_user}
     assert_receive {:alpha_init, "general"}
     assert_receive {:child_init, _session, _connect_info}
-    assert_push("patch", %{"root_id" => "shared-root"})
+    assert_push("patch", %{"root_id" => ^composite})
 
     duplicate_ref =
       push(socket, "mount", %{
-        "module" => @beta_module_str,
+        "module" => @alpha_module_str,
         "id" => "shared-root",
-        "params" => %{"label" => "secondary"}
+        "params" => %{"room_id" => "other"}
       })
 
     assert_reply(duplicate_ref, :error, %{reason: "root already mounted"})
+  end
+
+  test "mount permits the same caller id under different modules" do
+    {:ok, _reply, socket} = join_connection()
+    assert_receive {:connection_join, _params, _current_user}
+
+    alpha_ref =
+      push(socket, "mount", %{
+        "module" => @alpha_module_str,
+        "id" => "shared",
+        "params" => %{"room_id" => "general"}
+      })
+
+    alpha_root = @alpha_module_str <> ":shared"
+    assert_reply(alpha_ref, :ok, %{"root_id" => ^alpha_root})
+    assert_receive {:alpha_mount, _pid, _params, _current_user}
+    assert_receive {:alpha_init, "general"}
+    assert_receive {:child_init, _session, _connect_info}
+    assert_push("patch", %{"root_id" => ^alpha_root})
+
+    beta_ref =
+      push(socket, "mount", %{
+        "module" => @beta_module_str,
+        "id" => "shared",
+        "params" => %{"label" => "secondary"}
+      })
+
+    beta_root = @beta_module_str <> ":shared"
+    assert_reply(beta_ref, :ok, %{"root_id" => ^beta_root})
+    assert_receive {:beta_mount, _pid, _params, _current_user}
+    assert_push("patch", %{"root_id" => ^beta_root})
   end
 
   test "unmount stops only the addressed root store" do
@@ -402,11 +434,11 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"room_id" => "general"}
       })
 
-    assert_reply(alpha_ref, :ok, %{"root_id" => "alpha-1"})
+    assert_reply(alpha_ref, :ok, %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
     assert_receive {:alpha_mount, alpha_pid, _params, _current_user}
     assert_receive {:alpha_init, "general"}
     assert_receive {:child_init, _session, _connect_info}
-    assert_push("patch", %{"root_id" => "alpha-1"})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
 
     beta_ref =
       push(socket, "mount", %{
@@ -415,32 +447,32 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"label" => "secondary"}
       })
 
-    assert_reply(beta_ref, :ok, %{"root_id" => "beta-1"})
+    assert_reply(beta_ref, :ok, %{"root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1"})
     assert_receive {:beta_mount, beta_pid, _params, _current_user}
-    assert_push("patch", %{"root_id" => "beta-1"})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1"})
 
     alpha_down = Process.monitor(alpha_pid)
     beta_down = Process.monitor(beta_pid)
 
-    unmount_ref = push(socket, "unmount", %{"root_id" => "alpha-1"})
+    unmount_ref = push(socket, "unmount", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
     assert_reply(unmount_ref, :ok, %{})
     assert_receive {:DOWN, ^alpha_down, :process, ^alpha_pid, {:shutdown, :unmounted}}
     refute_receive {:DOWN, ^beta_down, :process, ^beta_pid, _reason}
 
     command_ref =
       push(socket, "command", %{
-        "root_id" => "beta-1",
+        "root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1",
         "store_id" => [],
         "name" => "rename",
         "payload" => %{"label" => "still-mounted"}
       })
 
     assert_reply(command_ref, :ok, %{})
-    assert_push("patch", %{"root_id" => "beta-1", "ops" => [%{path: "/label"}]})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1", "ops" => [%{path: "/label"}]})
 
     removed_command_ref =
       push(socket, "command", %{
-        "root_id" => "alpha-1",
+        "root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1",
         "store_id" => [],
         "name" => "rename",
         "payload" => %{"room_id" => "gone"}
@@ -448,7 +480,7 @@ defmodule Musubi.Transport.ConnectionChannelTest do
 
     assert_reply(removed_command_ref, :error, %{reason: "unknown root"})
 
-    second_unmount_ref = push(socket, "unmount", %{"root_id" => "alpha-1"})
+    second_unmount_ref = push(socket, "unmount", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
     assert_reply(second_unmount_ref, :error, %{reason: "unknown root"})
   end
 
@@ -463,11 +495,11 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"room_id" => "general"}
       })
 
-    assert_reply(alpha_ref, :ok, %{"root_id" => "alpha-1"})
+    assert_reply(alpha_ref, :ok, %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
     assert_receive {:alpha_mount, alpha_pid, _params, _current_user}
     assert_receive {:alpha_init, "general"}
     assert_receive {:child_init, _session, _connect_info}
-    assert_push("patch", %{"root_id" => "alpha-1"})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.AlphaRootStore:alpha-1"})
 
     beta_ref =
       push(socket, "mount", %{
@@ -476,9 +508,9 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"label" => "secondary"}
       })
 
-    assert_reply(beta_ref, :ok, %{"root_id" => "beta-1"})
+    assert_reply(beta_ref, :ok, %{"root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1"})
     assert_receive {:beta_mount, beta_pid, _params, _current_user}
-    assert_push("patch", %{"root_id" => "beta-1"})
+    assert_push("patch", %{"root_id" => "Musubi.Transport.ConnectionChannelTest.BetaRootStore:beta-1"})
 
     alpha_down = Process.monitor(alpha_pid)
     beta_down = Process.monitor(beta_pid)

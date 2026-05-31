@@ -57,12 +57,17 @@ export interface ConnectionListener {
 
 export interface RootConnection {
   readonly module: string
-  readonly id: string
+  // Caller-supplied `MountStoreOptions.id` — sent in the mount payload so
+  // the server can compose the canonical root id.
+  readonly callerId: string
   readonly connection: ConnectionState
   readonly mountParams: Record<string, unknown>
 
+  // Server-assigned wire root_id. Empty until the mount reply arrives;
+  // once set, doubles as the key in `ConnectionState.roots`.
+  id: string
+
   // Mutable runtime state — read by the proxy on every property access.
-  refCount: number
   channel: ChannelLike | undefined
   channelGeneration: number
   root: unknown
@@ -156,28 +161,27 @@ export function mountConnectionRoot(
   connectionState: ConnectionState,
   options: MountConnectionRootOptions
 ): { connection: RootConnection; ready: Promise<void> } {
-  // Wire `root_id` composes `(module, id)` so two stores of different modules
-  // can share the same caller-supplied id without colliding either locally
-  // or on the server. The server treats this string as opaque.
+  // No client-side dedup: every caller gets its own RootConnection and its
+  // own server mount. The server is the sole authority on duplicate root
+  // ids and will reply with `:already_mounted` if the same `(module, id)`
+  // is mounted twice on one connection. Consumers that want sharing across
+  // components layer their own ref-counting on top (e.g. `@musubi/react`'s
+  // `pendingRootMounts`).
+  //
+  // Wire `root_id` is composed by the server as `"<module>:<callerId>"` and
+  // echoed back in the mount reply. We compute the same composite locally
+  // so the `connectionState.roots` Map entry exists before the initial
+  // patch arrives — under mocked channels the patch can land in the same
+  // call stack as the mount reply, so we cannot wait for the reply
+  // microtask to insert. The mount reply still validates the server agrees.
   const rootId = `${options.module}:${options.id}`
-  const existing = connectionState.roots.get(rootId)
-
-  // Don't pre-reject duplicates locally — the server is the source of truth
-  // for "already mounted" and will reply with an `:already_mounted` error
-  // when appropriate. Reusing the existing entry lets concurrent mount
-  // attempts (e.g. React StrictMode effect replay, HMR remounts) attach
-  // to the in-flight mount instead of crashing on a stale local view.
-  if (existing) {
-    existing.refCount += 1
-    return { connection: existing, ready: ensureConnectionRootMounted(existing) }
-  }
 
   const connection: RootConnection = {
     module: options.module,
+    callerId: options.id,
     id: rootId,
     connection: connectionState,
     mountParams: options.params ?? {},
-    refCount: 1,
     channel: undefined,
     channelGeneration: 0,
     root: undefined,
@@ -208,27 +212,26 @@ export function mountConnectionRoot(
 }
 
 export async function unmountConnectionRoot(connection: RootConnection): Promise<void> {
-  connection.refCount -= 1
+  const connectionState = connection.connection
+  const rootId = connection.id
 
-  if (connection.refCount > 0) {
+  if (!connectionState.roots.has(rootId)) {
     return
   }
-
-  const connectionState = connection.connection
 
   connection.pendingConnect?.reject(new Error("Unmounted"))
   connection.pendingConnect = null
   rejectPendingCommands(connection, new Error("Unmounted"))
   resetConnectionState(connection)
   connection.channel = undefined
-  connectionState.roots.delete(connection.id)
+  connectionState.roots.delete(rootId)
 
   if (!connectionState.channel) {
     return
   }
 
   await receivePush(
-    connectionState.channel.push("unmount", { root_id: connection.id }) as PushLike,
+    connectionState.channel.push("unmount", { root_id: rootId }) as PushLike,
     "Root unmount"
   )
 }
@@ -446,13 +449,17 @@ async function doMountConnectionRoot(
     const reply = await receivePush(
       connectionState.channel.push("mount", {
         module: connection.module,
-        id: connection.id,
+        id: connection.callerId,
         params: connection.mountParams ?? {}
       }) as PushLike,
       "Root mount"
     )
 
-    validateMountReply(connection, reply)
+    const assignedRootId = extractRootIdFromMountReply(reply)
+
+    if (assignedRootId !== connection.id) {
+      throw new Error(`Root mount returned unexpected root_id: ${assignedRootId}`)
+    }
   } catch (error) {
     connection.pendingConnect = null
     connection.channel = undefined
@@ -462,16 +469,12 @@ async function doMountConnectionRoot(
   await initialPatch
 }
 
-function validateMountReply(connection: RootConnection, reply: unknown): void {
-  if (!isRecord(reply)) {
-    return
+function extractRootIdFromMountReply(reply: unknown): string {
+  if (isRecord(reply) && typeof reply.root_id === "string" && reply.root_id !== "") {
+    return reply.root_id
   }
 
-  const rootId = reply.root_id
-
-  if (typeof rootId === "string" && rootId !== connection.id) {
-    throw new Error(`Root mount returned unexpected root_id: ${rootId}`)
-  }
+  throw new Error(`Root mount reply missing root_id: ${JSON.stringify(reply)}`)
 }
 
 function handlePatch(

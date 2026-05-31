@@ -247,7 +247,7 @@ describe("connect", () => {
     expect(mountPush.event).toBe("mount")
     expect(mountPush.payload).toEqual({
       module: "Test.Store",
-      id: "Test.Store:alpha-1",
+      id: "alpha-1",
       params: { room_id: "general" }
     })
 
@@ -381,17 +381,21 @@ describe("connect", () => {
     const firstPushCount = channel.pushes.length
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared-root" })
     channel.emit("patch", initialConnectionEnvelope("Test.Store:shared-root", rootState()))
-    const firstMounted = await firstPromise
+    await firstPromise
 
-    const secondMounted = await connection.mountStore({
+    // No client-side dedup: a second mount for the same (module, id) hits
+    // the wire, and the server is the single source of truth for duplicate
+    // detection. Here we simulate the `:already_mounted` rejection.
+    const secondPromise = connection.mountStore({
       module: "Test.Store",
       id: "shared-root"
     })
-
-    expect(secondMounted.store).toBe(firstMounted.store)
-    // No second mount push: dedup reuses the in-memory entry. The server is
-    // the source of truth for duplicate-mount errors; locally we just attach.
-    expect(channel.pushes.length).toBe(firstPushCount)
+    await Promise.resolve()
+    expect(channel.pushes.length).toBe(firstPushCount + 1)
+    const secondMountPush = lastPush(channel)
+    expect(secondMountPush.event).toBe("mount")
+    secondMountPush.push.resolve("error", { reason: "root already mounted" })
+    await expect(secondPromise).rejects.toThrow(/root already mounted/)
   })
 
   test("distinct modules sharing one id get distinct server mounts and patches", async () => {
@@ -409,11 +413,11 @@ describe("connect", () => {
     await Promise.resolve()
     const firstMountPush = lastPush(channel)
     expect(firstMountPush.event).toBe("mount")
-    // Wire `id` composes module + caller id so the server treats distinct
-    // (module, id) pairs as distinct roots.
+    // Server composes the canonical wire root id as `"<module>:<id>"` so
+    // distinct modules sharing one caller id get distinct roots end-to-end.
     expect(firstMountPush.payload).toMatchObject({
       module: "Test.Store",
-      id: "Test.Store:shared"
+      id: "shared"
     })
     firstMountPush.push.resolve("ok", { root_id: "Test.Store:shared" })
     channel.emit("patch", initialConnectionEnvelope("Test.Store:shared", rootState()))
@@ -428,7 +432,7 @@ describe("connect", () => {
     expect(secondMountPush.event).toBe("mount")
     expect(secondMountPush.payload).toMatchObject({
       module: "Test.Other",
-      id: "Test.Other:shared"
+      id: "shared"
     })
     secondMountPush.push.resolve("ok", { root_id: "Test.Other:shared" })
     channel.emit(
@@ -457,7 +461,7 @@ describe("connect", () => {
     expect(first.store.counter).toBe(7)
   })
 
-  test("shared root unmount waits for the last caller handle", async () => {
+  test("unmount sends the unmount push using the server-assigned root_id", async () => {
     const { connect } = await import("../src/connect")
     const socket = new MockSocket()
     const connectionPromise = connect<TestStores>(socket)
@@ -465,35 +469,24 @@ describe("connect", () => {
     channel.resolveJoin()
     const connection = await connectionPromise
 
-    const firstPromise = connection.mountStore({
+    const mountedPromise = connection.mountStore({
       module: "Test.Store",
       id: "shared-root"
     })
     await Promise.resolve()
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared-root" })
     channel.emit("patch", initialConnectionEnvelope("Test.Store:shared-root", rootState()))
+    const mounted = await mountedPromise
 
-    const firstMounted = await firstPromise
-    const secondMounted = await connection.mountStore({
-      module: "Test.Store",
-      id: "shared-root"
-    })
-    const pushCountBeforeUnmount = channel.pushes.length
-
-    await firstMounted.unmount()
-    expect(channel.pushes.length).toBe(pushCountBeforeUnmount)
-    expect(firstMounted.store.title).toBe("Inbox")
-
-    const secondUnmountPromise = secondMounted.unmount()
+    const unmountPromise = mounted.unmount()
     const unmountPush = lastPush(channel)
-
     expect(unmountPush.event).toBe("unmount")
     expect(unmountPush.payload).toEqual({ root_id: "Test.Store:shared-root" })
 
     unmountPush.push.resolve("ok", {})
-    await secondUnmountPromise
+    await unmountPromise
 
-    expect(firstMounted.store.title).toBeUndefined()
+    expect(mounted.store.title).toBeUndefined()
   })
 
   test("snapshot returns a plain object tree", async () => {

@@ -137,7 +137,7 @@ defmodule Musubi.Transport.UploadConnectionTest do
   test "allow_upload on a child store_id resolves the child upload", %{socket: socket} do
     push_ref =
       push(socket, "allow_upload", %{
-        "root_id" => "cart-1",
+        "root_id" => "Musubi.Transport.UploadConnectionTest.CartStore:cart-1",
         "store_id" => ["lines", "line-2"],
         "name" => "attachment",
         "entries" => [
@@ -156,7 +156,7 @@ defmodule Musubi.Transport.UploadConnectionTest do
   test "allow_upload on the root rejects when the upload is not declared there", %{socket: socket} do
     push_ref =
       push(socket, "allow_upload", %{
-        "root_id" => "cart-1",
+        "root_id" => "Musubi.Transport.UploadConnectionTest.CartStore:cart-1",
         "store_id" => [],
         "name" => "attachment",
         "entries" => [
@@ -171,7 +171,7 @@ defmodule Musubi.Transport.UploadConnectionTest do
   test "cancel_upload routes by child store_id", %{socket: socket} do
     push_ref =
       push(socket, "allow_upload", %{
-        "root_id" => "cart-1",
+        "root_id" => "Musubi.Transport.UploadConnectionTest.CartStore:cart-1",
         "store_id" => ["lines", "line-1"],
         "name" => "attachment",
         "entries" => [
@@ -184,7 +184,7 @@ defmodule Musubi.Transport.UploadConnectionTest do
 
     push_ref =
       push(socket, "cancel_upload", %{
-        "root_id" => "cart-1",
+        "root_id" => "Musubi.Transport.UploadConnectionTest.CartStore:cart-1",
         "store_id" => ["lines", "line-1"],
         "name" => "attachment",
         "ref" => entry_ref
@@ -209,7 +209,7 @@ defmodule Musubi.Transport.UploadConnectionTest do
     test "client-pushed upload_error emits {op: error, code: external_failed}", %{socket: socket} do
       push_ref =
         push(socket, "allow_upload", %{
-          "root_id" => "ext-1",
+          "root_id" => "Musubi.Transport.UploadConnectionTest.ExternalStore:ext-1",
           "store_id" => [],
           "name" => "avatar",
           "entries" => [
@@ -222,7 +222,7 @@ defmodule Musubi.Transport.UploadConnectionTest do
 
       push_ref =
         push(socket, "upload_error", %{
-          "root_id" => "ext-1",
+          "root_id" => "Musubi.Transport.UploadConnectionTest.ExternalStore:ext-1",
           "store_id" => [],
           "name" => "avatar",
           "ref" => entry_ref,
@@ -236,7 +236,7 @@ defmodule Musubi.Transport.UploadConnectionTest do
     test "unknown error codes degrade to external_failed", %{socket: socket} do
       push_ref =
         push(socket, "allow_upload", %{
-          "root_id" => "ext-1",
+          "root_id" => "Musubi.Transport.UploadConnectionTest.ExternalStore:ext-1",
           "store_id" => [],
           "name" => "avatar",
           "entries" => [
@@ -251,7 +251,7 @@ defmodule Musubi.Transport.UploadConnectionTest do
       # does not let the client invent arbitrary `Musubi.Upload.Error.code()`.
       push_ref =
         push(socket, "upload_error", %{
-          "root_id" => "ext-1",
+          "root_id" => "Musubi.Transport.UploadConnectionTest.ExternalStore:ext-1",
           "store_id" => [],
           "name" => "avatar",
           "ref" => entry_ref,

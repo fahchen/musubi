@@ -69,8 +69,9 @@ defmodule Musubi.Transport.ConnectionChannel do
           {:reply, {:ok, map()} | {:error, map()}, Phoenix.Socket.t()}
   def handle_in("mount", payload, %Phoenix.Socket{} = socket) when is_map(payload) do
     with {:ok, module_str} <- fetch_string(payload, "module"),
-         {:ok, root_id} <- fetch_root_id(payload),
+         {:ok, caller_id} <- fetch_root_id(payload),
          {:ok, params} <- fetch_params(payload),
+         root_id <- compose_root_id(module_str, caller_id),
          :ok <- ensure_root_not_mounted(socket, root_id),
          {:ok, root_module} <- fetch_declared_root(socket, module_str),
          :ok <- ensure_root_store(root_module),
@@ -237,6 +238,18 @@ defmodule Musubi.Transport.ConnectionChannel do
       value when is_binary(value) and value != "" -> {:ok, value}
       _other -> {:error, :missing_root_id}
     end
+  end
+
+  # Connection-wide wire root_id composes the declared module string with the
+  # caller-supplied id so two roots of different modules can share one caller
+  # id on a single connection without colliding in `mounted_roots` or the
+  # patch envelope. The composed string is opaque to downstream consumers —
+  # they receive it back in the mount reply and round-trip it on subsequent
+  # `unmount` / `command` / `patch` payloads.
+  @spec compose_root_id(String.t(), String.t()) :: String.t()
+  defp compose_root_id(module_str, caller_id)
+       when is_binary(module_str) and is_binary(caller_id) do
+    module_str <> ":" <> caller_id
   end
 
   @spec fetch_params(map()) :: {:ok, map()} | {:error, :invalid_params}
