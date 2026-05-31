@@ -866,7 +866,9 @@ describe("connect", () => {
         root_id: "Test.Store:alpha-1"
       })
 
-      // Let recovery's catch run + handleConnectionDisconnect cascade.
+      // Let recovery's catch run + disconnectConnectionState cascade
+      // (which leaves the channel and removes the runtime entry on top
+      // of clearing local state).
       await new Promise<void>((resolve) => setTimeout(resolve, 0))
 
       expect(unhandled).toEqual([])
