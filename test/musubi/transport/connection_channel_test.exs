@@ -423,7 +423,18 @@ defmodule Musubi.Transport.ConnectionChannelTest do
         "params" => %{"room_id" => "other"}
       })
 
-    assert_reply(duplicate_ref, :error, %{reason: "root already mounted"})
+    # Server replies :error with the canonical "already_mounted" reason and
+    # the existing root_id so the client can alias to its local
+    # RootConnection instead of treating it as a hard error. Mount replies
+    # (both :ok and the :already_mounted :error variant) use string keys to
+    # mirror the wire JSON shape and stay symmetric with patch envelopes;
+    # other :error fallthroughs (`"missing root id"`, `"unknown root"`, …)
+    # keep the atom-keyed `%{reason: ...}` convention because they're built
+    # from internal error symbols via `error_reason/1`.
+    assert_reply(duplicate_ref, :error, %{
+      "reason" => "already_mounted",
+      "root_id" => ^composite
+    })
   end
 
   test "mount permits the same caller id under different modules" do

@@ -70,13 +70,11 @@ function buildConnectionApi<R>(connectionState: ConnectionState): MusubiConnecti
     async mountStore<M extends StoreModule<R>>(
       options: MountStoreOptions<M, R>
     ): Promise<MountedStore<M, R>> {
-      const { connection, ready } = mountConnectionRoot(connectionState, {
+      const connection = await mountConnectionRoot(connectionState, {
         module: options.module,
         id: options.id,
         ...(options.params !== undefined ? { params: options.params } : {})
       })
-
-      await ready
 
       const store = getRootProxy<M, R>(connection)
       let unmounted = false

@@ -11,6 +11,22 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Transport / `@musubi/client`** — Restored multi-observer ergonomics
+  regressed in 0.7.0. The server's `:already_mounted` reply on duplicate
+  `(module, id)` now carries the existing `root_id`; the client aliases
+  to its local `RootConnection`, bumps a local refCount, and shares one
+  `StoreProxy` across all consumers. The last `unmount` defers the server
+  push via a brief grace timer so a route-swap remount within the same
+  React commit batch cancels the teardown. Out-of-sync state (server
+  reports mounted, client has no record) surfaces as
+  `MusubiInconsistencyError` instead of being swallowed. Dev-mode warns
+  when an alias has different `params` than the original mount. Wire
+  protocol additions: `:already_mounted` `:error` reply payload now
+  carries `"root_id"`. The 0.7.0 cross-module isolation
+  (`"<module>:<caller-id>"` composite root_id) is unchanged.
+
 ## [0.7.0] — 2026-05-31
 
 ### Changed (breaking — wire protocol)
