@@ -11,6 +11,8 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-05-31
+
 ### Fixed
 
 - **Transport / `@musubi/client`** — Restored multi-observer ergonomics
@@ -25,7 +27,35 @@ not in lockstep yet; entries note which surface they affect.
   when an alias has different `params` than the original mount. Wire
   protocol additions: `:already_mounted` `:error` reply payload now
   carries `"root_id"`. The 0.7.0 cross-module isolation
-  (`"<module>:<caller-id>"` composite root_id) is unchanged.
+  (`"<module>:<caller-id>"` composite root_id) is unchanged (#67).
+- **`@musubi/client`** — Hardened the mount / unmount / disconnect
+  interplay against several real edge cases (#68). Mid-mount disconnect
+  no longer surfaces as an unhandled rejection: the in-flight
+  tentative's initial-patch waiter is now shielded by a pre-attached
+  `.catch` so rejecting before any awaiter is observing is safe, and
+  the mount push is settled synchronously via a `cancelMountPush` hook
+  so the caller doesn't wait for Phoenix's push timeout. Version-mismatch
+  recovery that hits a stale `:already_mounted` reply (server still
+  has our entry after our recovery `unmount` push failed to land) no
+  longer hangs forever waiting for an initial patch the server won't
+  re-emit — it logs and force-cascades a full
+  `disconnectConnectionState` (channel left + runtime entry removed)
+  so consumers see a clean tear-down. Grace-timer cancellation
+  (alias-remount, disconnect) now settles the awaiting `unmount()`
+  caller through a `pendingUnmountResolver` rather than hanging it
+  forever. The grace timer skips teardown when a concurrent mount for
+  the same `(module, callerId)` is in flight, and
+  `mountConnectionRoot`'s `finally` re-arms teardown for any root left
+  orphaned because that pending mount then settled `:error` instead of
+  aliasing. `channel.leave()` is now called with `connectionState.channel`
+  pre-cleared and inside a `try/finally` that guarantees `roots` and
+  the runtime entry are dropped even if `leave()` throws synchronously.
+  `handleConnectionDisconnect` now clears `connectionState.roots` (was
+  only `disconnectConnectionState`) so a subsequent mount on the
+  reconnecting state can't alias to a disconnected entry. Server-side
+  unmount-push failures are now logged via `console.warn` instead of
+  bubbling to the consumer's `await mounted.unmount()` — local state
+  is already torn down by then; the release promise resolves cleanly.
 
 ## [0.7.0] — 2026-05-31
 
@@ -203,7 +233,8 @@ Initial public release of the Musubi runtime (then `Arbor`):
 - TypeScript client and React adapter that materialize the diff stream
   into immutable snapshots.
 
-[Unreleased]: https://github.com/fahchen/musubi/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/fahchen/musubi/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/fahchen/musubi/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/fahchen/musubi/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/fahchen/musubi/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/fahchen/musubi/compare/v0.5.0...v0.6.0
