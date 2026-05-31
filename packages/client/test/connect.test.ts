@@ -781,12 +781,22 @@ describe("connect", () => {
       const connection = await connectionPromise
 
       // Kick off a mount, then disconnect before the mount reply arrives.
-      void connection.mountStore({ module: "Test.Store", id: "alpha-1" })
+      const mountedPromise = connection.mountStore({
+        module: "Test.Store",
+        id: "alpha-1"
+      })
       await Promise.resolve()
       const mountPush = lastPush(channel)
       expect(mountPush.event).toBe("mount")
 
       await connection.disconnect()
+
+      // Even if a stale `:ok` reply lands after disconnect (mocked here),
+      // the mount caller must settle — not hang — because the tentative's
+      // initial-patch waiter was rejected by the disconnect handler.
+      mountPush.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+
+      await expect(mountedPromise).rejects.toThrow(/Disconnected/)
 
       // Let any micro/macrotasks settle so an unhandled rejection would
       // have surfaced by now.

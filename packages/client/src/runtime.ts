@@ -345,9 +345,17 @@ function registerInitialPatchWaiter(
   connection: RootConnection,
   generation: number
 ): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
+  const promise = new Promise<void>((resolve, reject) => {
     connection.pendingConnect = { generation, resolve, reject }
   })
+  // Pre-attach a no-op `.catch` on the original promise so a rejection
+  // arriving before anyone explicitly awaits it (e.g. disconnect firing
+  // mid-mount, before `pushMount` has returned and `mountConnectionRoot`
+  // reaches the `await tentativeInitialPatch` line) doesn't surface as
+  // an unhandled rejection. The original promise stays in its rejected
+  // state; subsequent `await` callers still observe the rejection.
+  promise.catch(() => undefined)
+  return promise
 }
 
 function cancelGraceTimer(connection: RootConnection): void {
@@ -468,15 +476,16 @@ export async function disconnectConnectionState(
 ): Promise<void> {
   const disconnectError = new Error("Disconnected")
 
-  // In-flight `mountConnectionRoot` tentatives haven't yet been awaited
-  // on their initial-patch promise (that happens only in the `:ok`
-  // branch after `pushMount` returns). Clearing `pendingConnect` —
-  // without rejecting it — avoids surfacing an unhandled rejection on
-  // a promise no one is observing. The outer `pushMount` await unblocks
-  // via Phoenix's default push timeout when the channel goes away;
-  // `mountConnectionRoot` then takes the `:error` branch and surfaces
-  // the failure to its actual awaiter.
+  // Reject the initial-patch waiter on in-flight tentatives so that if
+  // the mount push later returns `:ok` (after a brief disconnect that
+  // didn't kill the push), `mountConnectionRoot`'s `await
+  // tentativeInitialPatch` immediately throws and surfaces the
+  // disconnect to the mount caller instead of hanging. The waiter
+  // promise is shielded by a no-op `.catch` attached at creation in
+  // `registerInitialPatchWaiter`, so rejecting before anyone awaits
+  // doesn't surface as an unhandled rejection.
   for (const pending of connectionState.pendingMounts) {
+    pending.pendingConnect?.reject(disconnectError)
     pending.pendingConnect = null
   }
   connectionState.pendingMounts.clear()
@@ -491,16 +500,23 @@ export async function disconnectConnectionState(
     root.channel = undefined
   }
 
-  if (connectionState.channel) {
-    connectionState.suppressDisconnectEvent = true
-    connectionState.channel.leave()
-    connectionState.channel = undefined
+  // Make sure `roots` and the runtime entry are cleared even if
+  // `channel.leave()` throws synchronously (custom socket impl or
+  // mid-leave channel state). Without this guard a thrown `leave()`
+  // would leak the connection in `runtime.connections` and any future
+  // `openConnectionState` for the same topic would resurrect the
+  // (now-broken) connection instead of opening a fresh one.
+  try {
+    if (connectionState.channel) {
+      connectionState.suppressDisconnectEvent = true
+      connectionState.channel.leave()
+      connectionState.channel = undefined
+    }
+  } finally {
+    connectionState.roots.clear()
+    const runtime = getSharedRuntime(connectionState.socket)
+    runtime.connections.delete(connectionState.topic)
   }
-
-  connectionState.roots.clear()
-
-  const runtime = getSharedRuntime(connectionState.socket)
-  runtime.connections.delete(connectionState.topic)
 }
 
 export function subscribeStore(
@@ -951,9 +967,12 @@ function handleConnectionDisconnect(
 ): void {
   const disconnectError = new Error("Disconnected")
 
-  // See `disconnectConnectionState` for the rationale on not rejecting
-  // pendingConnect for in-flight tentatives.
+  // See `disconnectConnectionState` for the rationale: the
+  // `registerInitialPatchWaiter` shield handles the no-awaiter case;
+  // rejecting ensures the mount caller surfaces an error if the push
+  // happens to come back `:ok` after the channel closed.
   for (const pending of connectionState.pendingMounts) {
+    pending.pendingConnect?.reject(disconnectError)
     pending.pendingConnect = null
   }
   connectionState.pendingMounts.clear()
