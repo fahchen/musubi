@@ -809,6 +809,50 @@ describe("connect", () => {
     }
   })
 
+  test("disconnect between mount :ok and initial patch rejects mountStore promptly", async () => {
+    // Disconnect timing variant: server has already replied :ok and the
+    // tentative is in `connectionState.roots`, but the initial patch
+    // hasn't landed yet. Disconnect must surface to the mount caller
+    // through the `:ok` branch's `await tentativeInitialPatch`, not
+    // hang indefinitely.
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on("unhandledRejection", onUnhandled)
+
+    try {
+      const { connect } = await import("../src/connect")
+      const socket = new MockSocket()
+      const connectionPromise = connect<TestStores>(socket)
+      const channel = lastChannel(socket)
+      channel.resolveJoin()
+      const connection = await connectionPromise
+
+      const mountedPromise = connection.mountStore({
+        module: "Test.Store",
+        id: "alpha-1"
+      })
+      await Promise.resolve()
+
+      // Server replies :ok — `mountConnectionRoot` enters its `:ok` branch,
+      // inserts into `roots`, and starts awaiting the initial patch.
+      lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+      await Promise.resolve()
+
+      // Disconnect now — patch never arrives.
+      await connection.disconnect()
+
+      await expect(mountedPromise).rejects.toThrow(/Disconnected/)
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+      expect(unhandled).toEqual([])
+      expect(channel.left).toBe(true)
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+    }
+  })
+
   test("recovery from version mismatch hitting :already_mounted disconnects cleanly", async () => {
     // Pre-fix behaviour: `remountExistingConnection` threw on
     // `:already_mounted`, which bubbled out of
