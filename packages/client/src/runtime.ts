@@ -162,24 +162,20 @@ export function mountConnectionRoot(
   options: MountConnectionRootOptions
 ): { connection: RootConnection; ready: Promise<void> } {
   // No client-side dedup: every caller gets its own RootConnection and its
-  // own server mount. The server is the sole authority on duplicate root
-  // ids and will reply with `:already_mounted` if the same `(module, id)`
-  // is mounted twice on one connection. Consumers that want sharing across
-  // components layer their own ref-counting on top (e.g. `@musubi/react`'s
-  // `pendingRootMounts`).
+  // own server mount. The server is the sole authority on duplicates and
+  // replies with `:already_mounted` if the same `(module, id)` is mounted
+  // twice on one connection. Consumers that need sharing layer their own
+  // ref-counting (e.g. `@musubi/react`'s `pendingRootMounts`).
   //
-  // Wire `root_id` is composed by the server as `"<module>:<callerId>"` and
-  // echoed back in the mount reply. We compute the same composite locally
-  // so the `connectionState.roots` Map entry exists before the initial
-  // patch arrives — under mocked channels the patch can land in the same
-  // call stack as the mount reply, so we cannot wait for the reply
-  // microtask to insert. The mount reply still validates the server agrees.
-  const rootId = `${options.module}:${options.id}`
-
+  // The wire `root_id` is whatever the server returns from the mount reply
+  // — opaque to the client. We don't insert into `connectionState.roots`
+  // until the reply lands, so patches for this root can't arrive before
+  // its id is known anyway (the server only emits the initial patch after
+  // the mount succeeds).
   const connection: RootConnection = {
     module: options.module,
     callerId: options.id,
-    id: rootId,
+    id: "",
     connection: connectionState,
     mountParams: options.params ?? {},
     channel: undefined,
@@ -198,11 +194,11 @@ export function mountConnectionRoot(
     recovering: false
   }
 
-  connectionState.roots.set(rootId, connection)
-
   const ready = ensureConnectionRootMounted(connection).catch((error) => {
-    if (connection.version === 0) {
-      connectionState.roots.delete(rootId)
+    // Drop the map entry if the mount got far enough to be inserted before
+    // it failed; pre-reply failures never inserted, so this is a no-op.
+    if (connection.id !== "") {
+      connectionState.roots.delete(connection.id)
     }
 
     throw error
@@ -457,9 +453,15 @@ async function doMountConnectionRoot(
 
     const assignedRootId = extractRootIdFromMountReply(reply)
 
-    if (assignedRootId !== connection.id) {
+    // Recovery (`recoverConnectionRootFromVersionMismatch`) re-uses the
+    // same connection across remounts; the server-assigned root id must
+    // stay stable.
+    if (connection.id !== "" && connection.id !== assignedRootId) {
       throw new Error(`Root mount returned unexpected root_id: ${assignedRootId}`)
     }
+
+    connection.id = assignedRootId
+    connectionState.roots.set(assignedRootId, connection)
   } catch (error) {
     connection.pendingConnect = null
     connection.channel = undefined

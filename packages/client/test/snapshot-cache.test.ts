@@ -217,6 +217,10 @@ async function mountTestRoot(): Promise<{
 
   const mountPush = lastPush(channel)
   mountPush.push.resolve("ok", { root_id: "Test.Root:root" })
+  // Let the mount-reply microtask register the root in connectionState
+  // before the initial patch arrives — real Phoenix delivers these as
+  // separate frames, so the JS event loop drains microtasks between them.
+  await Promise.resolve()
   channel.emit("patch", initialConnectionEnvelope("Test.Root:root", rootState()))
   await ready
 

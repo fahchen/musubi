@@ -108,6 +108,7 @@ async function setupProxy() {
   await Promise.resolve()
   const mountPush = channel.pushes[channel.pushes.length - 1]!
   mountPush.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+  await Promise.resolve()
   channel.emit("patch", initialEnvelope("Test.Store:alpha-1"))
   const { store: proxy } = await mountedPromise
   return { channel, proxy }

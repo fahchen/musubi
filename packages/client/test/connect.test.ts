@@ -277,6 +277,9 @@ describe("connect", () => {
     await Promise.resolve()
 
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+
+
+    await Promise.resolve()
     channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
 
     const { store: proxy } = await mountedPromise
@@ -299,6 +302,9 @@ describe("connect", () => {
     await Promise.resolve()
 
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+
+
+    await Promise.resolve()
     channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
 
     const { store: proxy } = await mountedPromise
@@ -331,6 +337,8 @@ describe("connect", () => {
     })
     await Promise.resolve()
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+
+    await Promise.resolve()
     channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
     const { store: alpha } = await alphaMountedPromise
 
@@ -340,6 +348,8 @@ describe("connect", () => {
     })
     await Promise.resolve()
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:beta-1" })
+
+    await Promise.resolve()
     channel.emit("patch", initialConnectionEnvelope("Test.Store:beta-1", rootState("Secondary")))
     const { store: beta } = await betaMountedPromise
 
@@ -380,6 +390,8 @@ describe("connect", () => {
     await Promise.resolve()
     const firstPushCount = channel.pushes.length
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared-root" })
+
+    await Promise.resolve()
     channel.emit("patch", initialConnectionEnvelope("Test.Store:shared-root", rootState()))
     await firstPromise
 
@@ -420,6 +432,8 @@ describe("connect", () => {
       id: "shared"
     })
     firstMountPush.push.resolve("ok", { root_id: "Test.Store:shared" })
+
+    await Promise.resolve()
     channel.emit("patch", initialConnectionEnvelope("Test.Store:shared", rootState()))
     const first = await firstPromise
 
@@ -435,6 +449,7 @@ describe("connect", () => {
       id: "shared"
     })
     secondMountPush.push.resolve("ok", { root_id: "Test.Other:shared" })
+    await Promise.resolve()
     channel.emit(
       "patch",
       connectionEnvelope(
@@ -475,6 +490,8 @@ describe("connect", () => {
     })
     await Promise.resolve()
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared-root" })
+
+    await Promise.resolve()
     channel.emit("patch", initialConnectionEnvelope("Test.Store:shared-root", rootState()))
     const mounted = await mountedPromise
 
@@ -503,6 +520,9 @@ describe("connect", () => {
     await Promise.resolve()
 
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+
+
+    await Promise.resolve()
     channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
 
     const { store: proxy } = await mountedPromise
@@ -534,6 +554,7 @@ describe("connect", () => {
     await Promise.resolve()
 
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+    await Promise.resolve()
     channel.emit(
       "patch",
       connectionEnvelope(
@@ -609,6 +630,9 @@ describe("connect", () => {
     await Promise.resolve()
 
     lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+
+
+    await Promise.resolve()
     channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
 
     const { store: proxy, unmount } = await mountedPromise
