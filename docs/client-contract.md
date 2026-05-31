@@ -161,6 +161,19 @@ type MountMessage = {
 }
 ```
 
+The `id` field is the caller-supplied `MountStoreOptions.id`. The server
+composes the canonical wire root id as `"<module>:<caller-id>"` and
+returns it on the `:ok` mount reply under the `root_id` key. Every
+subsequent `unmount` / `command` / upload / `patch` message uses that
+server-assigned `root_id`. The client never composes the wire id itself
+— it round-trips whatever the server returned.
+
+Composing on both module and caller id is what lets two roots of
+different modules share the same caller-facing id on one connection
+without colliding in the server's `mounted_roots` map. Duplicate
+detection is the server's responsibility: a second mount for the same
+`(module, id)` on one connection replies with `:already_mounted`.
+
 Commands target mounted stores by `root_id` plus `store_id`:
 
 ```ts
