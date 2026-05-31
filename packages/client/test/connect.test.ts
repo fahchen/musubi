@@ -760,19 +760,17 @@ describe("connect", () => {
   })
 
   test("disconnect mid-mount does not surface an unhandled rejection on the in-flight tentative", async () => {
-    // Catch any unhandled rejection that fires during this test. The
-    // pre-fix behaviour was that disconnect rejected the tentative's
-    // `pendingConnect` while no awaiter was observing it, producing a
-    // PromiseRejectionEvent on its own task. We now clear the waiter
-    // without rejecting it.
+    // Pre-fix behaviour: disconnect rejected the tentative's
+    // `pendingConnect` while no awaiter was observing it, producing an
+    // unhandled rejection on its own task. We now clear the waiter
+    // without rejecting it. Node's `unhandledRejection` listener takes
+    // `(reason, promise)` — not a browser-style `PromiseRejectionEvent`
+    // — so calling `event.preventDefault()` would itself throw.
     const unhandled: unknown[] = []
-    const onUnhandled = (event: PromiseRejectionEvent): void => {
-      unhandled.push(event.reason)
-      event.preventDefault()
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
     }
-    if (typeof process !== "undefined" && typeof process.on === "function") {
-      process.on("unhandledRejection", onUnhandled as never)
-    }
+    process.on("unhandledRejection", onUnhandled)
 
     try {
       const { connect } = await import("../src/connect")
@@ -797,9 +795,7 @@ describe("connect", () => {
       expect(unhandled).toEqual([])
       expect(channel.left).toBe(true)
     } finally {
-      if (typeof process !== "undefined" && typeof process.off === "function") {
-        process.off("unhandledRejection", onUnhandled as never)
-      }
+      process.off("unhandledRejection", onUnhandled)
     }
   })
 
@@ -810,14 +806,12 @@ describe("connect", () => {
     // `void recover...`) as an unhandled rejection AND left the
     // connection waiting forever on `initialPatchPromise`. The fix
     // catches the throw inside `recover`, force-disconnects, and logs.
+    // Node `unhandledRejection` listener signature is `(reason, promise)`.
     const unhandled: unknown[] = []
-    const onUnhandled = (event: PromiseRejectionEvent): void => {
-      unhandled.push(event.reason)
-      event.preventDefault()
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
     }
-    if (typeof process !== "undefined" && typeof process.on === "function") {
-      process.on("unhandledRejection", onUnhandled as never)
-    }
+    process.on("unhandledRejection", onUnhandled)
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
 
     try {
@@ -883,11 +877,11 @@ describe("connect", () => {
         "[musubi] root recovery failed:",
         expect.any(Error)
       )
+      // Channel was actually torn down (not just local state cleared).
+      expect(channel.left).toBe(true)
     } finally {
       errorSpy.mockRestore()
-      if (typeof process !== "undefined" && typeof process.off === "function") {
-        process.off("unhandledRejection", onUnhandled as never)
-      }
+      process.off("unhandledRejection", onUnhandled)
     }
   })
 })

@@ -921,13 +921,17 @@ async function recoverConnectionRootFromVersionMismatch(
   } catch (error) {
     // Recovery is fire-and-forget (`void recover...` in `handlePatch`),
     // so a throw here would surface as an unhandled rejection. Force a
-    // disconnect instead — consumers see a clean tear-down (pending
-    // commands rejected, snapshots stop updating) and can reconnect
-    // explicitly. The error itself is logged so the failure isn't
-    // silent.
+    // full disconnect instead — consumers see a clean tear-down
+    // (pending commands rejected, snapshots stop updating, channel
+    // left, runtime entry removed) and can reconnect explicitly. The
+    // error itself is logged so the failure isn't silent.
+    // Use `disconnectConnectionState` rather than just
+    // `handleConnectionDisconnect`: the channel is still open in this
+    // path, so we need to actually leave it and drop the connection
+    // from the shared runtime, not just clear local state.
     // eslint-disable-next-line no-console
     console.error("[musubi] root recovery failed:", error)
-    handleConnectionDisconnect(connectionState, error)
+    void disconnectConnectionState(connectionState)
   } finally {
     connection.recovering = false
   }
