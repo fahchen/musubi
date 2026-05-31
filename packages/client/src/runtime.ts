@@ -465,10 +465,17 @@ export async function unmountConnectionRoot(connection: RootConnection): Promise
 // roots that were left orphaned when a previous timer firing skipped
 // teardown to wait for a pending alias that subsequently failed.
 function scheduleRootTeardown(connection: RootConnection): Promise<void> {
+  // Defensive guard: every current caller checks `refCount === 0` first,
+  // but anyone adding a future call site shouldn't be able to accidentally
+  // schedule teardown for a held root.
+  if (connection.refCount > 0) {
+    return Promise.resolve()
+  }
+
   const connectionState = connection.connection
   const rootId = connection.id
 
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<void>((resolve) => {
     // Track the resolver on the connection so external paths
     // (`cancelGraceTimer` on alias-remount, disconnect handlers) can
     // settle this awaiter — otherwise the caller's `await unmount()`
@@ -534,17 +541,23 @@ function scheduleRootTeardown(connection: RootConnection): Promise<void> {
         return
       }
 
+      // Swallow server-side unmount errors (`unknown root`, push
+      // timeout from a closing channel, etc.) — local state is
+      // already torn down, and the consumer's intent was "release my
+      // handle". Bubbling a server-cleanup failure to the caller is
+      // surprising and not actionable. Log so the failure isn't
+      // silent in dev / observability.
       receivePush(
         connectionState.channel.push("unmount", { root_id: rootId }) as PushLike,
         "Root unmount"
       )
-        .then(() => {
+        .catch((error: unknown) => {
+          // eslint-disable-next-line no-console
+          console.warn("[musubi] root unmount push failed:", error)
+        })
+        .finally(() => {
           connection.pendingUnmountResolver = null
           resolve()
-        })
-        .catch((error) => {
-          connection.pendingUnmountResolver = null
-          reject(error)
         })
     }, UNMOUNT_GRACE_MS)
   })

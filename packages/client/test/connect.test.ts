@@ -859,6 +859,52 @@ describe("connect", () => {
     expect(channel.left).toBe(true)
   })
 
+  test("unmount swallows server-side push failures so the consumer's release resolves", async () => {
+    // Server might return :error on the unmount push (already gone,
+    // unknown root, channel closing). Local state is already torn
+    // down by that point; surfacing the failure to the consumer's
+    // `await mounted.unmount()` is surprising and unactionable. The
+    // failure should log via `console.warn` and the consumer's
+    // promise should resolve.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+    try {
+      const { connect } = await import("../src/connect")
+      const socket = new MockSocket()
+      const connectionPromise = connect<TestStores>(socket)
+      const channel = lastChannel(socket)
+      channel.resolveJoin()
+      const connection = await connectionPromise
+
+      const mountedPromise = connection.mountStore({
+        module: "Test.Store",
+        id: "alpha-1"
+      })
+      await Promise.resolve()
+      lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+      await Promise.resolve()
+      channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
+      const mounted = await mountedPromise
+
+      const unmountPromise = mounted.unmount()
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      const unmountPush = lastPush(channel)
+      expect(unmountPush.event).toBe("unmount")
+
+      // Server replies :error.
+      unmountPush.push.resolve("error", { reason: "unknown root" })
+
+      // Consumer's promise still resolves cleanly.
+      await expect(unmountPromise).resolves.toBeUndefined()
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[musubi] root unmount push failed:",
+        expect.any(Error)
+      )
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
   test("disconnect mid-mount does not surface an unhandled rejection on the in-flight tentative", async () => {
     // Disconnect rejects the tentative's `pendingConnect` so that if
     // the mount push later returns `:ok`, the `:ok` branch's
