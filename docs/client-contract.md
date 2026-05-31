@@ -161,6 +161,14 @@ type MountMessage = {
 }
 ```
 
+The `id` field is the composite wire root id `"<module>:<caller-id>"`,
+not the caller's raw `MountStoreOptions.id`. Composing on both module
+and caller id lets two roots of different modules share the same
+caller-facing id on one connection without colliding either locally or
+in the server's `mounted_roots` map. The server treats the string as
+opaque; subsequent `unmount` / `command` / `patch` messages reuse this
+same composite as `root_id`.
+
 Commands target mounted stores by `root_id` plus `store_id`:
 
 ```ts

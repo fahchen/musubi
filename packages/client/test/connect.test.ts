@@ -410,7 +410,7 @@ describe("connect", () => {
     const firstMountPush = lastPush(channel)
     expect(firstMountPush.event).toBe("mount")
     // Wire `id` composes module + caller id so the server treats distinct
-    // (module, id) pairs as distinct roots — see spec/cf-dashboard-route-mount-bug.md.
+    // (module, id) pairs as distinct roots.
     expect(firstMountPush.payload).toMatchObject({
       module: "Test.Store",
       id: "Test.Store:shared"
