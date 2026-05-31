@@ -468,12 +468,15 @@ export async function disconnectConnectionState(
 ): Promise<void> {
   const disconnectError = new Error("Disconnected")
 
-  // Reject the initial-patch waiter on any in-flight mount whose tentative
-  // has been wired up with `pendingConnect` but isn't in `roots` yet. The
-  // outer `pushMount` await unblocks via Phoenix's default push timeout
-  // when the channel goes away.
+  // In-flight `mountConnectionRoot` tentatives haven't yet been awaited
+  // on their initial-patch promise (that happens only in the `:ok`
+  // branch after `pushMount` returns). Clearing `pendingConnect` —
+  // without rejecting it — avoids surfacing an unhandled rejection on
+  // a promise no one is observing. The outer `pushMount` await unblocks
+  // via Phoenix's default push timeout when the channel goes away;
+  // `mountConnectionRoot` then takes the `:error` branch and surfaces
+  // the failure to its actual awaiter.
   for (const pending of connectionState.pendingMounts) {
-    pending.pendingConnect?.reject(disconnectError)
     pending.pendingConnect = null
   }
   connectionState.pendingMounts.clear()
@@ -915,6 +918,16 @@ async function recoverConnectionRootFromVersionMismatch(
     }
 
     await remountExistingConnection(connection)
+  } catch (error) {
+    // Recovery is fire-and-forget (`void recover...` in `handlePatch`),
+    // so a throw here would surface as an unhandled rejection. Force a
+    // disconnect instead — consumers see a clean tear-down (pending
+    // commands rejected, snapshots stop updating) and can reconnect
+    // explicitly. The error itself is logged so the failure isn't
+    // silent.
+    // eslint-disable-next-line no-console
+    console.error("[musubi] root recovery failed:", error)
+    handleConnectionDisconnect(connectionState, error)
   } finally {
     connection.recovering = false
   }
@@ -926,8 +939,9 @@ function handleConnectionDisconnect(
 ): void {
   const disconnectError = new Error("Disconnected")
 
+  // See `disconnectConnectionState` for the rationale on not rejecting
+  // pendingConnect for in-flight tentatives.
   for (const pending of connectionState.pendingMounts) {
-    pending.pendingConnect?.reject(disconnectError)
     pending.pendingConnect = null
   }
   connectionState.pendingMounts.clear()

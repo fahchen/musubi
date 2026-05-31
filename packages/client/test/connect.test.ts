@@ -758,6 +758,138 @@ describe("connect", () => {
 
     expect(channel.left).toBe(true)
   })
+
+  test("disconnect mid-mount does not surface an unhandled rejection on the in-flight tentative", async () => {
+    // Catch any unhandled rejection that fires during this test. The
+    // pre-fix behaviour was that disconnect rejected the tentative's
+    // `pendingConnect` while no awaiter was observing it, producing a
+    // PromiseRejectionEvent on its own task. We now clear the waiter
+    // without rejecting it.
+    const unhandled: unknown[] = []
+    const onUnhandled = (event: PromiseRejectionEvent): void => {
+      unhandled.push(event.reason)
+      event.preventDefault()
+    }
+    if (typeof process !== "undefined" && typeof process.on === "function") {
+      process.on("unhandledRejection", onUnhandled as never)
+    }
+
+    try {
+      const { connect } = await import("../src/connect")
+      const socket = new MockSocket()
+      const connectionPromise = connect<TestStores>(socket)
+      const channel = lastChannel(socket)
+      channel.resolveJoin()
+      const connection = await connectionPromise
+
+      // Kick off a mount, then disconnect before the mount reply arrives.
+      void connection.mountStore({ module: "Test.Store", id: "alpha-1" })
+      await Promise.resolve()
+      const mountPush = lastPush(channel)
+      expect(mountPush.event).toBe("mount")
+
+      await connection.disconnect()
+
+      // Let any micro/macrotasks settle so an unhandled rejection would
+      // have surfaced by now.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+      expect(unhandled).toEqual([])
+      expect(channel.left).toBe(true)
+    } finally {
+      if (typeof process !== "undefined" && typeof process.off === "function") {
+        process.off("unhandledRejection", onUnhandled as never)
+      }
+    }
+  })
+
+  test("recovery from version mismatch hitting :already_mounted disconnects cleanly", async () => {
+    // Pre-fix behaviour: `remountExistingConnection` threw on
+    // `:already_mounted`, which bubbled out of
+    // `recoverConnectionRootFromVersionMismatch` (invoked via
+    // `void recover...`) as an unhandled rejection AND left the
+    // connection waiting forever on `initialPatchPromise`. The fix
+    // catches the throw inside `recover`, force-disconnects, and logs.
+    const unhandled: unknown[] = []
+    const onUnhandled = (event: PromiseRejectionEvent): void => {
+      unhandled.push(event.reason)
+      event.preventDefault()
+    }
+    if (typeof process !== "undefined" && typeof process.on === "function") {
+      process.on("unhandledRejection", onUnhandled as never)
+    }
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    try {
+      const { connect } = await import("../src/connect")
+      const socket = new MockSocket()
+      const connectionPromise = connect<TestStores>(socket)
+      const channel = lastChannel(socket)
+      channel.resolveJoin()
+      const connection = await connectionPromise
+
+      const mountedPromise = connection.mountStore({
+        module: "Test.Store",
+        id: "alpha-1"
+      })
+      await Promise.resolve()
+      lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+      await Promise.resolve()
+      channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
+      await mountedPromise
+
+      // Simulate a version-mismatch patch — base_version=99 != current 1.
+      // `handlePatch` schedules `recoverConnectionRootFromVersionMismatch`.
+      channel.emit(
+        "patch",
+        connectionEnvelope(
+          "Test.Store:alpha-1",
+          99,
+          100,
+          [{ op: "replace", path: "/counter", value: 99 }],
+          []
+        )
+      )
+
+      // Recovery's prologue pushes `unmount`; reply with :ok (entry was
+      // never really gone server-side — we simulate the stale case where
+      // the unmount push succeeds but the server still has the entry on
+      // the subsequent re-mount).
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      const unmountPush = lastPush(channel)
+      expect(unmountPush.event).toBe("unmount")
+      unmountPush.push.resolve("ok", {})
+      // Drain microtasks so recover continues into remountExistingConnection
+      // → ensureConnectionReady → pushMount (which fires the mount push).
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+      // Re-mount push arrives; reply with :already_mounted carrying the
+      // SAME root_id. This is the recovery-deadlock scenario.
+      const remountPush = lastPush(channel)
+      expect(remountPush.event).toBe("mount")
+      remountPush.push.resolve("error", {
+        reason: "already_mounted",
+        root_id: "Test.Store:alpha-1"
+      })
+
+      // Let recovery's catch run + handleConnectionDisconnect cascade.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+      expect(unhandled).toEqual([])
+      // Connection state should be cleaned up: a follow-up command on
+      // the proxy now fails with "Store is not connected" because
+      // disconnect cleared the channel and reset state.
+      expect(errorSpy).toHaveBeenCalledWith(
+        "[musubi] root recovery failed:",
+        expect.any(Error)
+      )
+    } finally {
+      errorSpy.mockRestore()
+      if (typeof process !== "undefined" && typeof process.off === "function") {
+        process.off("unhandledRejection", onUnhandled as never)
+      }
+    }
+  })
 })
 
 function lastChannel(socket: MockSocket): MockChannel {
