@@ -11,6 +11,16 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Changed (breaking — wire protocol)
+
+- **Transport / `@musubi/client`** — Connection roots are now identified
+  by `(module, caller id)`; the server composes and assigns the wire
+  `root_id`, which the client treats as opaque. Fixes silent state
+  corruption when two roots shared a caller id. Duplicate `(module, id)`
+  on one connection is rejected with `:already_mounted`. Client-side
+  dedup removed. Tooling that pinned literal `root_id` values must
+  update. See `spec/domains/runtime/features/connection-root-identity.feature` (#65).
+
 ## [0.6.1] — 2026-05-30
 
 ### Fixed
