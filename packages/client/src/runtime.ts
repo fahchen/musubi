@@ -159,7 +159,7 @@ export function mountConnectionRoot(
   // Wire `root_id` composes `(module, id)` so two stores of different modules
   // can share the same caller-supplied id without colliding either locally
   // or on the server. The server treats this string as opaque.
-  const rootId = `${options.module}|${options.id}`
+  const rootId = `${options.module}:${options.id}`
   const existing = connectionState.roots.get(rootId)
 
   // Don't pre-reject duplicates locally — the server is the source of truth

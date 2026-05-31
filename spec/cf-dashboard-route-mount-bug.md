@@ -3,7 +3,7 @@
 Filed by: coloured_flow_dashboard (dashboard/ui, musubi 0.6.1, @musubi/react workspace)
 
 **Status**: fixed. `packages/client/src/runtime.ts` now composes the wire
-`root_id` as `${module}|${id}`, so the local `connectionState.roots` Map
+`root_id` as `${module}:${id}`, so the local `connectionState.roots` Map
 and the server's `mounted_roots` map both treat distinct `(module, id)`
 pairs as distinct roots natively. Patch routing reverts to a direct
 `roots.get(payload.root_id)` lookup — no fallback needed.
