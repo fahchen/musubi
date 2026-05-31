@@ -931,7 +931,15 @@ async function recoverConnectionRootFromVersionMismatch(
     // from the shared runtime, not just clear local state.
     // eslint-disable-next-line no-console
     console.error("[musubi] root recovery failed:", error)
-    void disconnectConnectionState(connectionState)
+    // Belt-and-braces `.catch` on the discarded promise: while
+    // `disconnectConnectionState` doesn't currently throw, a synchronous
+    // failure from `channel.leave()` would otherwise re-surface here as
+    // an unhandled rejection — exactly the failure mode we're trying to
+    // eliminate in this PR.
+    disconnectConnectionState(connectionState).catch((cleanupError) => {
+      // eslint-disable-next-line no-console
+      console.error("[musubi] post-recovery disconnect failed:", cleanupError)
+    })
   } finally {
     connection.recovering = false
   }
