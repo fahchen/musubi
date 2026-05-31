@@ -2,14 +2,21 @@
 
 Filed by: coloured_flow_dashboard (dashboard/ui, musubi 0.6.1, @musubi/react workspace)
 
-**Status**: fixed. `packages/client/src/runtime.ts` now keys the local
-`connectionState.roots` Map by `(module, id)`. Patch routing iterates by
-wire `root_id` and prefers the server-confirmed entry (`version >= 1`),
-which keeps the existing protocol intact while turning silent corruption
-into either correct dedup (same `(module, id)`) or a loud
-`:already_mounted` rejection (distinct module reusing a sibling's `id`).
+**Status**: fixed. `packages/client/src/runtime.ts` now composes the wire
+`root_id` as `${module}|${id}`, so the local `connectionState.roots` Map
+and the server's `mounted_roots` map both treat distinct `(module, id)`
+pairs as distinct roots natively. Patch routing reverts to a direct
+`roots.get(payload.root_id)` lookup — no fallback needed.
+
+**Wire-format breaking change**: `root_id` on the `mount` / `unmount` /
+`command` payloads and the `patch` envelopes is now the composite string.
+`MountStoreOptions.id` (the user-facing API) is unchanged. The server
+treats the string as opaque, so no server-side change was required, but
+any external tooling that pinned literal `root_id` values (e.g. wire
+inspection scripts, recorded fixtures) will need to update.
+
 Regression covered by `packages/client/test/connect.test.ts` →
-"mountStore does not dedup across distinct modules sharing one id".
+"distinct modules sharing one id get distinct server mounts and patches".
 
 ## Symptom
 

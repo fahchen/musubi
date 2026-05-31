@@ -247,15 +247,15 @@ describe("connect", () => {
     expect(mountPush.event).toBe("mount")
     expect(mountPush.payload).toEqual({
       module: "Test.Store",
-      id: "alpha-1",
+      id: "Test.Store|alpha-1",
       params: { room_id: "general" }
     })
 
-    mountPush.push.resolve("ok", { root_id: "alpha-1" })
+    mountPush.push.resolve("ok", { root_id: "Test.Store|alpha-1" })
     await Promise.resolve()
     expect(resolved).toBe(false)
 
-    channel.emit("patch", initialConnectionEnvelope("alpha-1", rootState()))
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|alpha-1", rootState()))
 
     const { store: proxy } = await mountedPromise
     expect(proxy.title).toBe("Inbox")
@@ -276,8 +276,8 @@ describe("connect", () => {
     })
     await Promise.resolve()
 
-    lastPush(channel).push.resolve("ok", { root_id: "alpha-1" })
-    channel.emit("patch", initialConnectionEnvelope("alpha-1", rootState()))
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store|alpha-1" })
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|alpha-1", rootState()))
 
     const { store: proxy } = await mountedPromise
 
@@ -298,8 +298,8 @@ describe("connect", () => {
     })
     await Promise.resolve()
 
-    lastPush(channel).push.resolve("ok", { root_id: "alpha-1" })
-    channel.emit("patch", initialConnectionEnvelope("alpha-1", rootState()))
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store|alpha-1" })
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|alpha-1", rootState()))
 
     const { store: proxy } = await mountedPromise
     const replyPromise = proxy.dispatchCommand("rename", { title: "Outbox" })
@@ -307,7 +307,7 @@ describe("connect", () => {
     const commandPush = lastPush(channel)
     expect(commandPush.event).toBe("command")
     expect(commandPush.payload).toEqual({
-      root_id: "alpha-1",
+      root_id: "Test.Store|alpha-1",
       store_id: [],
       name: "rename",
       payload: { title: "Outbox" }
@@ -330,8 +330,8 @@ describe("connect", () => {
       id: "alpha-1"
     })
     await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "alpha-1" })
-    channel.emit("patch", initialConnectionEnvelope("alpha-1", rootState()))
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store|alpha-1" })
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|alpha-1", rootState()))
     const { store: alpha } = await alphaMountedPromise
 
     const betaMountedPromise = connection.mountStore({
@@ -339,8 +339,8 @@ describe("connect", () => {
       id: "beta-1"
     })
     await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "beta-1" })
-    channel.emit("patch", initialConnectionEnvelope("beta-1", rootState("Secondary")))
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store|beta-1" })
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|beta-1", rootState("Secondary")))
     const { store: beta } = await betaMountedPromise
 
     const alphaListener = vi.fn()
@@ -351,7 +351,7 @@ describe("connect", () => {
     channel.emit(
       "patch",
       connectionEnvelope(
-        "beta-1",
+        "Test.Store|beta-1",
         1,
         2,
         [{ op: "replace", path: "/counter", value: 9 }],
@@ -379,8 +379,8 @@ describe("connect", () => {
     })
     await Promise.resolve()
     const firstPushCount = channel.pushes.length
-    lastPush(channel).push.resolve("ok", { root_id: "shared-root" })
-    channel.emit("patch", initialConnectionEnvelope("shared-root", rootState()))
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store|shared-root" })
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|shared-root", rootState()))
     const firstMounted = await firstPromise
 
     const secondMounted = await connection.mountStore({
@@ -394,7 +394,7 @@ describe("connect", () => {
     expect(channel.pushes.length).toBe(firstPushCount)
   })
 
-  test("mountStore does not dedup across distinct modules sharing one id", async () => {
+  test("distinct modules sharing one id get distinct server mounts and patches", async () => {
     const { connect } = await import("../src/connect")
     const socket = new MockSocket()
     const connectionPromise = connect<TestStores>(socket)
@@ -409,42 +409,51 @@ describe("connect", () => {
     await Promise.resolve()
     const firstMountPush = lastPush(channel)
     expect(firstMountPush.event).toBe("mount")
-    expect(firstMountPush.payload).toMatchObject({ module: "Test.Store", id: "shared" })
-    firstMountPush.push.resolve("ok", { root_id: "shared" })
-    channel.emit("patch", initialConnectionEnvelope("shared", rootState()))
+    // Wire `id` composes module + caller id so the server treats distinct
+    // (module, id) pairs as distinct roots — see spec/cf-dashboard-route-mount-bug.md.
+    expect(firstMountPush.payload).toMatchObject({
+      module: "Test.Store",
+      id: "Test.Store|shared"
+    })
+    firstMountPush.push.resolve("ok", { root_id: "Test.Store|shared" })
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|shared", rootState()))
     const first = await firstPromise
-
-    const pushCountBeforeSecond = channel.pushes.length
 
     const secondPromise = connection.mountStore({
       module: "Test.Other",
       id: "shared"
     })
     await Promise.resolve()
-
-    // Distinct module must issue its own server mount instead of aliasing
-    // the existing root — see spec/cf-dashboard-route-mount-bug.md.
-    expect(channel.pushes.length).toBe(pushCountBeforeSecond + 1)
     const secondMountPush = lastPush(channel)
     expect(secondMountPush.event).toBe("mount")
-    expect(secondMountPush.payload).toMatchObject({ module: "Test.Other", id: "shared" })
-
-    // Server rejects the colliding mount; client surfaces the error and
-    // cleans up the orphaned local entry instead of silently aliasing.
-    secondMountPush.push.resolve("error", { reason: "root already mounted" })
-    await expect(secondPromise).rejects.toThrow()
-
-    // Patches for the original mount keep flowing to the surviving root.
+    expect(secondMountPush.payload).toMatchObject({
+      module: "Test.Other",
+      id: "Test.Other|shared"
+    })
+    secondMountPush.push.resolve("ok", { root_id: "Test.Other|shared" })
     channel.emit(
       "patch",
       connectionEnvelope(
-        "shared",
+        "Test.Other|shared",
+        0,
+        1,
+        [{ op: "replace", path: "", value: { label: "other" } }],
+        []
+      )
+    )
+    await secondPromise
+
+    channel.emit(
+      "patch",
+      connectionEnvelope(
+        "Test.Store|shared",
         1,
         2,
         [{ op: "replace", path: "/counter", value: 7 }],
         []
       )
     )
+
     expect(first.store.counter).toBe(7)
   })
 
@@ -461,8 +470,8 @@ describe("connect", () => {
       id: "shared-root"
     })
     await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "shared-root" })
-    channel.emit("patch", initialConnectionEnvelope("shared-root", rootState()))
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store|shared-root" })
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|shared-root", rootState()))
 
     const firstMounted = await firstPromise
     const secondMounted = await connection.mountStore({
@@ -479,7 +488,7 @@ describe("connect", () => {
     const unmountPush = lastPush(channel)
 
     expect(unmountPush.event).toBe("unmount")
-    expect(unmountPush.payload).toEqual({ root_id: "shared-root" })
+    expect(unmountPush.payload).toEqual({ root_id: "Test.Store|shared-root" })
 
     unmountPush.push.resolve("ok", {})
     await secondUnmountPromise
@@ -500,8 +509,8 @@ describe("connect", () => {
     })
     await Promise.resolve()
 
-    lastPush(channel).push.resolve("ok", { root_id: "alpha-1" })
-    channel.emit("patch", initialConnectionEnvelope("alpha-1", rootState()))
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store|alpha-1" })
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|alpha-1", rootState()))
 
     const { store: proxy } = await mountedPromise
     const snapshot = proxy.snapshot()
@@ -531,11 +540,11 @@ describe("connect", () => {
     })
     await Promise.resolve()
 
-    lastPush(channel).push.resolve("ok", { root_id: "alpha-1" })
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store|alpha-1" })
     channel.emit(
       "patch",
       connectionEnvelope(
-        "alpha-1",
+        "Test.Store|alpha-1",
         0,
         1,
         [{ op: "replace", path: "", value: rootState() }],
@@ -606,15 +615,15 @@ describe("connect", () => {
     })
     await Promise.resolve()
 
-    lastPush(channel).push.resolve("ok", { root_id: "alpha-1" })
-    channel.emit("patch", initialConnectionEnvelope("alpha-1", rootState()))
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store|alpha-1" })
+    channel.emit("patch", initialConnectionEnvelope("Test.Store|alpha-1", rootState()))
 
     const { store: proxy, unmount } = await mountedPromise
     const unmountPromise = unmount()
     const unmountPush = lastPush(channel)
 
     expect(unmountPush.event).toBe("unmount")
-    expect(unmountPush.payload).toEqual({ root_id: "alpha-1" })
+    expect(unmountPush.payload).toEqual({ root_id: "Test.Store|alpha-1" })
 
     unmountPush.push.resolve("ok", {})
     await unmountPromise

@@ -94,7 +94,7 @@ describe("snapshot cache invalidation", () => {
     channel.emit(
       "patch",
       connectionEnvelope(
-        "root",
+        "Test.Root|root",
         1,
         2,
         [{ op: "replace", path: "/b/v", value: 2 }],
@@ -115,7 +115,7 @@ describe("snapshot cache invalidation", () => {
     channel.emit(
       "patch",
       connectionEnvelope(
-        "root",
+        "Test.Root|root",
         1,
         2,
         [{ op: "replace", path: "/a/v", value: 2 }],
@@ -138,7 +138,7 @@ describe("snapshot cache invalidation", () => {
     channel.emit(
       "patch",
       connectionEnvelope(
-        "root",
+        "Test.Root|root",
         1,
         2,
         [
@@ -170,7 +170,7 @@ describe("snapshot cache invalidation", () => {
     channel.emit(
       "patch",
       connectionEnvelope(
-        "root",
+        "Test.Root|root",
         1,
         2,
         [],
@@ -216,8 +216,8 @@ async function mountTestRoot(): Promise<{
   await Promise.resolve()
 
   const mountPush = lastPush(channel)
-  mountPush.push.resolve("ok", { root_id: "root" })
-  channel.emit("patch", initialConnectionEnvelope("root", rootState()))
+  mountPush.push.resolve("ok", { root_id: "Test.Root|root" })
+  channel.emit("patch", initialConnectionEnvelope("Test.Root|root", rootState()))
   await ready
 
   return { channel, connection }
