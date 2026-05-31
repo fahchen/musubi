@@ -171,8 +171,33 @@ server-assigned `root_id`. The client never composes the wire id itself
 Composing on both module and caller id is what lets two roots of
 different modules share the same caller-facing id on one connection
 without colliding in the server's `mounted_roots` map. Duplicate
-detection is the server's responsibility: a second mount for the same
-`(module, id)` on one connection replies with `:already_mounted`.
+detection is the server's responsibility.
+
+### Aliasing on duplicate `(module, id)`
+
+A second mount of the same `(module, id)` on one connection is a
+multi-observer scenario, not an error. The server replies with:
+
+```json
+{ "reason": "already_mounted", "root_id": "<existing root id>" }
+```
+
+…on the `:error` channel reply. The client looks the returned `root_id`
+up in its local `connectionState.roots` map and:
+
+- **Hit**: bumps the existing `RootConnection`'s local `refCount`,
+  cancels any pending grace-timer teardown, discards the tentative
+  connection it built before the mount push, and returns the canonical
+  one. The aliased caller shares the same `StoreProxy`. The server
+  never starts a second page runtime.
+- **Miss**: throws `MusubiInconsistencyError`. The server claims a
+  mount that the client has no record of (reconnect race, dropped
+  unmount, server-side leak); fail loud rather than fabricate state.
+
+The last `unmount` (refCount → 0) schedules a brief grace timer instead
+of pushing immediately. A remount of the same `(module, id)` within the
+grace window cancels the timer and reuses the existing mount — covers
+React 19 route-swap commit batching and StrictMode effect replay.
 
 Commands target mounted stores by `root_id` plus `store_id`:
 

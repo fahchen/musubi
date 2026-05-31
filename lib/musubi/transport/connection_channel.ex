@@ -72,15 +72,9 @@ defmodule Musubi.Transport.ConnectionChannel do
          {:ok, caller_id} <- fetch_root_id(payload),
          {:ok, params} <- fetch_params(payload),
          root_id <- compose_root_id(module_str, caller_id),
-         :ok <- ensure_root_not_mounted(socket, root_id),
          {:ok, root_module} <- fetch_declared_root(socket, module_str),
-         :ok <- ensure_root_store(root_module),
-         {:ok, page_pid} <- start_root_page(root_module, root_id, params, socket) do
-      root_entry = %{pid: page_pid, module: root_module}
-
-      socket = update_mounted_roots(socket, &Map.put(&1, root_id, root_entry))
-
-      {:reply, {:ok, %{"root_id" => root_id}}, socket}
+         :ok <- ensure_root_store(root_module) do
+      handle_mount(socket, root_id, root_module, params)
     else
       {:error, reason} -> {:reply, {:error, %{reason: error_reason(reason)}}, socket}
     end
@@ -218,6 +212,42 @@ defmodule Musubi.Transport.ConnectionChannel do
     :ok
   end
 
+  # Dispatch a mount request to either the fresh-start or the alias path
+  # depending on whether `mounted_roots[root_id]` already has an entry.
+  @spec handle_mount(Phoenix.Socket.t(), String.t(), module(), map()) ::
+          {:reply, {:ok, map()} | {:error, map()}, Phoenix.Socket.t()}
+  defp handle_mount(%Phoenix.Socket{} = socket, root_id, root_module, params) do
+    case Map.get(mounted_roots(socket), root_id) do
+      nil -> start_fresh_root(socket, root_id, root_module, params)
+      _existing -> reply_already_mounted(socket, root_id)
+    end
+  end
+
+  @spec start_fresh_root(Phoenix.Socket.t(), String.t(), module(), map()) ::
+          {:reply, {:ok, map()} | {:error, map()}, Phoenix.Socket.t()}
+  defp start_fresh_root(%Phoenix.Socket{} = socket, root_id, root_module, params) do
+    case start_root_page(root_module, root_id, params, socket) do
+      {:ok, page_pid} ->
+        entry = %{pid: page_pid, module: root_module}
+        socket = update_mounted_roots(socket, &Map.put(&1, root_id, entry))
+        {:reply, {:ok, %{"root_id" => root_id}}, socket}
+
+      {:error, reason} ->
+        {:reply, {:error, %{reason: error_reason(reason)}}, socket}
+    end
+  end
+
+  # The (module, caller_id) pair is already mounted on this connection.
+  # Reply with the canonical root_id so the client can alias to its local
+  # RootConnection without spinning up a second server entry. The
+  # `"already_mounted"` reason is a structured signal the client treats as
+  # an alias hint, not as a hard error.
+  @spec reply_already_mounted(Phoenix.Socket.t(), String.t()) ::
+          {:reply, {:error, map()}, Phoenix.Socket.t()}
+  defp reply_already_mounted(%Phoenix.Socket{} = socket, root_id) do
+    {:reply, {:error, %{"reason" => "already_mounted", "root_id" => root_id}}, socket}
+  end
+
   @spec fetch_socket_module(Phoenix.Socket.t()) :: {:ok, module()} | {:error, :missing_socket}
   defp fetch_socket_module(%Phoenix.Socket{handler: handler}) when is_atom(handler) do
     if function_exported?(handler, :__musubi_roots__, 0) do
@@ -257,16 +287,6 @@ defmodule Musubi.Transport.ConnectionChannel do
     case Map.get(payload, "params", %{}) do
       params when is_map(params) -> {:ok, params}
       _other -> {:error, :invalid_params}
-    end
-  end
-
-  @spec ensure_root_not_mounted(Phoenix.Socket.t(), String.t()) ::
-          :ok | {:error, :already_mounted}
-  defp ensure_root_not_mounted(%Phoenix.Socket{} = socket, root_id) when is_binary(root_id) do
-    if Map.has_key?(mounted_roots(socket), root_id) do
-      {:error, :already_mounted}
-    else
-      :ok
     end
   end
 
@@ -367,8 +387,7 @@ defmodule Musubi.Transport.ConnectionChannel do
   end
 
   @spec error_reason(
-          :already_mounted
-          | :invalid_params
+          :invalid_params
           | :missing_field
           | :missing_root_id
           | :missing_connection_socket
@@ -438,7 +457,6 @@ defmodule Musubi.Transport.ConnectionChannel do
 
   defp parse_client_error_code(_other), do: :external_failed
 
-  defp error_reason(:already_mounted), do: "root already mounted"
   defp error_reason(:invalid_params), do: "params must be a map"
   defp error_reason(:missing_field), do: "missing required field"
   defp error_reason(:missing_root_id), do: "missing root id"

@@ -395,9 +395,12 @@ describe("connect", () => {
     channel.emit("patch", initialConnectionEnvelope("Test.Store:shared-root", rootState()))
     await firstPromise
 
-    // No client-side dedup: a second mount for the same (module, id) hits
-    // the wire, and the server is the single source of truth for duplicate
-    // detection. Here we simulate the `:already_mounted` rejection.
+    // No client-side prediction: the second mount for the same (module, id)
+    // hits the wire; the server replies with :already_mounted carrying the
+    // canonical root_id; the client aliases to the existing RootConnection
+    // and bumps the shared refCount. Multi-observer ergonomic — both
+    // callers share one server mount and one StoreProxy.
+    const firstMounted = await firstPromise
     const secondPromise = connection.mountStore({
       module: "Test.Store",
       id: "shared-root"
@@ -406,8 +409,95 @@ describe("connect", () => {
     expect(channel.pushes.length).toBe(firstPushCount + 1)
     const secondMountPush = lastPush(channel)
     expect(secondMountPush.event).toBe("mount")
-    secondMountPush.push.resolve("error", { reason: "root already mounted" })
-    await expect(secondPromise).rejects.toThrow(/root already mounted/)
+    secondMountPush.push.resolve("error", {
+      reason: "already_mounted",
+      root_id: "Test.Store:shared-root"
+    })
+
+    const secondMounted = await secondPromise
+    expect(secondMounted.store).toBe(firstMounted.store)
+    // No second initial-patch envelope is required; aliased caller reuses
+    // the existing connection's data tree.
+  })
+
+  test("mountStore throws MusubiInconsistencyError when server says already_mounted but client has no record", async () => {
+    const { connect } = await import("../src/connect")
+    const { MusubiInconsistencyError } = await import("../src/runtime")
+    const socket = new MockSocket()
+    const connectionPromise = connect<TestStores>(socket)
+    const channel = lastChannel(socket)
+    channel.resolveJoin()
+    const connection = await connectionPromise
+
+    const mountedPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "orphan"
+    })
+    await Promise.resolve()
+    const mountPush = lastPush(channel)
+    // Server claims an entry exists for a root_id the client has never seen
+    // — out-of-sync state, not a legitimate alias case. Client must throw,
+    // not silently fabricate an entry.
+    mountPush.push.resolve("error", {
+      reason: "already_mounted",
+      root_id: "Test.Store:phantom"
+    })
+
+    await expect(mountedPromise).rejects.toBeInstanceOf(MusubiInconsistencyError)
+  })
+
+  test("the last unmount fires the server push only after the grace timer; an in-window remount cancels it", async () => {
+    const { connect } = await import("../src/connect")
+    const socket = new MockSocket()
+    const connectionPromise = connect<TestStores>(socket)
+    const channel = lastChannel(socket)
+    channel.resolveJoin()
+    const connection = await connectionPromise
+
+    const firstPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "shared-root"
+    })
+    await Promise.resolve()
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared-root" })
+    await Promise.resolve()
+    channel.emit(
+      "patch",
+      initialConnectionEnvelope("Test.Store:shared-root", rootState())
+    )
+    const firstMounted = await firstPromise
+
+    const pushCountBefore = channel.pushes.length
+
+    // Last caller unmounts. The grace timer is scheduled but hasn't fired
+    // yet — no unmount push on the wire.
+    void firstMounted.unmount()
+    expect(channel.pushes.length).toBe(pushCountBefore)
+
+    // In-window remount: server replies :already_mounted with the same
+    // root_id (server never tore down because the unmount push never went
+    // out), client aliases back to the same RootConnection, the pending
+    // grace timer is cancelled.
+    const secondPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "shared-root"
+    })
+    await Promise.resolve()
+    const secondMountPush = lastPush(channel)
+    expect(secondMountPush.event).toBe("mount")
+    secondMountPush.push.resolve("error", {
+      reason: "already_mounted",
+      root_id: "Test.Store:shared-root"
+    })
+    const secondMounted = await secondPromise
+    expect(secondMounted.store).toBe(firstMounted.store)
+
+    // Let the original grace timer would-have-fired tick pass; no unmount
+    // push should be emitted because refCount went back to 1 before the
+    // timer ran.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    const unmountPushes = channel.pushes.filter((p) => p.event === "unmount")
+    expect(unmountPushes.length).toBe(0)
   })
 
   test("distinct modules sharing one id get distinct server mounts and patches", async () => {
@@ -496,6 +586,9 @@ describe("connect", () => {
     const mounted = await mountedPromise
 
     const unmountPromise = mounted.unmount()
+    // Server unmount push fires after the grace timer (setTimeout 0), not
+    // synchronously. Wait one task for the timer to fire.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
     const unmountPush = lastPush(channel)
     expect(unmountPush.event).toBe("unmount")
     expect(unmountPush.payload).toEqual({ root_id: "Test.Store:shared-root" })
@@ -637,6 +730,8 @@ describe("connect", () => {
 
     const { store: proxy, unmount } = await mountedPromise
     const unmountPromise = unmount()
+    // Grace timer defers the server unmount push to the next task.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
     const unmountPush = lastPush(channel)
 
     expect(unmountPush.event).toBe("unmount")

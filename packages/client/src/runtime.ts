@@ -67,6 +67,21 @@ export interface RootConnection {
   // once set, doubles as the key in `ConnectionState.roots`.
   id: string
 
+  // Local consumer count. Each `mountConnectionRoot` call that resolves to
+  // this `RootConnection` (fresh mount OR alias on `:already_mounted`)
+  // increments; each `unmountConnectionRoot` call decrements. When it hits
+  // zero, a brief grace timer fires the server `unmount` push; a re-mount
+  // within the grace window cancels the timer.
+  refCount: number
+  graceTimer: ReturnType<typeof setTimeout> | null
+
+  // Promise that resolves on the initial patch envelope (or rejects on
+  // mount failure / channel close). External `mountConnectionRoot` callers
+  // and the React adapter both `await` this. Cached on the connection so
+  // aliasing callers (`:already_mounted` reply) can await the same
+  // promise instead of racing.
+  initialPatchPromise: Promise<void> | null
+
   // Mutable runtime state — read by the proxy on every property access.
   channel: ChannelLike | undefined
   channelGeneration: number
@@ -83,6 +98,32 @@ export interface RootConnection {
   connectPromise: Promise<void> | null
   recovering: boolean
 }
+
+/**
+ * Thrown when the server reports `:already_mounted` for a `root_id` the
+ * client has no local record of — i.e. server and client `mounted_roots` /
+ * `roots` are out of sync. Indicates a real bug (reconnect race, dropped
+ * unmount, server-side state leak); should not be silently swallowed.
+ */
+export class MusubiInconsistencyError extends Error {
+  readonly rootId: string
+
+  constructor(rootId: string) {
+    super(
+      `Server reports root_id=${rootId} already mounted but the client has no matching RootConnection`
+    )
+    this.name = "MusubiInconsistencyError"
+    this.rootId = rootId
+  }
+}
+
+// Grace window (ms) between the last `unmountConnectionRoot` and the server
+// unmount push. A re-mount of the same `(module, id)` within this window
+// cancels the cleanup and reuses the existing mount — covers React 19
+// route-swap commit batching and StrictMode effect replay where one
+// component's unmount cleanup fires in the same task as the next
+// component's mount.
+const UNMOUNT_GRACE_MS = 0
 
 export interface ConnectionState {
   readonly socket: SocketLike
@@ -157,27 +198,118 @@ export function openConnectionState(
   return { connection, ready }
 }
 
-export function mountConnectionRoot(
+/**
+ * Mount (or alias to an existing mount of) a root on `connectionState`.
+ *
+ * The server is the sole authority on `(module, id)` identity:
+ *   * Fresh mount → server replies `:ok` with a canonical `root_id`. The
+ *     newly built `RootConnection` is inserted into `connectionState.roots`
+ *     under that id and returned.
+ *   * Duplicate `(module, id)` on the same connection → server replies
+ *     `:error` with `reason: "already_mounted"` and the existing `root_id`.
+ *     The client looks the id up in its own `roots` Map:
+ *       - Hit (expected): bump the existing entry's `refCount`, cancel any
+ *         pending grace-timer cleanup, discard the tentative connection,
+ *         and return the canonical one. This is the multi-observer case.
+ *       - Miss: throw `MusubiInconsistencyError`. Server and client are
+ *         out of sync (reconnect race, dropped unmount, server-side leak).
+ *
+ * Caller treats the returned `RootConnection` as the canonical reference;
+ * the tentative connection built before the mount push is discarded on
+ * the alias path.
+ */
+export async function mountConnectionRoot(
   connectionState: ConnectionState,
   options: MountConnectionRootOptions
-): { connection: RootConnection; ready: Promise<void> } {
-  // No client-side dedup: every caller gets its own RootConnection and its
-  // own server mount. The server is the sole authority on duplicates and
-  // replies with `:already_mounted` if the same `(module, id)` is mounted
-  // twice on one connection. Consumers that need sharing layer their own
-  // ref-counting (e.g. `@musubi/react`'s `pendingRootMounts`).
-  //
-  // The wire `root_id` is whatever the server returns from the mount reply
-  // — opaque to the client. We don't insert into `connectionState.roots`
-  // until the reply lands, so patches for this root can't arrive before
-  // its id is known anyway (the server only emits the initial patch after
-  // the mount succeeds).
-  const connection: RootConnection = {
+): Promise<RootConnection> {
+  const tentative = newRootConnection(connectionState, options)
+
+  await ensureConnectionReady(connectionState)
+  if (!connectionState.channel) {
+    throw new Error("Connection is not connected")
+  }
+
+  const generation = connectionState.channelGeneration
+  tentative.channel = connectionState.channel
+  tentative.channelGeneration = generation
+
+  // Prepare the initial-patch waiter on the tentative BEFORE pushing — if
+  // the server replies `:ok` quickly and the initial patch arrives in the
+  // same task, we need `pendingConnect` already wired up.
+  const tentativeInitialPatch = registerInitialPatchWaiter(tentative, generation)
+
+  const reply = await pushMount(connectionState.channel, {
+    module: tentative.module,
+    id: tentative.callerId,
+    params: tentative.mountParams
+  })
+
+  switch (reply.kind) {
+    case "ok": {
+      tentative.id = reply.rootId
+      connectionState.roots.set(reply.rootId, tentative)
+      tentative.initialPatchPromise = tentativeInitialPatch
+
+      try {
+        await tentativeInitialPatch
+      } catch (error) {
+        connectionState.roots.delete(reply.rootId)
+        tentative.channel = undefined
+        throw error
+      }
+
+      return tentative
+    }
+
+    case "already_mounted": {
+      // Tear down the tentative's pending waiter — we're not using it.
+      tentative.pendingConnect = null
+      tentative.channel = undefined
+
+      const existing = connectionState.roots.get(reply.rootId)
+      if (!existing) {
+        throw new MusubiInconsistencyError(reply.rootId)
+      }
+
+      warnOnParamsMismatch(existing, options)
+
+      existing.refCount += 1
+      cancelGraceTimer(existing)
+
+      if (existing.initialPatchPromise && existing.version === 0) {
+        // Aliasing caller arrived before the initial patch settled.
+        try {
+          await existing.initialPatchPromise
+        } catch (error) {
+          existing.refCount -= 1
+          throw error
+        }
+      }
+
+      return existing
+    }
+
+    case "error": {
+      tentative.pendingConnect = null
+      tentative.channel = undefined
+      throw new Error(`Root mount failed: ${reply.reason}`)
+    }
+  }
+}
+
+function newRootConnection(
+  connectionState: ConnectionState,
+  options: MountConnectionRootOptions
+): RootConnection {
+  return {
     module: options.module,
     callerId: options.id,
     id: "",
     connection: connectionState,
     mountParams: options.params ?? {},
+    refCount: 1,
+    graceTimer: null,
+    initialPatchPromise: null,
     channel: undefined,
     channelGeneration: 0,
     root: undefined,
@@ -193,43 +325,130 @@ export function mountConnectionRoot(
     connectPromise: null,
     recovering: false
   }
-
-  const ready = ensureConnectionRootMounted(connection).catch((error) => {
-    // Drop the map entry if the mount got far enough to be inserted before
-    // it failed; pre-reply failures never inserted, so this is a no-op.
-    if (connection.id !== "") {
-      connectionState.roots.delete(connection.id)
-    }
-
-    throw error
-  })
-
-  return { connection, ready }
 }
 
+function registerInitialPatchWaiter(
+  connection: RootConnection,
+  generation: number
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    connection.pendingConnect = { generation, resolve, reject }
+  })
+}
+
+function cancelGraceTimer(connection: RootConnection): void {
+  if (connection.graceTimer !== null) {
+    clearTimeout(connection.graceTimer)
+    connection.graceTimer = null
+  }
+}
+
+function warnOnParamsMismatch(
+  existing: RootConnection,
+  options: MountConnectionRootOptions
+): void {
+  if (isProductionEnv()) {
+    return
+  }
+
+  const next = options.params ?? {}
+  if (sameParams(existing.mountParams, next)) {
+    return
+  }
+
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[musubi] mountConnectionRoot({module: "${options.module}", id: "${options.id}"}) ` +
+      `aliased to an existing root with different params. First-mount params ` +
+      `are authoritative; later params are ignored. Use a distinct id if you ` +
+      `need separate instances.`
+  )
+}
+
+function isProductionEnv(): boolean {
+  // Reach `process.env.NODE_ENV` via `globalThis` so the check works in
+  // Node and in tree-shaken browser bundles without requiring an ambient
+  // `process` declaration (browser-only consumer apps don't include
+  // `@types/node` and would otherwise see a "Cannot find name 'process'"
+  // typecheck error).
+  const env = (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env
+    ?.NODE_ENV
+  return env === "production"
+}
+
+function sameParams(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const aKeys = Object.keys(a)
+  const bKeys = Object.keys(b)
+  if (aKeys.length !== bKeys.length) return false
+  for (const k of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false
+    if (!Object.is(a[k], b[k])) return false
+  }
+  return true
+}
+
+/**
+ * Drop a caller's hold on a `RootConnection`. When `refCount` hits zero a
+ * grace timer schedules the server `unmount` push; a re-mount of the same
+ * `(module, id)` within the grace window cancels the cleanup and reuses
+ * the existing mount.
+ */
 export async function unmountConnectionRoot(connection: RootConnection): Promise<void> {
+  if (connection.refCount <= 0) {
+    return
+  }
+
+  connection.refCount -= 1
+  if (connection.refCount > 0) {
+    return
+  }
+
+  // Last caller went away. Defer the actual server unmount so a near-future
+  // re-mount (route swap, StrictMode replay) can grab the existing entry
+  // before we tear it down.
+  cancelGraceTimer(connection)
   const connectionState = connection.connection
   const rootId = connection.id
 
-  if (!connectionState.roots.has(rootId)) {
-    return
-  }
+  const settled = new Promise<void>((resolve, reject) => {
+    connection.graceTimer = setTimeout(() => {
+      connection.graceTimer = null
 
-  connection.pendingConnect?.reject(new Error("Unmounted"))
-  connection.pendingConnect = null
-  rejectPendingCommands(connection, new Error("Unmounted"))
-  resetConnectionState(connection)
-  connection.channel = undefined
-  connectionState.roots.delete(rootId)
+      if (connection.refCount > 0) {
+        // A new caller showed up; cleanup cancelled.
+        resolve()
+        return
+      }
 
-  if (!connectionState.channel) {
-    return
-  }
+      if (!connectionState.roots.has(rootId)) {
+        // Disconnect / external cleanup already removed us.
+        resolve()
+        return
+      }
 
-  await receivePush(
-    connectionState.channel.push("unmount", { root_id: rootId }) as PushLike,
-    "Root unmount"
-  )
+      connection.pendingConnect?.reject(new Error("Unmounted"))
+      connection.pendingConnect = null
+      rejectPendingCommands(connection, new Error("Unmounted"))
+      resetConnectionState(connection)
+      connection.channel = undefined
+      connection.initialPatchPromise = null
+      connectionState.roots.delete(rootId)
+
+      if (!connectionState.channel) {
+        resolve()
+        return
+      }
+
+      receivePush(
+        connectionState.channel.push("unmount", { root_id: rootId }) as PushLike,
+        "Root unmount"
+      )
+        .then(() => resolve())
+        .catch(reject)
+    }, UNMOUNT_GRACE_MS)
+  })
+
+  await settled
 }
 
 export async function disconnectConnectionState(
@@ -405,28 +624,57 @@ async function doConnectConnection(connectionState: ConnectionState): Promise<vo
   }
 }
 
-function ensureConnectionRootMounted(connection: RootConnection): Promise<void> {
-  if (connection.version >= 1 && connection.channel) {
-    return Promise.resolve()
-  }
+type MountReply =
+  | { kind: "ok"; rootId: string }
+  | { kind: "already_mounted"; rootId: string }
+  | { kind: "error"; reason: string }
 
-  if (connection.connectPromise) {
-    return connection.connectPromise
-  }
-
-  const connectionState = connection.connection
-
-  connection.connectPromise = doMountConnectionRoot(connectionState, connection).finally(() => {
-    connection.connectPromise = null
+function pushMount(
+  channel: ChannelLike,
+  payload: { module: string; id: string; params: Record<string, unknown> }
+): Promise<MountReply> {
+  return new Promise<MountReply>((resolve) => {
+    ;(channel.push("mount", payload) as PushLike)
+      .receive("ok", (replyPayload) => {
+        if (isRecord(replyPayload) && typeof replyPayload.root_id === "string" && replyPayload.root_id !== "") {
+          resolve({ kind: "ok", rootId: replyPayload.root_id })
+        } else {
+          resolve({
+            kind: "error",
+            reason: `mount reply missing root_id: ${JSON.stringify(replyPayload)}`
+          })
+        }
+      })
+      .receive("error", (replyPayload) => {
+        if (
+          isRecord(replyPayload) &&
+          replyPayload.reason === "already_mounted" &&
+          typeof replyPayload.root_id === "string" &&
+          replyPayload.root_id !== ""
+        ) {
+          resolve({ kind: "already_mounted", rootId: replyPayload.root_id })
+        } else {
+          const reason =
+            isRecord(replyPayload) && typeof replyPayload.reason === "string"
+              ? replyPayload.reason
+              : JSON.stringify(replyPayload)
+          resolve({ kind: "error", reason })
+        }
+      })
+      .receive("timeout", () => {
+        resolve({ kind: "error", reason: "timeout" })
+      })
   })
-
-  return connection.connectPromise
 }
 
-async function doMountConnectionRoot(
-  connectionState: ConnectionState,
-  connection: RootConnection
-): Promise<void> {
+/**
+ * Re-mount the existing `connection` after a version mismatch / recovery.
+ * Reuses the same `RootConnection` instance (its `id`, `module`, `callerId`
+ * are stable) — the server-assigned `root_id` must match what we already
+ * have, otherwise something is badly out of sync.
+ */
+async function remountExistingConnection(connection: RootConnection): Promise<void> {
+  const connectionState = connection.connection
   await ensureConnectionReady(connectionState)
 
   if (!connectionState.channel) {
@@ -436,47 +684,33 @@ async function doMountConnectionRoot(
   const generation = connectionState.channelGeneration
   connection.channel = connectionState.channel
   connection.channelGeneration = generation
+  const initialPatch = registerInitialPatchWaiter(connection, generation)
+  connection.initialPatchPromise = initialPatch
 
-  const initialPatch = new Promise<void>((resolve, reject) => {
-    connection.pendingConnect = { generation, resolve, reject }
+  const reply = await pushMount(connectionState.channel, {
+    module: connection.module,
+    id: connection.callerId,
+    params: connection.mountParams
   })
 
-  try {
-    const reply = await receivePush(
-      connectionState.channel.push("mount", {
-        module: connection.module,
-        id: connection.callerId,
-        params: connection.mountParams ?? {}
-      }) as PushLike,
-      "Root mount"
-    )
-
-    const assignedRootId = extractRootIdFromMountReply(reply)
-
-    // Recovery (`recoverConnectionRootFromVersionMismatch`) re-uses the
-    // same connection across remounts; the server-assigned root id must
-    // stay stable.
-    if (connection.id !== "" && connection.id !== assignedRootId) {
-      throw new Error(`Root mount returned unexpected root_id: ${assignedRootId}`)
-    }
-
-    connection.id = assignedRootId
-    connectionState.roots.set(assignedRootId, connection)
-  } catch (error) {
+  if (reply.kind === "error") {
     connection.pendingConnect = null
     connection.channel = undefined
-    throw error
+    throw new Error(`Root remount failed: ${reply.reason}`)
   }
+
+  if (reply.rootId !== connection.id) {
+    connection.pendingConnect = null
+    connection.channel = undefined
+    throw new Error(
+      `Root remount returned unexpected root_id: ${reply.rootId} (expected ${connection.id})`
+    )
+  }
+
+  // Re-insert in the roots Map (recovery may have removed us during reset).
+  connectionState.roots.set(connection.id, connection)
 
   await initialPatch
-}
-
-function extractRootIdFromMountReply(reply: unknown): string {
-  if (isRecord(reply) && typeof reply.root_id === "string" && reply.root_id !== "") {
-    return reply.root_id
-  }
-
-  throw new Error(`Root mount reply missing root_id: ${JSON.stringify(reply)}`)
 }
 
 function handlePatch(
@@ -637,7 +871,7 @@ async function recoverConnectionRootFromVersionMismatch(
       ).catch(() => undefined)
     }
 
-    await ensureConnectionRootMounted(connection)
+    await remountExistingConnection(connection)
   } finally {
     connection.recovering = false
   }
