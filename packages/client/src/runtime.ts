@@ -131,6 +131,12 @@ export interface ConnectionState {
   readonly roots: Map<string, RootConnection>
   readonly uploaders: Record<string, ExternalUploader>
 
+  // In-flight `mountConnectionRoot` tentatives that haven't yet been
+  // inserted into `roots`. Tracked here so disconnect / channel close
+  // can cancel them — otherwise their awaiting callers would hang
+  // forever because there's no `roots` entry to find them through.
+  readonly pendingMounts: Set<RootConnection>
+
   channel: ChannelLike | undefined
   channelGeneration: number
   connectPromise: Promise<void> | null
@@ -184,6 +190,7 @@ export function openConnectionState(
     socket,
     topic,
     roots: new Map(),
+    pendingMounts: new Set(),
     uploaders: options.uploaders ?? {},
     channel: undefined,
     channelGeneration: 0,
@@ -223,29 +230,37 @@ export async function mountConnectionRoot(
   options: MountConnectionRootOptions
 ): Promise<RootConnection> {
   const tentative = newRootConnection(connectionState, options)
+  connectionState.pendingMounts.add(tentative)
 
-  await ensureConnectionReady(connectionState)
-  if (!connectionState.channel) {
-    throw new Error("Connection is not connected")
-  }
+  try {
+    await ensureConnectionReady(connectionState)
+    if (!connectionState.channel) {
+      throw new Error("Connection is not connected")
+    }
 
-  const generation = connectionState.channelGeneration
-  tentative.channel = connectionState.channel
-  tentative.channelGeneration = generation
+    const generation = connectionState.channelGeneration
+    tentative.channel = connectionState.channel
+    tentative.channelGeneration = generation
 
-  // Prepare the initial-patch waiter on the tentative BEFORE pushing — if
-  // the server replies `:ok` quickly and the initial patch arrives in the
-  // same task, we need `pendingConnect` already wired up.
-  const tentativeInitialPatch = registerInitialPatchWaiter(tentative, generation)
+    // Prepare the initial-patch waiter on the tentative BEFORE pushing —
+    // if the server replies `:ok` quickly and the initial patch arrives
+    // in the same task, we need `pendingConnect` already wired up.
+    const tentativeInitialPatch = registerInitialPatchWaiter(tentative, generation)
 
-  const reply = await pushMount(connectionState.channel, {
-    module: tentative.module,
-    id: tentative.callerId,
-    params: tentative.mountParams
-  })
+    // Phoenix delivers reply frames in push order and processes them
+    // serially in the JS event loop, so reply / patch interleaving is
+    // not a concern: by the time the patch frame is handled, the mount
+    // reply's microtask continuation has already settled and inserted
+    // the connection into `connectionState.roots`. On channel close
+    // mid-mount, Phoenix's push errors out via the default push timeout
+    // — the awaiter unblocks then.
+    const reply = await pushMount(connectionState.channel, {
+      module: tentative.module,
+      id: tentative.callerId,
+      params: tentative.mountParams
+    })
 
-  switch (reply.kind) {
-    case "ok": {
+    if (reply.kind === "ok") {
       tentative.id = reply.rootId
       connectionState.roots.set(reply.rootId, tentative)
       tentative.initialPatchPromise = tentativeInitialPatch
@@ -261,39 +276,38 @@ export async function mountConnectionRoot(
       return tentative
     }
 
-    case "already_mounted": {
-      // Tear down the tentative's pending waiter — we're not using it.
-      tentative.pendingConnect = null
-      tentative.channel = undefined
+    // Both `already_mounted` and `error` discard the tentative — its waiter
+    // is no longer wired to anything the channel will resolve.
+    tentative.pendingConnect = null
+    tentative.channel = undefined
 
-      const existing = connectionState.roots.get(reply.rootId)
-      if (!existing) {
-        throw new MusubiInconsistencyError(reply.rootId)
-      }
-
-      warnOnParamsMismatch(existing, options)
-
-      existing.refCount += 1
-      cancelGraceTimer(existing)
-
-      if (existing.initialPatchPromise && existing.version === 0) {
-        // Aliasing caller arrived before the initial patch settled.
-        try {
-          await existing.initialPatchPromise
-        } catch (error) {
-          existing.refCount -= 1
-          throw error
-        }
-      }
-
-      return existing
-    }
-
-    case "error": {
-      tentative.pendingConnect = null
-      tentative.channel = undefined
+    if (reply.kind === "error") {
       throw new Error(`Root mount failed: ${reply.reason}`)
     }
+
+    const existing = connectionState.roots.get(reply.rootId)
+    if (!existing) {
+      throw new MusubiInconsistencyError(reply.rootId)
+    }
+
+    warnOnParamsMismatch(existing, options)
+
+    existing.refCount += 1
+    cancelGraceTimer(existing)
+
+    if (existing.initialPatchPromise && existing.version === 0) {
+      // Aliasing caller arrived before the initial patch settled.
+      try {
+        await existing.initialPatchPromise
+      } catch (error) {
+        existing.refCount -= 1
+        throw error
+      }
+    }
+
+    return existing
+  } finally {
+    connectionState.pendingMounts.delete(tentative)
   }
 }
 
@@ -378,8 +392,7 @@ function isProductionEnv(): boolean {
 
 function sameParams(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
   const aKeys = Object.keys(a)
-  const bKeys = Object.keys(b)
-  if (aKeys.length !== bKeys.length) return false
+  if (aKeys.length !== Object.keys(b).length) return false
   for (const k of aKeys) {
     if (!Object.prototype.hasOwnProperty.call(b, k)) return false
     if (!Object.is(a[k], b[k])) return false
@@ -410,7 +423,7 @@ export async function unmountConnectionRoot(connection: RootConnection): Promise
   const connectionState = connection.connection
   const rootId = connection.id
 
-  const settled = new Promise<void>((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     connection.graceTimer = setTimeout(() => {
       connection.graceTimer = null
 
@@ -426,9 +439,10 @@ export async function unmountConnectionRoot(connection: RootConnection): Promise
         return
       }
 
-      connection.pendingConnect?.reject(new Error("Unmounted"))
+      const unmounted = new Error("Unmounted")
+      connection.pendingConnect?.reject(unmounted)
       connection.pendingConnect = null
-      rejectPendingCommands(connection, new Error("Unmounted"))
+      rejectPendingCommands(connection, unmounted)
       resetConnectionState(connection)
       connection.channel = undefined
       connection.initialPatchPromise = null
@@ -447,17 +461,29 @@ export async function unmountConnectionRoot(connection: RootConnection): Promise
         .catch(reject)
     }, UNMOUNT_GRACE_MS)
   })
-
-  await settled
 }
 
 export async function disconnectConnectionState(
   connectionState: ConnectionState
 ): Promise<void> {
+  const disconnectError = new Error("Disconnected")
+
+  // Reject the initial-patch waiter on any in-flight mount whose tentative
+  // has been wired up with `pendingConnect` but isn't in `roots` yet. The
+  // outer `pushMount` await unblocks via Phoenix's default push timeout
+  // when the channel goes away.
+  for (const pending of connectionState.pendingMounts) {
+    pending.pendingConnect?.reject(disconnectError)
+    pending.pendingConnect = null
+  }
+  connectionState.pendingMounts.clear()
+
   for (const root of connectionState.roots.values()) {
-    root.pendingConnect?.reject(new Error("Disconnected"))
+    cancelGraceTimer(root)
+    root.pendingConnect?.reject(disconnectError)
     root.pendingConnect = null
-    rejectPendingCommands(root, new Error("Disconnected"))
+    root.initialPatchPromise = null
+    rejectPendingCommands(root, disconnectError)
     resetConnectionState(root)
     root.channel = undefined
   }
@@ -699,6 +725,23 @@ async function remountExistingConnection(connection: RootConnection): Promise<vo
     throw new Error(`Root remount failed: ${reply.reason}`)
   }
 
+  // `:already_mounted` during recovery means the server still has our
+  // entry — the prologue's `unmount` push didn't take effect (either
+  // dropped on a flaky channel or processed after we'd already started
+  // re-mounting). We just `resetConnectionState`-d this connection
+  // locally, so the server will NOT re-emit an initial patch (the page
+  // server didn't restart). Awaiting `initialPatch` here would hang
+  // forever — fail loud instead so the consumer can drop the connection
+  // and reconnect cleanly.
+  if (reply.kind === "already_mounted") {
+    connection.pendingConnect = null
+    connection.channel = undefined
+    connection.initialPatchPromise = null
+    throw new Error(
+      `Root remount aborted: server still has root_id=${reply.rootId} but the recovery unmount did not complete. Disconnect and reconnect to resynchronise.`
+    )
+  }
+
   if (reply.rootId !== connection.id) {
     connection.pendingConnect = null
     connection.channel = undefined
@@ -881,10 +924,20 @@ function handleConnectionDisconnect(
   connectionState: ConnectionState,
   _reason: unknown
 ): void {
+  const disconnectError = new Error("Disconnected")
+
+  for (const pending of connectionState.pendingMounts) {
+    pending.pendingConnect?.reject(disconnectError)
+    pending.pendingConnect = null
+  }
+  connectionState.pendingMounts.clear()
+
   for (const root of connectionState.roots.values()) {
-    root.pendingConnect?.reject(new Error("Disconnected"))
+    cancelGraceTimer(root)
+    root.pendingConnect?.reject(disconnectError)
     root.pendingConnect = null
-    rejectPendingCommands(root, new Error("Disconnected"))
+    root.initialPatchPromise = null
+    rejectPendingCommands(root, disconnectError)
     resetConnectionState(root)
     root.channel = undefined
   }
