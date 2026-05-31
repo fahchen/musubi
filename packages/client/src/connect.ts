@@ -86,7 +86,7 @@ function buildConnectionApi<R>(connectionState: ConnectionState): MusubiConnecti
         }
 
         unmounted = true
-        return unmountConnectionRoot(connectionState, options.id)
+        return unmountConnectionRoot(connection)
       }
 
       return { store, unmount }

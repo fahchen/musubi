@@ -122,6 +122,13 @@ export interface MountConnectionRootOptions {
   params?: Record<string, unknown>
 }
 
+// Local Map key — wire `root_id` stays `options.id`; collisions on the same
+// id with distinct modules get a server-side `:already_mounted` rejection
+// instead of silently aliasing the first entry.
+function rootMapKey(module: string, id: string): string {
+  return `${module}|${id}`
+}
+
 export function openConnectionState(
   socket: SocketLike,
   options: OpenConnectionOptions = {}
@@ -156,8 +163,8 @@ export function mountConnectionRoot(
   connectionState: ConnectionState,
   options: MountConnectionRootOptions
 ): { connection: RootConnection; ready: Promise<void> } {
-  const rootId = options.id
-  const existing = connectionState.roots.get(rootId)
+  const mapKey = rootMapKey(options.module, options.id)
+  const existing = connectionState.roots.get(mapKey)
 
   // Don't pre-reject duplicates locally — the server is the source of truth
   // for "already mounted" and will reply with an `:already_mounted` error
@@ -191,11 +198,11 @@ export function mountConnectionRoot(
     recovering: false
   }
 
-  connectionState.roots.set(rootId, connection)
+  connectionState.roots.set(mapKey, connection)
 
   const ready = ensureConnectionRootMounted(connection).catch((error) => {
     if (connection.version === 0) {
-      connectionState.roots.delete(rootId)
+      connectionState.roots.delete(mapKey)
     }
 
     throw error
@@ -204,35 +211,28 @@ export function mountConnectionRoot(
   return { connection, ready }
 }
 
-export async function unmountConnectionRoot(
-  connectionState: ConnectionState,
-  rootId: string
-): Promise<void> {
-  const connection = connectionState.roots.get(rootId)
-
-  if (!connection) {
-    return
-  }
-
+export async function unmountConnectionRoot(connection: RootConnection): Promise<void> {
   connection.refCount -= 1
 
   if (connection.refCount > 0) {
     return
   }
 
+  const connectionState = connection.connection
+
   connection.pendingConnect?.reject(new Error("Unmounted"))
   connection.pendingConnect = null
   rejectPendingCommands(connection, new Error("Unmounted"))
   resetConnectionState(connection)
   connection.channel = undefined
-  connectionState.roots.delete(rootId)
+  connectionState.roots.delete(rootMapKey(connection.module, connection.id))
 
   if (!connectionState.channel) {
     return
   }
 
   await receivePush(
-    connectionState.channel.push("unmount", { root_id: rootId }) as PushLike,
+    connectionState.channel.push("unmount", { root_id: connection.id }) as PushLike,
     "Root unmount"
   )
 }
@@ -560,6 +560,24 @@ function acceptEnvelope(
   }
 }
 
+// Multiple Map entries can share a wire id when distinct modules collide on
+// the same options.id; prefer the server-confirmed root, fall back to the
+// pending one that's about to be rejected.
+function findRootByWireId(
+  connectionState: ConnectionState,
+  rootId: string
+): RootConnection | undefined {
+  let fallback: RootConnection | undefined
+
+  for (const root of connectionState.roots.values()) {
+    if (root.id !== rootId) continue
+    if (root.version >= 1) return root
+    fallback ??= root
+  }
+
+  return fallback
+}
+
 function handleConnectionPatch(
   connectionState: ConnectionState,
   payload: unknown,
@@ -572,7 +590,7 @@ function handleConnectionPatch(
     return
   }
 
-  const connection = connectionState.roots.get(payload.root_id)
+  const connection = findRootByWireId(connectionState, payload.root_id)
 
   if (!connection) {
     return

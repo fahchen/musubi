@@ -158,6 +158,14 @@ type TestStores = {
     },
     {}
   >
+
+  "Test.Other": Musubi.StoreDef<
+    "Test.Other",
+    {
+      label: string
+    },
+    {}
+  >
 }
 
 type Equal<Left, Right> =
@@ -384,6 +392,60 @@ describe("connect", () => {
     // No second mount push: dedup reuses the in-memory entry. The server is
     // the source of truth for duplicate-mount errors; locally we just attach.
     expect(channel.pushes.length).toBe(firstPushCount)
+  })
+
+  test("mountStore does not dedup across distinct modules sharing one id", async () => {
+    const { connect } = await import("../src/connect")
+    const socket = new MockSocket()
+    const connectionPromise = connect<TestStores>(socket)
+    const channel = lastChannel(socket)
+    channel.resolveJoin()
+    const connection = await connectionPromise
+
+    const firstPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "shared"
+    })
+    await Promise.resolve()
+    const firstMountPush = lastPush(channel)
+    expect(firstMountPush.event).toBe("mount")
+    expect(firstMountPush.payload).toMatchObject({ module: "Test.Store", id: "shared" })
+    firstMountPush.push.resolve("ok", { root_id: "shared" })
+    channel.emit("patch", initialConnectionEnvelope("shared", rootState()))
+    const first = await firstPromise
+
+    const pushCountBeforeSecond = channel.pushes.length
+
+    const secondPromise = connection.mountStore({
+      module: "Test.Other",
+      id: "shared"
+    })
+    await Promise.resolve()
+
+    // Distinct module must issue its own server mount instead of aliasing
+    // the existing root — see spec/cf-dashboard-route-mount-bug.md.
+    expect(channel.pushes.length).toBe(pushCountBeforeSecond + 1)
+    const secondMountPush = lastPush(channel)
+    expect(secondMountPush.event).toBe("mount")
+    expect(secondMountPush.payload).toMatchObject({ module: "Test.Other", id: "shared" })
+
+    // Server rejects the colliding mount; client surfaces the error and
+    // cleans up the orphaned local entry instead of silently aliasing.
+    secondMountPush.push.resolve("error", { reason: "root already mounted" })
+    await expect(secondPromise).rejects.toThrow()
+
+    // Patches for the original mount keep flowing to the surviving root.
+    channel.emit(
+      "patch",
+      connectionEnvelope(
+        "shared",
+        1,
+        2,
+        [{ op: "replace", path: "/counter", value: 7 }],
+        []
+      )
+    )
+    expect(first.store.counter).toBe(7)
   })
 
   test("shared root unmount waits for the last caller handle", async () => {
