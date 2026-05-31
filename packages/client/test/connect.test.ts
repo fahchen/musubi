@@ -500,6 +500,106 @@ describe("connect", () => {
     expect(unmountPushes.length).toBe(0)
   })
 
+  test("an orphaned root after grace-timer skip + failed pending mount re-arms teardown", async () => {
+    // Variant of the alias-deferred race: timer skipped teardown
+    // because a pending mount existed, but that mount then settles
+    // with `:error` (server returned an unrelated failure). Without
+    // re-arming, the prior root would leak at refCount=0 forever.
+    const { connect } = await import("../src/connect")
+    const socket = new MockSocket()
+    const connectionPromise = connect<TestStores>(socket)
+    const channel = lastChannel(socket)
+    channel.resolveJoin()
+    const connection = await connectionPromise
+
+    const firstPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "shared"
+    })
+    await Promise.resolve()
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared" })
+    await Promise.resolve()
+    channel.emit("patch", initialConnectionEnvelope("Test.Store:shared", rootState()))
+    const firstMounted = await firstPromise
+
+    void firstMounted.unmount()
+    const secondPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "shared"
+    })
+    await Promise.resolve()
+    const secondMountPush = lastPush(channel)
+    expect(secondMountPush.event).toBe("mount")
+
+    // Grace timer fires, sees pending mount, skips teardown.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(channel.pushes.filter((p) => p.event === "unmount").length).toBe(0)
+
+    // Pending mount FAILS (not :already_mounted) — leaves the
+    // original root orphaned at refCount=0.
+    secondMountPush.push.resolve("error", { reason: "params must be a map" })
+    await expect(secondPromise).rejects.toThrow(/Root mount failed/)
+
+    // `mountConnectionRoot`'s finally re-armed teardown for the
+    // orphaned root. Let the new grace timer fire.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    const unmountPushes = channel.pushes.filter((p) => p.event === "unmount")
+    expect(unmountPushes.length).toBe(1)
+    expect(unmountPushes[0]!.payload).toEqual({ root_id: "Test.Store:shared" })
+  })
+
+  test("a grace timer firing while a remount push is in flight defers teardown and lets the alias succeed", async () => {
+    // Race: `mountConnectionRoot` issued a fresh push (whose reply
+    // will be `:already_mounted`), but the grace timer from a prior
+    // `unmount()` fires before the reply arrives. If the timer
+    // unconditionally tore the entry down, the alias path would hit
+    // `MusubiInconsistencyError`. The timer must skip teardown when
+    // a pending mount for the same `(module, callerId)` exists.
+    const { connect } = await import("../src/connect")
+    const socket = new MockSocket()
+    const connectionPromise = connect<TestStores>(socket)
+    const channel = lastChannel(socket)
+    channel.resolveJoin()
+    const connection = await connectionPromise
+
+    const firstPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "shared"
+    })
+    await Promise.resolve()
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared" })
+    await Promise.resolve()
+    channel.emit("patch", initialConnectionEnvelope("Test.Store:shared", rootState()))
+    const firstMounted = await firstPromise
+
+    // Last caller releases — grace timer scheduled.
+    void firstMounted.unmount()
+
+    // New caller starts a mount with the same (module, callerId);
+    // push goes out but the reply is held.
+    const secondPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "shared"
+    })
+    await Promise.resolve()
+    const remountPush = lastPush(channel)
+    expect(remountPush.event).toBe("mount")
+
+    // Let the grace timer fire — it must skip teardown because a
+    // mount with the same (module, callerId) is in `pendingMounts`.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(channel.pushes.filter((p) => p.event === "unmount").length).toBe(0)
+
+    // Server replies :already_mounted; alias path looks up the still-
+    // present `roots` entry, succeeds, returns the same proxy.
+    remountPush.push.resolve("error", {
+      reason: "already_mounted",
+      root_id: "Test.Store:shared"
+    })
+    const secondMounted = await secondPromise
+    expect(secondMounted.store).toBe(firstMounted.store)
+  })
+
   test("distinct modules sharing one id get distinct server mounts and patches", async () => {
     const { connect } = await import("../src/connect")
     const socket = new MockSocket()
@@ -760,12 +860,16 @@ describe("connect", () => {
   })
 
   test("disconnect mid-mount does not surface an unhandled rejection on the in-flight tentative", async () => {
-    // Pre-fix behaviour: disconnect rejected the tentative's
-    // `pendingConnect` while no awaiter was observing it, producing an
-    // unhandled rejection on its own task. We now clear the waiter
-    // without rejecting it. Node's `unhandledRejection` listener takes
-    // `(reason, promise)` — not a browser-style `PromiseRejectionEvent`
-    // — so calling `event.preventDefault()` would itself throw.
+    // Disconnect rejects the tentative's `pendingConnect` so that if
+    // the mount push later returns `:ok`, the `:ok` branch's
+    // `await tentativeInitialPatch` immediately throws and surfaces
+    // the error to the mount caller. The
+    // `registerInitialPatchWaiter` pre-attached `.catch` shield
+    // prevents that rejection from surfacing as an unhandled
+    // `PromiseRejectionEvent` if no one is awaiting the promise yet.
+    // Node's `unhandledRejection` listener takes `(reason, promise)` —
+    // not a browser-style `PromiseRejectionEvent` — so the listener
+    // signature must match.
     const unhandled: unknown[] = []
     const onUnhandled = (reason: unknown): void => {
       unhandled.push(reason)

@@ -97,6 +97,20 @@ export interface RootConnection {
   pendingConnect: PendingConnect | null
   connectPromise: Promise<void> | null
   recovering: boolean
+
+  // Set while `mountConnectionRoot`'s inner `pushMount` await is in
+  // flight. Disconnect calls this to settle the awaited mount reply
+  // promise immediately with `{ kind: "error" }` so the mount caller
+  // doesn't have to wait for Phoenix's push timeout. Cleared after
+  // `pushMount` settles via any path.
+  cancelMountPush: ((reason: string) => void) | null
+
+  // Set while `unmountConnectionRoot` is awaiting the grace-timer
+  // settlement. A timer cancellation (alias-on-remount, disconnect)
+  // calls this to resolve the awaiting caller — the consumer's
+  // "release my handle" intent is honored even if the internal
+  // server-side teardown was skipped.
+  pendingUnmountResolver: (() => void) | null
 }
 
 /**
@@ -254,7 +268,7 @@ export async function mountConnectionRoot(
     // the connection into `connectionState.roots`. On channel close
     // mid-mount, Phoenix's push errors out via the default push timeout
     // — the awaiter unblocks then.
-    const reply = await pushMount(connectionState.channel, {
+    const reply = await pushMount(connectionState.channel, tentative, {
       module: tentative.module,
       id: tentative.callerId,
       params: tentative.mountParams
@@ -308,6 +322,11 @@ export async function mountConnectionRoot(
     return existing
   } finally {
     connectionState.pendingMounts.delete(tentative)
+    // If a prior `unmountConnectionRoot`'s grace timer fired while this
+    // mount was pending and skipped teardown to wait for our alias, but
+    // we ended up not aliasing (errored out, or `:ok` produced a fresh
+    // root_id), the orphaned entry never gets torn down. Re-arm.
+    rearmOrphanedRootTeardowns(connectionState, tentative.module, tentative.callerId)
   }
 }
 
@@ -324,6 +343,8 @@ function newRootConnection(
     refCount: 1,
     graceTimer: null,
     initialPatchPromise: null,
+    cancelMountPush: null,
+    pendingUnmountResolver: null,
     channel: undefined,
     channelGeneration: 0,
     root: undefined,
@@ -362,6 +383,13 @@ function cancelGraceTimer(connection: RootConnection): void {
   if (connection.graceTimer !== null) {
     clearTimeout(connection.graceTimer)
     connection.graceTimer = null
+  }
+  // Settle the awaiting `unmount()` caller — the consumer released
+  // their handle; whether the server teardown actually ran is internal.
+  const resolver = connection.pendingUnmountResolver
+  if (resolver) {
+    connection.pendingUnmountResolver = null
+    resolver()
   }
 }
 
@@ -428,21 +456,65 @@ export async function unmountConnectionRoot(connection: RootConnection): Promise
   // re-mount (route swap, StrictMode replay) can grab the existing entry
   // before we tear it down.
   cancelGraceTimer(connection)
+  await scheduleRootTeardown(connection)
+}
+
+// Schedule a grace-window teardown for a `refCount === 0` root. Used both by
+// `unmountConnectionRoot` (the normal release path) and by
+// `mountConnectionRoot`'s post-error cleanup, which re-arms the timer for
+// roots that were left orphaned when a previous timer firing skipped
+// teardown to wait for a pending alias that subsequently failed.
+function scheduleRootTeardown(connection: RootConnection): Promise<void> {
   const connectionState = connection.connection
   const rootId = connection.id
 
-  await new Promise<void>((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
+    // Track the resolver on the connection so external paths
+    // (`cancelGraceTimer` on alias-remount, disconnect handlers) can
+    // settle this awaiter — otherwise the caller's `await unmount()`
+    // hangs forever if the timer is cancelled before it fires.
+    connection.pendingUnmountResolver = () => {
+      connection.pendingUnmountResolver = null
+      resolve()
+    }
+
     connection.graceTimer = setTimeout(() => {
       connection.graceTimer = null
 
       if (connection.refCount > 0) {
-        // A new caller showed up; cleanup cancelled.
+        // A new caller showed up; cleanup cancelled. The consumer's
+        // "release my handle" intent is honored regardless of whether
+        // the server-side teardown ran.
+        connection.pendingUnmountResolver = null
         resolve()
         return
       }
 
       if (!connectionState.roots.has(rootId)) {
         // Disconnect / external cleanup already removed us.
+        connection.pendingUnmountResolver = null
+        resolve()
+        return
+      }
+
+      // Race guard: a concurrent `mountConnectionRoot` for the same
+      // `(module, callerId)` may already be awaiting its mount push.
+      // When the server replies `:already_mounted`, the alias path
+      // looks `rootId` up in `connectionState.roots` — if we tear down
+      // now, the alias finds nothing and throws
+      // `MusubiInconsistencyError`. Skip teardown if such a pending
+      // mount exists; the alias path will bump `refCount` (and cancel
+      // any grace timer) shortly. If the pending mount instead settles
+      // with `:error`, its `finally` re-arms us via
+      // `scheduleRootTeardown`.
+      const pendingAliasing = [...connectionState.pendingMounts].some(
+        (p) =>
+          p !== connection &&
+          p.module === connection.module &&
+          p.callerId === connection.callerId
+      )
+      if (pendingAliasing) {
+        connection.pendingUnmountResolver = null
         resolve()
         return
       }
@@ -457,6 +529,7 @@ export async function unmountConnectionRoot(connection: RootConnection): Promise
       connectionState.roots.delete(rootId)
 
       if (!connectionState.channel) {
+        connection.pendingUnmountResolver = null
         resolve()
         return
       }
@@ -465,10 +538,40 @@ export async function unmountConnectionRoot(connection: RootConnection): Promise
         connectionState.channel.push("unmount", { root_id: rootId }) as PushLike,
         "Root unmount"
       )
-        .then(() => resolve())
-        .catch(reject)
+        .then(() => {
+          connection.pendingUnmountResolver = null
+          resolve()
+        })
+        .catch((error) => {
+          connection.pendingUnmountResolver = null
+          reject(error)
+        })
     }, UNMOUNT_GRACE_MS)
   })
+}
+
+// Re-arm teardown for any root left orphaned (refCount=0, no grace timer)
+// after `mountConnectionRoot` settles non-aliasing. Specifically: if a
+// previous unmount's timer fired and skipped teardown because this mount
+// was pending, and this mount then settled `:error` (or `:ok` with a
+// different rootId), the prior root never gets torn down without our
+// re-arming.
+function rearmOrphanedRootTeardowns(
+  connectionState: ConnectionState,
+  module: string,
+  callerId: string
+): void {
+  for (const root of connectionState.roots.values()) {
+    if (
+      root.module === module &&
+      root.callerId === callerId &&
+      root.refCount === 0 &&
+      root.graceTimer === null &&
+      root.pendingUnmountResolver === null
+    ) {
+      scheduleRootTeardown(root).catch(() => undefined)
+    }
+  }
 }
 
 export async function disconnectConnectionState(
@@ -476,21 +579,27 @@ export async function disconnectConnectionState(
 ): Promise<void> {
   const disconnectError = new Error("Disconnected")
 
-  // Reject the initial-patch waiter on in-flight tentatives so that if
-  // the mount push later returns `:ok` (after a brief disconnect that
-  // didn't kill the push), `mountConnectionRoot`'s `await
-  // tentativeInitialPatch` immediately throws and surfaces the
-  // disconnect to the mount caller instead of hanging. The waiter
-  // promise is shielded by a no-op `.catch` attached at creation in
-  // `registerInitialPatchWaiter`, so rejecting before anyone awaits
-  // doesn't surface as an unhandled rejection.
+  // Settle in-flight mounts immediately. Cancelling the mount push
+  // (via `cancelMountPush`) makes the outer `await pushMount` resolve
+  // with `{ kind: "error" }`, which takes the `:error` branch and
+  // rejects the mount caller — no Phoenix push-timeout wait. Rejecting
+  // `pendingConnect` covers the `:ok` race where the push happens to
+  // settle just before disconnect, leaving the `:ok` branch's
+  // `await tentativeInitialPatch` to surface the error. The
+  // `registerInitialPatchWaiter` shield prevents the rejection from
+  // surfacing as `unhandledRejection` if nobody is awaiting yet.
   for (const pending of connectionState.pendingMounts) {
+    pending.cancelMountPush?.("Disconnected")
     pending.pendingConnect?.reject(disconnectError)
     pending.pendingConnect = null
   }
   connectionState.pendingMounts.clear()
 
   for (const root of connectionState.roots.values()) {
+    // Cancel any in-flight recovery-remount push so the awaiting
+    // `remountExistingConnection` settles immediately instead of
+    // waiting for Phoenix's push timeout.
+    root.cancelMountPush?.("Disconnected")
     cancelGraceTimer(root)
     root.pendingConnect?.reject(disconnectError)
     root.pendingConnect = null
@@ -500,17 +609,18 @@ export async function disconnectConnectionState(
     root.channel = undefined
   }
 
-  // Make sure `roots` and the runtime entry are cleared even if
-  // `channel.leave()` throws synchronously (custom socket impl or
-  // mid-leave channel state). Without this guard a thrown `leave()`
-  // would leak the connection in `runtime.connections` and any future
-  // `openConnectionState` for the same topic would resurrect the
-  // (now-broken) connection instead of opening a fresh one.
+  // Clear `channel` BEFORE calling `leave()` so a synchronous throw
+  // from the leave implementation doesn't leave a stale channel
+  // reference on the connection state (which would short-circuit
+  // `ensureConnectionReady` on the next mount attempt and try to
+  // reuse a broken channel). The `try/finally` then guarantees
+  // `roots` and the runtime entry are cleared regardless.
+  const closingChannel = connectionState.channel
+  connectionState.channel = undefined
   try {
-    if (connectionState.channel) {
+    if (closingChannel) {
       connectionState.suppressDisconnectEvent = true
-      connectionState.channel.leave()
-      connectionState.channel = undefined
+      closingChannel.leave()
     }
   } finally {
     connectionState.roots.clear()
@@ -676,15 +786,29 @@ type MountReply =
 
 function pushMount(
   channel: ChannelLike,
+  connection: RootConnection,
   payload: { module: string; id: string; params: Record<string, unknown> }
 ): Promise<MountReply> {
   return new Promise<MountReply>((resolve) => {
+    // Idempotent settle — receive callbacks AND external cancellation
+    // (disconnect calling `connection.cancelMountPush`) both go through
+    // here so whichever fires first wins and the others are no-ops.
+    let settled = false
+    const settle = (reply: MountReply): void => {
+      if (settled) return
+      settled = true
+      connection.cancelMountPush = null
+      resolve(reply)
+    }
+
+    connection.cancelMountPush = (reason) => settle({ kind: "error", reason })
+
     ;(channel.push("mount", payload) as PushLike)
       .receive("ok", (replyPayload) => {
         if (isRecord(replyPayload) && typeof replyPayload.root_id === "string" && replyPayload.root_id !== "") {
-          resolve({ kind: "ok", rootId: replyPayload.root_id })
+          settle({ kind: "ok", rootId: replyPayload.root_id })
         } else {
-          resolve({
+          settle({
             kind: "error",
             reason: `mount reply missing root_id: ${JSON.stringify(replyPayload)}`
           })
@@ -697,17 +821,17 @@ function pushMount(
           typeof replyPayload.root_id === "string" &&
           replyPayload.root_id !== ""
         ) {
-          resolve({ kind: "already_mounted", rootId: replyPayload.root_id })
+          settle({ kind: "already_mounted", rootId: replyPayload.root_id })
         } else {
           const reason =
             isRecord(replyPayload) && typeof replyPayload.reason === "string"
               ? replyPayload.reason
               : JSON.stringify(replyPayload)
-          resolve({ kind: "error", reason })
+          settle({ kind: "error", reason })
         }
       })
       .receive("timeout", () => {
-        resolve({ kind: "error", reason: "timeout" })
+        settle({ kind: "error", reason: "timeout" })
       })
   })
 }
@@ -732,7 +856,7 @@ async function remountExistingConnection(connection: RootConnection): Promise<vo
   const initialPatch = registerInitialPatchWaiter(connection, generation)
   connection.initialPatchPromise = initialPatch
 
-  const reply = await pushMount(connectionState.channel, {
+  const reply = await pushMount(connectionState.channel, connection, {
     module: connection.module,
     id: connection.callerId,
     params: connection.mountParams
@@ -967,17 +1091,19 @@ function handleConnectionDisconnect(
 ): void {
   const disconnectError = new Error("Disconnected")
 
-  // See `disconnectConnectionState` for the rationale: the
-  // `registerInitialPatchWaiter` shield handles the no-awaiter case;
-  // rejecting ensures the mount caller surfaces an error if the push
-  // happens to come back `:ok` after the channel closed.
+  // See `disconnectConnectionState` for the rationale on cancelling
+  // both `pushMount` and `pendingConnect`.
   for (const pending of connectionState.pendingMounts) {
+    pending.cancelMountPush?.("Disconnected")
     pending.pendingConnect?.reject(disconnectError)
     pending.pendingConnect = null
   }
   connectionState.pendingMounts.clear()
 
   for (const root of connectionState.roots.values()) {
+    // Cancel any in-flight recovery-remount push (see
+    // `disconnectConnectionState` for rationale).
+    root.cancelMountPush?.("Disconnected")
     cancelGraceTimer(root)
     root.pendingConnect?.reject(disconnectError)
     root.pendingConnect = null
@@ -986,6 +1112,12 @@ function handleConnectionDisconnect(
     resetConnectionState(root)
     root.channel = undefined
   }
+
+  // Drop stale `roots` entries — otherwise a subsequent mount on the
+  // (about-to-be-reconnected) state could find a disconnected entry
+  // and alias to it via `:already_mounted`, handing the caller a
+  // dead RootConnection.
+  connectionState.roots.clear()
 
   connectionState.channel = undefined
 }
