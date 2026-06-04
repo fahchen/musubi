@@ -149,8 +149,9 @@ git pull
 gh release create vX.Y.Z+1 --target main --title "vX.Y.Z+1" --generate-notes
 ```
 
-One command does everything — no separate `git tag`, no hand-pasted
-notes:
+The `git checkout main` / `git pull` just sync your local `main`; the
+`gh release create` line is the actual release and does everything in
+one step — no separate `git tag`, no hand-pasted notes:
 
 - `gh release create` creates and pushes the `vX.Y.Z+1` tag at `main`.
 - The tag push fires `.github/workflows/publish.yml`, which runs
