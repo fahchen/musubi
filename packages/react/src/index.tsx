@@ -277,11 +277,7 @@ export function createMusubi<R>(): MusubiFactory<R> {
     useEffect(() => {
       let cancelled = false
       const unmountOnCleanup = options.unmountOnCleanup ?? true
-      const mountOptions: MountStoreOptions<M, R> = {
-        module: options.module,
-        id: options.id,
-        ...(options.params !== undefined ? { params: options.params } : {})
-      }
+      const mountOptions = buildMountOptions<M, R>(options)
 
       setState({ status: "loading", store: null, error: null })
 
@@ -324,11 +320,7 @@ export function createMusubi<R>(): MusubiFactory<R> {
     const connection = useMusubiConnection()
     const unmountOnCleanup = options.unmountOnCleanup ?? true
 
-    const mountOptions: MountStoreOptions<M, R> = {
-      module: options.module,
-      id: options.id,
-      ...(options.params !== undefined ? { params: options.params } : {})
-    }
+    const mountOptions = buildMountOptions<M, R>(options)
 
     // Render-phase: lookup-or-create. DO NOT bump refs here — that happens
     // in the commit-phase effect below. Suspense may discard this render.
@@ -539,6 +531,7 @@ export function createMusubi<R>(): MusubiFactory<R> {
 // ---------------------------------------------------------------------------
 
 type SharedRootMount = {
+  key: string
   refs: number
   promise: Promise<MountedStore<never, unknown>>
   settled: boolean
@@ -619,24 +612,41 @@ export function __runSuspenseOrphanSweep(holdings: SuspenseSweepHoldings): void 
   // `MountedStore` with no one left to call `.unmount()` on it. Chain
   // off the promise so the unmount tracks the settled value (mirrors
   // the deferred unmount in `releaseRootMount`).
+  //
+  // Settling the mount is exactly what wakes React's Suspense ping for
+  // the resumed render. Tearing down inline in the `.then` microtask
+  // would delete the entry in the same flush as the settle, before
+  // React's scheduler re-renders the discarded subtree — the resumed
+  // render's `ensureRootMount` would then find no entry and allocate a
+  // fresh one, producing the duplicate `unmount` + `mount` wire push
+  // seen on SPA navigation under react-router v7's `startTransition`.
+  // `sweepSettledOrphan` defers the teardown two macrotask hops past
+  // the settle so the resumed render can re-claim first: hop one lets
+  // React's scheduler run the resumed render-phase (re-adds the fiber's
+  // claimer), hop two lets the commit-phase effect fire `bumpMountRef`
+  // (bumps refs). Either signal flips a guard and bails. One hop is not
+  // enough on test runtimes where React's scheduler postMessage trails
+  // `setTimeout(0)`.
+  const sweepSettledOrphan = (teardown?: () => void): void => {
+    // hop 1: React's render-phase (resumed render re-adds its claimer)
+    setTimeout(() => {
+      // hop 2: React's commit-phase (effect fires `bumpMountRef` → refs)
+      setTimeout(() => {
+        if (mounts.get(key) !== shared) return
+        if (shared.refs > 0) return
+        if (shared.claimers.size > 0) return
+        mounts.delete(key)
+        teardown?.()
+      }, 0)
+    }, 0)
+  }
+
   void shared.promise.then(
-    (mounted) => {
-      // Re-check between this callback being scheduled and running —
-      // a sibling consumer may have rearmed or committed in the gap.
-      if (mounts.get(key) !== shared) return
-      if (shared.refs > 0) return
-      if (shared.claimers.size > 0) return
-      mounts.delete(key)
-      if (unmountOnCleanup) void mounted.unmount()
-    },
-    () => {
-      if (mounts.get(key) !== shared) return
-      if (shared.refs > 0) return
-      if (shared.claimers.size > 0) return
-      // Failed mount: nothing to unmount, just drop the dead entry so
-      // a future render can retry.
-      mounts.delete(key)
-    }
+    (mounted) =>
+      sweepSettledOrphan(unmountOnCleanup ? () => void mounted.unmount() : undefined),
+    // Failed mount: nothing to unmount, just drop the dead entry so a
+    // future render can retry.
+    () => sweepSettledOrphan()
   )
 }
 
@@ -676,20 +686,18 @@ const suspenseSweepRegistry: FinalizationRegistry<SuspenseSweepHoldings> | null 
 function ensureRootMount<M extends StoreModule<R>, R>(
   connection: MusubiConnection<R>,
   options: MountStoreOptions<M, R>
-): SharedRootMount & { key: string } {
+): SharedRootMount {
   const key = rootMountKey(options)
   const mounts = rootMountsFor(connection)
   const existing = mounts.get(key)
 
   if (existing) {
-    if (existing.cleanupTimer) {
-      clearTimeout(existing.cleanupTimer)
-      existing.cleanupTimer = null
-    }
-    return Object.assign(existing, { key })
+    cancelCleanupTimer(existing)
+    return existing
   }
 
   const shared: SharedRootMount = {
+    key,
     refs: 0,
     promise: Promise.resolve(null as never),
     settled: false,
@@ -722,17 +730,21 @@ function ensureRootMount<M extends StoreModule<R>, R>(
   shared.promise.catch(() => undefined)
 
   mounts.set(key, shared)
-  return Object.assign(shared, { key })
+  return shared
+}
+
+function cancelCleanupTimer(shared: SharedRootMount): void {
+  if (shared.cleanupTimer) {
+    clearTimeout(shared.cleanupTimer)
+    shared.cleanupTimer = null
+  }
 }
 
 function bumpMountRef<R>(connection: MusubiConnection<R>, key: string): void {
   const mounts = pendingRootMounts.get(connection as MusubiConnection<unknown>)
   const shared = mounts?.get(key)
   if (!shared) return
-  if (shared.cleanupTimer) {
-    clearTimeout(shared.cleanupTimer)
-    shared.cleanupTimer = null
-  }
+  cancelCleanupTimer(shared)
   shared.refs += 1
 }
 
@@ -787,6 +799,16 @@ function rootMountsFor<R>(
   const mounts = new Map<string, SharedRootMount>()
   pendingRootMounts.set(key, mounts)
   return mounts
+}
+
+function buildMountOptions<M extends StoreModule<R>, R>(
+  options: MountStoreOptions<M, R>
+): MountStoreOptions<M, R> {
+  return {
+    module: options.module,
+    id: options.id,
+    ...(options.params !== undefined ? { params: options.params } : {})
+  }
 }
 
 function rootMountKey<M extends StoreModule<R>, R>(

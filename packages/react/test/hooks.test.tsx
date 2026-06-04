@@ -943,6 +943,327 @@ describe("useMusubiRootSuspense", () => {
     second.unmount()
     await act(async () => { await flushTimers() })
   })
+
+  test("SPA route swap under startTransition does not double-mount the resolved root", async () => {
+    // Integration guard for the SPA route swap: clicking from /enactments
+    // to /enactments/:id (react-router v7 wraps the navigation in
+    // `startTransition` by default) must not turn the detail root's mount
+    // into an unmount+remount on the wire.
+    //
+    // NOTE: this does NOT reproduce the microtask race at HEAD — the
+    // FakeMusubiConnection + jsdom scheduler settle the mount before the
+    // sweep's chained `.then` can lose the ordering, so it passes with or
+    // without the fix. The regression guard that actually pins the race is
+    // the white-box "orphan sweep on a still-pending mount" test below,
+    // which drives `__runSuspenseOrphanSweep` directly. This one stays as a
+    // higher-level end-to-end check of the route-swap path.
+    //
+    // Wire trace (paraphrased):
+    //   sent  mount   detail
+    //   sent  unmount list
+    //   recv  ok ok
+    //   recv  patch   detail
+    //   sent  unmount detail   ← bug
+    //   sent  mount   detail   ← bug
+    //   recv  ok ok
+    //   recv  patch   detail
+    const listFake = buildProxy("List")
+    const detailFake = buildProxy("Detail")
+    const connection = new FakeMusubiConnection(listFake.asProxy())
+
+    const listGate = deferred<StoreProxy<Root, ReactTestStores>>()
+    const detailGate = deferred<StoreProxy<Root, ReactTestStores>>()
+    connection.mountResults = [listGate.promise, detailGate.promise]
+
+    function ListRoot() {
+      const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "list-1" })
+      return <span>list:{store.snapshot().title}</span>
+    }
+    function DetailRoot() {
+      const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "detail-1" })
+      return <span>detail:{store.snapshot().title}</span>
+    }
+
+    // Each route has its own Suspense boundary, mirroring the dashboard
+    // routes (EnactmentListPage's ListBoundary, EnactmentDetailPage's
+    // DetailBoundary). The outer container is what swaps under transition.
+    function Route({ route }: { route: "list" | "detail" }) {
+      if (route === "list") {
+        return (
+          <React.Suspense fallback={<span>list-fallback</span>}>
+            <ListRoot />
+          </React.Suspense>
+        )
+      }
+      return (
+        <React.Suspense fallback={<span>detail-fallback</span>}>
+          <DetailRoot />
+        </React.Suspense>
+      )
+    }
+
+    let setRoute: (next: "list" | "detail") => void = () => {}
+    function App() {
+      const [route, setRouteState] = React.useState<"list" | "detail">("list")
+      setRoute = setRouteState
+      return (
+        <MusubiProvider connection={connection}>
+          <Route route={route} />
+        </MusubiProvider>
+      )
+    }
+
+    render(<App />)
+
+    // Settle the list mount.
+    await act(async () => {
+      listGate.resolve(listFake.asProxy())
+      await listGate.promise
+    })
+    expect(await screen.findByText("list:List")).toBeTruthy()
+    expect(connection.mounts).toHaveLength(1)
+    expect(connection.mounts[0]?.id).toBe("list-1")
+
+    // Swap to the detail route. react-router v7 wraps navigation in
+    // startTransition by default.
+    await act(async () => {
+      React.startTransition(() => {
+        setRoute("detail")
+      })
+    })
+
+    // First wire: detail mount push goes out exactly once.
+    const detailMountCount = () =>
+      connection.mounts.filter((m) => m.id === "detail-1").length
+    expect(detailMountCount()).toBe(1)
+
+    // Resolve the detail mount + a microtask + the 0-ms grace timers.
+    await act(async () => {
+      detailGate.resolve(detailFake.asProxy())
+      await detailGate.promise
+      await flushTimers()
+    })
+
+    expect(await screen.findByText("detail:Detail")).toBeTruthy()
+
+    // The detail root must not have been torn down + re-mounted between
+    // the initial mount push and the patch settle.
+    expect(connection.unmounts.filter((id) => id === "detail-1")).toEqual([])
+    expect(detailMountCount()).toBe(1)
+
+    // List root should be cleaned up because its route is gone.
+    expect(connection.unmounts).toContain("list-1")
+  })
+
+  test("orphan sweep on a still-pending mount: resumed render does not double-mount when sweep fires before mount settles", async () => {
+    // Reproduces the dashboard SPA-navigation duplicate-mount bug.
+    //
+    // Production wire pattern (Detail route under react-router v7 transition):
+    //   sent  mount   detail
+    //   sent  unmount list
+    //   recv  ok ok
+    //   recv  patch   detail              ← initial patch lands
+    //   sent  unmount detail              ← bug: spurious tear-down
+    //   sent  mount   detail              ← bug: fresh re-mount
+    //   recv  ok ok
+    //   recv  patch   detail
+    //
+    // Sequence inside the client:
+    //   1. New tree renders. Detail's render-phase calls `ensureRootMount`
+    //      and `mountStore`. `useId` arms a finalizer token with claimer A.
+    //   2. The transition tries another render before the patch lands —
+    //      claimer B is added too (per the "do not unregister previous"
+    //      comment in the suspense hook).
+    //   3. The transition is superseded / the suspended subtree is discarded.
+    //      Both fiber tokens become GC-eligible.
+    //   4. Two `__runSuspenseOrphanSweep` calls fire. Sweep B drops claimer
+    //      B (claimers={A}, size=1) → bails. Sweep A drops claimer A
+    //      (claimers={}, size=0). `shared.refs === 0` because no commit
+    //      ever ran. The sweep chains `mounted.unmount()` onto the still
+    //      in-flight `shared.promise`.
+    //   5. Server replies + patch arrives. `mountStore` settles.
+    //      `ensureRootMount`'s `.then` sets `shared.settled = true`.
+    //      `shared.promise` resolves with the mounted handle. The sweep's
+    //      `.then` runs in the same microtask flush: guards still see
+    //      `refs=0` and `claimers.size=0`, so it `mounts.delete(key)` and
+    //      calls `mounted.unmount()` → wire `unmount detail`.
+    //   6. React's suspense ping schedules the resumed render *after* the
+    //      microtask flush. By the time `ensureRootMount` is called again
+    //      the entry is gone; a fresh `mountStore` runs and the wire
+    //      gets a second `mount` push.
+    //
+    // The fix must keep the entry reachable across the sweep+resume race
+    // so the resumed render aliases instead of allocating a new entry.
+    const fake = buildProxy()
+    const connection = new FakeMusubiConnection(fake.asProxy())
+    const gate = deferred<StoreProxy<Root, ReactTestStores>>()
+    connection.mountResult = gate.promise
+
+    function Reader() {
+      const store = useMusubiRootSuspense({
+        module: "React.Test.Root",
+        id: "race-1"
+      })
+      return <span>ready:{store.snapshot().title}</span>
+    }
+
+    render(
+      <MusubiProvider connection={connection}>
+        <React.Suspense fallback={<span>load</span>}>
+          <Reader />
+        </React.Suspense>
+      </MusubiProvider>
+    )
+
+    expect(connection.mounts).toHaveLength(1)
+    expect(connection.mounts[0]?.id).toBe("race-1")
+
+    const mountsMap = __pendingRootMountsForTests.get(
+      connection as unknown as MusubiConnection<unknown>
+    )!
+    const key = "race-1|React.Test.Root|null"
+    const shared = mountsMap.get(key)!
+
+    // Sweep every armed claimer. Mirrors the dashboard's two-sweep
+    // cascade: each fiber's claimer is removed one by one until the set
+    // is empty and `refs===0`, at which point the LAST sweep falls
+    // through to `void shared.promise.then(...)`.
+    expect(shared.refs).toBe(0)
+    for (const claimerId of Array.from(shared.claimers)) {
+      __runSuspenseOrphanSweep({
+        connection: connection as unknown as MusubiConnection<unknown>,
+        key,
+        unmountOnCleanup: true,
+        claimerId,
+        shared
+      })
+    }
+    expect(shared.claimers.size).toBe(0)
+
+    // Resolve the in-flight mount + flush. The sweep's chained `.then`
+    // runs in the microtask flush, tearing the entry down. React's
+    // resumed Reader render then has to allocate a fresh entry,
+    // producing a second `mountStore` call — the wire-level bug.
+    await act(async () => {
+      gate.resolve(fake.asProxy())
+      await gate.promise
+      await flushTimers()
+      await flushTimers()
+    })
+
+    expect(await screen.findByText("ready:Inbox")).toBeTruthy()
+
+    // Bug: a second mount push went out for the same (module, id) within
+    // a single suspense flow, and the first mount was torn down.
+    // Fix: the resumed render should alias to the existing entry — one
+    // mount, zero unmounts for `race-1`.
+    expect(connection.mounts.filter((m) => m.id === "race-1")).toHaveLength(1)
+    expect(connection.unmounts.filter((id) => id === "race-1")).toHaveLength(0)
+  })
+
+  test("Suspense ping after route swap: orphaned suspended render does not tear down committed entry", async () => {
+    // Tighter variant of the SPA route swap. Mirrors the actual dashboard
+    // race more faithfully:
+    //
+    //   1. Render List page, settle its root.
+    //   2. Begin SPA navigation: setState swaps the routed element to Detail.
+    //      Detail's `useMusubiRootSuspense` opens an `ensureRootMount` entry
+    //      and throws the mount promise.
+    //   3. Commit: List unmounts (effect cleanup → wire `unmount` for list).
+    //      Detail's Suspense renders its fallback. Detail's commit-phase
+    //      effect has NOT run yet — `bumpMountRef` has not happened.
+    //   4. Server replies OK and pushes the initial patch. The mount promise
+    //      settles. React re-renders Detail.
+    //   5. Detail commits the resolved tree. `useEffect` setup runs:
+    //      `bumpMountRef(detail)` → shared.refs = 1.
+    //
+    // The bug observed in production: between (3) and (5), or right after
+    // (5), the shared entry is released to refs=0 and torn down — generating
+    // an unmount+remount of detail on the wire. This test asserts the
+    // FakeConnection sees exactly one mount call and no unmount for detail
+    // during this window.
+    //
+    // NOTE: like the route-swap test above, this passes at HEAD too — the
+    // FakeConnection/jsdom scheduler does not reproduce the exact microtask
+    // ordering that triggers the wire-level duplicate. It is an integration
+    // guard for the suspend→ping→commit path, NOT the regression guard for
+    // the race; that is the white-box "orphan sweep on a still-pending
+    // mount" test above.
+    const listFake = buildProxy("List")
+    const detailFake = buildProxy("Detail")
+    const connection = new FakeMusubiConnection(listFake.asProxy())
+
+    const listGate = deferred<StoreProxy<Root, ReactTestStores>>()
+    const detailGate = deferred<StoreProxy<Root, ReactTestStores>>()
+    connection.mountResults = [listGate.promise, detailGate.promise]
+
+    function ListRoot() {
+      const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "list-2" })
+      return <span>list:{store.snapshot().title}</span>
+    }
+    function DetailRoot() {
+      const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "detail-2" })
+      return <span>detail:{store.snapshot().title}</span>
+    }
+
+    let setRoute: (next: "list" | "detail") => void = () => {}
+    function App() {
+      const [route, setRouteState] = React.useState<"list" | "detail">("list")
+      setRoute = setRouteState
+      const node = route === "list" ? <ListRoot /> : <DetailRoot />
+      return (
+        <React.StrictMode>
+          <MusubiProvider connection={connection}>
+            <React.Suspense fallback={<span>fb:{route}</span>}>{node}</React.Suspense>
+          </MusubiProvider>
+        </React.StrictMode>
+      )
+    }
+
+    render(<App />)
+
+    await act(async () => {
+      listGate.resolve(listFake.asProxy())
+      await listGate.promise
+    })
+    expect(await screen.findByText("list:List")).toBeTruthy()
+    const baselineMounts = connection.mounts.length
+
+    // Trigger the swap, but DO NOT resolve the gate yet. The Detail fiber
+    // should be suspended; the shared entry created in `ensureRootMount`
+    // must not be torn down because no commit-phase ref has been taken
+    // for it.
+    await act(async () => {
+      React.startTransition(() => {
+        setRoute("detail")
+      })
+      // Yield through microtasks + the 0-ms grace timers so any stray
+      // unmount push that the bug would emit lands BEFORE the gate
+      // resolves. The test must observe the bug at this point — once the
+      // patch arrives and refs jump to 1, the steady state is fine.
+      await flushTimers()
+      await flushTimers()
+    })
+
+    const detailMounts = connection.mounts
+      .slice(baselineMounts)
+      .filter((m) => m.id === "detail-2")
+    expect(detailMounts).toHaveLength(1)
+    expect(connection.unmounts.filter((id) => id === "detail-2")).toEqual([])
+
+    // Resolve the detail mount + flush. Even after settle there should
+    // still be only ONE mount call for detail.
+    await act(async () => {
+      detailGate.resolve(detailFake.asProxy())
+      await detailGate.promise
+      await flushTimers()
+      await flushTimers()
+    })
+
+    expect(await screen.findByText("detail:Detail")).toBeTruthy()
+    expect(connection.mounts.filter((m) => m.id === "detail-2")).toHaveLength(1)
+    expect(connection.unmounts.filter((id) => id === "detail-2")).toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------

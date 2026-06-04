@@ -11,6 +11,22 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`@musubi/react`** — `useMusubiRootSuspense` no longer double-mounts a
+  root over the wire on react-router v7 SPA navigation. When the last
+  render-phase claimer dropped while the mount was still in flight, the
+  orphan sweep chained teardown inline on the mount promise; that `.then`
+  ran in the same microtask flush as the mount settle — ahead of React's
+  MessageChannel-scheduled resumed Suspense render — so the resumed render
+  found no shared entry and allocated a fresh mount, producing a spurious
+  `unmount` + `mount` burst right after the first patch. Teardown is now
+  deferred two macrotask hops past the settle (React's render-phase then
+  commit-phase) so the resumed render re-claims the entry first and the
+  existing ref / claimer guards bail. Also tidied the shared-mount
+  bookkeeping (`key` as a real `SharedRootMount` field, `cancelCleanupTimer`
+  / `buildMountOptions` helpers) with no behavior change (#70).
+
 ## [0.7.1] — 2026-05-31
 
 ### Fixed
