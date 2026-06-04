@@ -141,17 +141,26 @@ CI runs the usual matrix.
 Squash merge into `main` once CI is green. The merge commit becomes
 the release commit on `main`.
 
-### 10. Tag and push
+### 10. Cut the release (tags, publishes, and generates notes)
 
 ```bash
 git checkout main
 git pull
-git tag vX.Y.Z+1
-git push origin vX.Y.Z+1
+gh release create vX.Y.Z+1 --target main --title "vX.Y.Z+1" --generate-notes
 ```
 
-Pushing the tag triggers `.github/workflows/publish.yml`, which
-runs `mix hex.publish --yes` against the production Hex account.
+One command does everything — no separate `git tag`, no hand-pasted
+notes:
+
+- `gh release create` creates and pushes the `vX.Y.Z+1` tag at `main`.
+- The tag push fires `.github/workflows/publish.yml`, which runs
+  `mix hex.publish --yes` against the production Hex account (+ HexDocs).
+- `--generate-notes` fills the release body automatically from the PRs
+  merged since the previous release.
+
+The maintained `CHANGELOG.md` (steps 4–5) stays the human-curated
+record; the GitHub release notes are the auto-generated PR rollup.
+They don't need to match.
 
 ### 11. Verify the publish
 
@@ -160,19 +169,6 @@ runs `mix hex.publish --yes` against the production Hex account.
 - Check that the [HexDocs](https://hexdocs.pm/musubi) site picked
   up the new version (HexDocs is built and uploaded by the same
   `mix hex.publish` run).
-
-### 12. GitHub Release
-
-Cut a GitHub release from the tag with the CHANGELOG entry as the
-body:
-
-```bash
-gh release create vX.Y.Z+1 \
-  --title "v X.Y.Z+1" \
-  --notes-from-tag
-```
-
-(or paste the relevant CHANGELOG section into `--notes`).
 
 ## Rollback
 
@@ -189,7 +185,10 @@ If a release is broken in a way that warrants withdrawal:
 - Don't bump `mix.exs` without finalizing the CHANGELOG section and
   ref-links in the same PR — the next contributor will trip over the
   half-finished state.
-- Don't tag from a branch other than `main`.
+- Don't point the release `--target` at anything but `main`.
+- Don't hand-write release notes or split out a separate `git tag` +
+  `git push` — `gh release create --generate-notes` does both in one
+  step (see step 10).
 - Don't manually run `mix hex.publish` from your laptop — the
   workflow has the credentials and the warnings-as-errors compile
   gate. Local publishes bypass the gate and confuse the audit trail.
