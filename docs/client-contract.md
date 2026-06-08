@@ -395,6 +395,10 @@ Rules:
 - `useMusubiCommand` sequences concurrent `dispatch` calls with a
   monotonic request token: only the latest call's outcome lands in
   `data` / `error`; `reset()` clears both
+- a `{:noreply, socket}` handler resolves with an empty object `{}`, not
+  `null` (see `dispatchCommand` below). After such a command `data` is
+  `{}` (truthy) — never use `data` as a "did it finish?" flag; rely on
+  `isPending` / `error`, or inspect `reply` fields explicitly
 
 ## Generated TypeScript
 
@@ -493,6 +497,13 @@ type StoreProxy<M extends StoreModule<R>, R> =
 
 `SnapshotValue<T, R>` and `ProxyValue<T, R>` keep `T` first because `T`
 is a projected wire type, not a module key.
+
+`dispatchCommand` resolves with the server's command reply. A
+`{:reply, payload, socket}` handler resolves with `payload`; a
+`{:noreply, socket}` handler resolves with an empty object `{}` (the
+server emits an empty `:ok` reply — see `docs/PRD.md`). State updates
+arrive out-of-band on the `patch` channel event regardless of reply
+shape, so a `{:noreply, socket}` command still patches the UI.
 
 Reserved runtime member names on every store proxy:
 
