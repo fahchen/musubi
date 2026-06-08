@@ -505,6 +505,12 @@ server emits an empty `:ok` reply — see `docs/PRD.md`). State updates
 arrive out-of-band on the `patch` channel event regardless of reply
 shape, so a `{:noreply, socket}` command still patches the UI.
 
+The reply `payload` must be a map on the server (guarded by `is_map/1`);
+returning a bare list, string, or other non-map raises `ArgumentError`
+in the page runtime. Wrap scalars/lists in a map (e.g.
+`{:reply, %{items: list}, socket}`), which the client receives as an
+object.
+
 Reserved runtime member names on every store proxy:
 
 - `__musubi_store_id__`

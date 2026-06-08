@@ -399,7 +399,7 @@ happens separately via `Musubi.Wire.to_wire/1`.
 `handle_command/3`, `handle_info/2`, `handle_async/3` return:
 
 - `{:noreply, socket}` — no reply payload (handle_command emits empty ok reply; others emit no reply at all).
-- `{:reply, payload, socket}` — only valid for `handle_command/3` and root-level `:before_command` hook halts. Other handlers raise on `:reply` returns.
+- `{:reply, payload, socket}` — only valid for `handle_command/3` and root-level `:before_command` hook halts. Other handlers raise on `:reply` returns. `payload` must be a map (guarded by `is_map/1`); returning a bare list, string, or other non-map raises `ArgumentError`. Wrap scalars/lists in a map, e.g. `{:reply, %{items: list}, socket}`.
 
 Effects are socket-pipe helpers (BDR-0006), not effect tuples:
 
