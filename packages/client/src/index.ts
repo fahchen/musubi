@@ -10,6 +10,19 @@ export type {
 } from "./connect"
 export type { ChannelLike, PushLike, SocketLike } from "./runtime"
 
+export {
+  canonicalStringify,
+  createMemoryPersister,
+  createStorageCachePersister,
+  storeCacheKey
+} from "./cache"
+export type {
+  CacheOptions,
+  MusubiCacheEntry,
+  MusubiCachePersister,
+  StorageLike
+} from "./cache"
+
 export { applyPatch, parsePointer } from "./patch"
 export { applyStreamOps, getStream, pruneStreams } from "./streams"
 export { applyUploadOps, getUploadHandle, pruneUploads, UploadHandleImpl } from "./uploads"

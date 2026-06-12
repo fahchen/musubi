@@ -1,3 +1,12 @@
+import {
+  createMemoryPersister,
+  createThrottledWriter,
+  DEFAULT_GC_MS,
+  storeCacheKey,
+  type CacheOptions,
+  type MusubiCachePersister,
+  type ThrottledWriter
+} from "./cache"
 import { MusubiCommandError } from "./error"
 import { applyPatch, parsePointer } from "./patch"
 import {
@@ -111,6 +120,12 @@ export interface RootConnection {
   // "release my handle" intent is honored even if the internal
   // server-side teardown was skipped.
   pendingUnmountResolver: (() => void) | null
+
+  // Cache slot key for this mount, or null when caching is disabled. When set,
+  // accepted patches are persisted (throttled) and the entry is GC'd after the
+  // grace teardown. Drives the stale-window command queue in
+  // `dispatchConnectionCommand`.
+  cacheKey: string | null
 }
 
 /**
@@ -151,6 +166,24 @@ export interface ConnectionState {
   // forever because there's no `roots` entry to find them through.
   readonly pendingMounts: Set<RootConnection>
 
+  // Default cache backend for mounts that enable caching without supplying a
+  // persister. Connection-scoped and ephemeral — cleared on disconnect.
+  readonly memoryPersister: MusubiCachePersister
+  // Per-cache-key trailing-throttle writers, shared across re-mounts of the
+  // same key so bursts collapse into one write.
+  readonly cacheWriters: Map<string, ThrottledWriter>
+  // Per-cache-key record of which persister + gc/buster a key was mounted
+  // with, so teardown GC and `clearStoreCache` act on the right backend.
+  readonly cacheRegistry: Map<
+    string,
+    { persister: MusubiCachePersister; gcMs: number; buster: string }
+  >
+  // Pending post-teardown eviction timers, keyed by cache key. The torn-down
+  // root is already gone from `roots`, so disconnect can't reach these through
+  // it — tracked here so disconnect can cancel them instead of leaking a
+  // gcTime-long closure over connection state.
+  readonly cacheEvictionTimers: Map<string, ReturnType<typeof setTimeout>>
+
   channel: ChannelLike | undefined
   channelGeneration: number
   connectPromise: Promise<void> | null
@@ -186,6 +219,7 @@ export interface MountConnectionRootOptions {
   module: string
   id: string
   params?: Record<string, unknown>
+  cache?: CacheOptions
 }
 
 export function openConnectionState(
@@ -205,6 +239,10 @@ export function openConnectionState(
     topic,
     roots: new Map(),
     pendingMounts: new Set(),
+    memoryPersister: createMemoryPersister(),
+    cacheWriters: new Map(),
+    cacheRegistry: new Map(),
+    cacheEvictionTimers: new Map(),
     uploaders: options.uploaders ?? {},
     channel: undefined,
     channelGeneration: 0,
@@ -239,12 +277,25 @@ export function openConnectionState(
  * the tentative connection built before the mount push is discarded on
  * the alias path.
  */
+export interface MountRootResult {
+  connection: RootConnection
+  // True when the returned connection was seeded from cache and is still
+  // revalidating against the server (its `version` is 0 until the live initial
+  // patch lands).
+  fromCache: boolean
+  // Resolves when the live initial patch has been applied (the seed was
+  // replaced by fresh server state), or immediately for a cold mount. Rejects
+  // if revalidation fails (disconnect / unmount / malformed initial patch).
+  revalidated: Promise<void>
+}
+
 export async function mountConnectionRoot(
   connectionState: ConnectionState,
   options: MountConnectionRootOptions
-): Promise<RootConnection> {
+): Promise<MountRootResult> {
   const tentative = newRootConnection(connectionState, options)
   connectionState.pendingMounts.add(tentative)
+  const cacheCfg = resolveCacheConfig(connectionState, options)
 
   try {
     await ensureConnectionReady(connectionState)
@@ -279,6 +330,23 @@ export async function mountConnectionRoot(
       connectionState.roots.set(reply.rootId, tentative)
       tentative.initialPatchPromise = tentativeInitialPatch
 
+      if (cacheCfg) {
+        tentative.cacheKey = cacheCfg.key
+        connectionState.cacheRegistry.set(cacheCfg.key, {
+          persister: cacheCfg.persister,
+          gcMs: cacheCfg.gcMs,
+          buster: cacheCfg.buster
+        })
+
+        // Stale-while-revalidate: if a valid cache entry exists, render it now
+        // and let `tentativeInitialPatch` swap in fresh state in the
+        // background. The seed keeps `version === 0`, so the live initial
+        // patch (a whole-root `replace ""`) fully replaces it.
+        if (await trySeedFromCache(tentative, cacheCfg)) {
+          return { connection: tentative, fromCache: true, revalidated: tentativeInitialPatch }
+        }
+      }
+
       try {
         await tentativeInitialPatch
       } catch (error) {
@@ -287,7 +355,7 @@ export async function mountConnectionRoot(
         throw error
       }
 
-      return tentative
+      return { connection: tentative, fromCache: false, revalidated: Promise.resolve() }
     }
 
     // Both `already_mounted` and `error` discard the tentative — its waiter
@@ -319,7 +387,8 @@ export async function mountConnectionRoot(
       }
     }
 
-    return existing
+    // Alias onto a live root — no cache seeding; it is already connected.
+    return { connection: existing, fromCache: false, revalidated: Promise.resolve() }
   } finally {
     connectionState.pendingMounts.delete(tentative)
     // If a prior `unmountConnectionRoot`'s grace timer fired while this
@@ -358,8 +427,89 @@ function newRootConnection(
     pendingCommandRejectors: new Set(),
     pendingConnect: null,
     connectPromise: null,
-    recovering: false
+    recovering: false,
+    cacheKey: null
   }
+}
+
+interface ResolvedCacheConfig {
+  key: string
+  persister: MusubiCachePersister
+  gcMs: number
+  buster: string
+  initialData: unknown
+}
+
+function resolveCacheConfig(
+  connectionState: ConnectionState,
+  options: MountConnectionRootOptions
+): ResolvedCacheConfig | null {
+  const cache = options.cache
+  if (!cache) {
+    return null
+  }
+
+  const persister = cache.persister ?? connectionState.memoryPersister
+  const buster = cache.buster ?? ""
+  const gcMs = cache.gcTime ?? DEFAULT_GC_MS
+
+  if (persister.durable && buster === "" && !isProductionEnv()) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[musubi] mountStore({module: "${options.module}", id: "${options.id}"}) enabled a ` +
+        `durable cache persister without a \`buster\`. Cached state will survive deploys ` +
+        `even if the store's data shape changes — set \`cache.buster\` to your build/schema ` +
+        `version so stale shapes are discarded.`
+    )
+  }
+
+  return {
+    key: storeCacheKey({
+      module: options.module,
+      id: options.id,
+      ...(options.params !== undefined ? { params: options.params } : {})
+    }),
+    persister,
+    gcMs,
+    buster,
+    initialData: cache.initialData
+  }
+}
+
+// Seed the tentative connection's root from cache for stale-while-revalidate.
+// Returns true when a valid entry (or `initialData`) was applied. Entries are
+// invalidated on `buster` mismatch or age beyond `gcTime`.
+async function trySeedFromCache(
+  tentative: RootConnection,
+  cfg: ResolvedCacheConfig
+): Promise<boolean> {
+  const now = Date.now()
+  let entry = await cfg.persister.getEntry(cfg.key)
+
+  if (entry && (entry.buster !== cfg.buster || now - entry.updatedAt > cfg.gcMs)) {
+    await cfg.persister.removeEntry(cfg.key)
+    entry = undefined
+  }
+
+  if (!entry && cfg.initialData !== undefined) {
+    entry = { data: cfg.initialData, updatedAt: now, buster: cfg.buster }
+    await cfg.persister.setEntry(cfg.key, entry)
+  }
+
+  if (!entry) {
+    return false
+  }
+
+  // An async persister can suspend long enough for the live initial patch to
+  // land first (version → 1). Don't clobber fresh server state with the stale
+  // seed; fall back to the cold-mount path so `fromCache` reports false.
+  if (tentative.version !== 0) {
+    return false
+  }
+
+  tentative.root = entry.data
+  tentative.storeIndex = buildStoreIndex(entry.data)
+  return true
 }
 
 function registerInitialPatchWaiter(
@@ -534,6 +684,7 @@ function scheduleRootTeardown(connection: RootConnection): Promise<void> {
       connection.channel = undefined
       connection.initialPatchPromise = null
       connectionState.roots.delete(rootId)
+      scheduleCacheEviction(connection)
 
       if (!connectionState.channel) {
         connection.pendingUnmountResolver = null
@@ -637,6 +788,20 @@ export async function disconnectConnectionState(
     }
   } finally {
     connectionState.roots.clear()
+    // Persist the latest pending value, then drop all cache state so a
+    // reconnect starts from a clean in-memory slot. Durable persisters keep
+    // their flushed entries (subject to gcTime on the next read).
+    for (const writer of connectionState.cacheWriters.values()) {
+      writer.flush()
+      writer.cancel()
+    }
+    connectionState.cacheWriters.clear()
+    for (const timer of connectionState.cacheEvictionTimers.values()) {
+      clearTimeout(timer)
+    }
+    connectionState.cacheEvictionTimers.clear()
+    connectionState.cacheRegistry.clear()
+    void Promise.resolve(connectionState.memoryPersister.clear?.()).catch(() => undefined)
     const runtime = getSharedRuntime(connectionState.socket)
     runtime.connections.delete(connectionState.topic)
   }
@@ -668,7 +833,20 @@ export function dispatchConnectionCommand<Reply>(
   name: string,
   payload: unknown
 ): Promise<Reply> {
-  if (!connection.channel || connection.version === 0) {
+  if (!connection.channel) {
+    return Promise.reject(new Error("Store is not connected"))
+  }
+
+  if (connection.version === 0) {
+    // Cache-seeded store still revalidating: queue the command behind the live
+    // initial patch instead of rejecting. Re-dispatch once connected
+    // (version → 1). If revalidation fails, `initialPatchPromise` rejects and
+    // the command rejects with the same error.
+    if (connection.cacheKey && connection.initialPatchPromise) {
+      return connection.initialPatchPromise.then(() =>
+        dispatchConnectionCommand<Reply>(connection, storeId, name, payload)
+      )
+    }
     return Promise.reject(new Error("Store is not connected"))
   }
 
@@ -978,6 +1156,8 @@ function acceptEnvelope(
   )
   connection.version = envelope.version
 
+  persistCacheEntry(connection, nextRoot)
+
   // Drop proxy entries whose store_id no longer exists in the tree. New
   // entries are created lazily by `proxy.ts` on demand.
   for (const key of Array.from(connection.proxyCache.keys())) {
@@ -992,6 +1172,135 @@ function acceptEnvelope(
     connection.pendingConnect?.resolve()
     connection.pendingConnect = null
   }
+}
+
+// Throttled write-through of the latest root state to this mount's cache slot.
+// No-op unless the mount enabled caching. Uses the registry-recorded persister
+// so the write lands in the same backend the mount read from.
+function persistCacheEntry(connection: RootConnection, data: unknown): void {
+  const key = connection.cacheKey
+  if (!key) {
+    return
+  }
+  const connectionState = connection.connection
+  const registered = connectionState.cacheRegistry.get(key)
+  if (!registered) {
+    return
+  }
+
+  let writer = connectionState.cacheWriters.get(key)
+  if (!writer) {
+    writer = createThrottledWriter(key, registered.persister)
+    connectionState.cacheWriters.set(key, writer)
+  }
+  writer.schedule({ data, updatedAt: Date.now(), buster: registered.buster })
+}
+
+// Flush the pending throttled write (if any) and schedule cache eviction for a
+// torn-down root. GC fires `gcTime` after the entry's last update (not after
+// unmount), matching the read-time age check so the two never disagree.
+function scheduleCacheEviction(connection: RootConnection): void {
+  const key = connection.cacheKey
+  if (!key) {
+    return
+  }
+  const connectionState = connection.connection
+  const writer = connectionState.cacheWriters.get(key)
+  if (writer) {
+    writer.flush()
+    connectionState.cacheWriters.delete(key)
+  }
+
+  const registered = connectionState.cacheRegistry.get(key)
+  if (!registered) {
+    return
+  }
+
+  const pendingTimer = connectionState.cacheEvictionTimers.get(key)
+  if (pendingTimer !== undefined) {
+    clearTimeout(pendingTimer)
+    connectionState.cacheEvictionTimers.delete(key)
+  }
+
+  void Promise.resolve(registered.persister.getEntry(key))
+    .then((entry) => {
+      const age = entry ? Date.now() - entry.updatedAt : registered.gcMs
+      const remaining = Math.max(0, registered.gcMs - age)
+      const timer = setTimeout(() => {
+        connectionState.cacheEvictionTimers.delete(key)
+        // Only evict if no live mount re-claimed the key in the meantime.
+        const stillRegistered = connectionState.cacheRegistry.get(key) === registered
+        if (!stillRegistered || hasLiveRootForKey(connectionState, key)) {
+          return
+        }
+        connectionState.cacheRegistry.delete(key)
+        void Promise.resolve(registered.persister.removeEntry(key)).catch(() => undefined)
+      }, remaining)
+      connectionState.cacheEvictionTimers.set(key, timer)
+    })
+    .catch(() => undefined)
+}
+
+function hasLiveRootForKey(connectionState: ConnectionState, key: string): boolean {
+  for (const root of connectionState.roots.values()) {
+    if (root.cacheKey === key) {
+      return true
+    }
+  }
+  return false
+}
+
+// Clear cache entries on demand. With a `target`, removes that one store's
+// entry via the persister it was registered with (falling back to the
+// connection's in-memory default if it was never mounted). Without a `target`,
+// clears every registered persister plus the in-memory default.
+export async function clearConnectionStoreCache(
+  connectionState: ConnectionState,
+  target?: { module: string; id: string; params?: Record<string, unknown> }
+): Promise<void> {
+  if (target) {
+    const key = storeCacheKey(target)
+    const writer = connectionState.cacheWriters.get(key)
+    if (writer) {
+      // Discard, not flush: clearing means "forget the latest value too".
+      writer.cancel()
+      connectionState.cacheWriters.delete(key)
+    }
+    const pendingTimer = connectionState.cacheEvictionTimers.get(key)
+    if (pendingTimer !== undefined) {
+      clearTimeout(pendingTimer)
+      connectionState.cacheEvictionTimers.delete(key)
+    }
+    const registered = connectionState.cacheRegistry.get(key)
+    const persister = registered?.persister ?? connectionState.memoryPersister
+    connectionState.cacheRegistry.delete(key)
+    await Promise.resolve(persister.removeEntry(key))
+    return
+  }
+
+  // Discard pending writes, not flush: clearing means "forget the latest too".
+  for (const writer of connectionState.cacheWriters.values()) {
+    writer.cancel()
+  }
+  connectionState.cacheWriters.clear()
+  for (const timer of connectionState.cacheEvictionTimers.values()) {
+    clearTimeout(timer)
+  }
+  connectionState.cacheEvictionTimers.clear()
+
+  const persisters = new Set<MusubiCachePersister>([connectionState.memoryPersister])
+  for (const registered of connectionState.cacheRegistry.values()) {
+    persisters.add(registered.persister)
+  }
+  connectionState.cacheRegistry.clear()
+
+  await Promise.all(
+    [...persisters].map((persister) =>
+      persister.clear
+        ? Promise.resolve(persister.clear())
+        : Promise.resolve()
+    )
+  )
 }
 
 function handleConnectionPatch(

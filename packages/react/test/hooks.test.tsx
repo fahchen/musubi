@@ -460,6 +460,101 @@ describe("useMusubiCommand", () => {
   })
 })
 
+describe("useMusubiRoot stale-while-revalidate", () => {
+  function SwrReader({ id, keepPreviousData }: { id: string; keepPreviousData?: boolean }) {
+    const root = useMusubiRoot({
+      module: "React.Test.Root",
+      id,
+      cache: {},
+      ...(keepPreviousData !== undefined ? { keepPreviousData } : {})
+    })
+    if (root.status !== "ready") {
+      return <span>{root.status}</span>
+    }
+    const error = root.revalidationError ? root.revalidationError.message : "none"
+    return <span>{`${root.store.snapshot().title}:${String(root.isFetching)}:${error}`}</span>
+  }
+
+  test("a cache-seeded mount is ready with isFetching until revalidation settles", async () => {
+    const fake = buildProxy("Cached")
+    const connection = new FakeMusubiConnection(fake.asProxy())
+    connection.fromCacheNext = true
+    const gate = deferred<void>()
+    connection.revalidatedResult = gate.promise
+
+    render(
+      <MusubiProvider connection={connection}>
+        <SwrReader id="d1" />
+      </MusubiProvider>
+    )
+
+    expect(await screen.findByText("Cached:true:none")).toBeTruthy()
+
+    await act(async () => {
+      gate.resolve()
+      await gate.promise
+    })
+
+    expect(await screen.findByText("Cached:false:none")).toBeTruthy()
+  })
+
+  test("revalidation failure surfaces revalidationError while keeping the stale store", async () => {
+    const fake = buildProxy("Cached")
+    const connection = new FakeMusubiConnection(fake.asProxy())
+    connection.fromCacheNext = true
+    const gate = deferred<void>()
+    connection.revalidatedResult = gate.promise
+
+    render(
+      <MusubiProvider connection={connection}>
+        <SwrReader id="d1" />
+      </MusubiProvider>
+    )
+
+    expect(await screen.findByText("Cached:true:none")).toBeTruthy()
+
+    await act(async () => {
+      gate.reject(new Error("revalidate failed"))
+      await gate.promise.catch(() => undefined)
+    })
+
+    expect(await screen.findByText("Cached:false:revalidate failed")).toBeTruthy()
+  })
+
+  test("keepPreviousData keeps the prior store visible while a new key mounts", async () => {
+    const fakeA = buildProxy("AAA")
+    const fakeB = buildProxy("BBB")
+    const connection = new FakeMusubiConnection(fakeA.asProxy())
+    const bGate = deferred<StoreProxy<Root, ReactTestStores>>()
+    connection.mountResults = [Promise.resolve(fakeA.asProxy()), bGate.promise]
+    connection.fromCacheValues = [false, false]
+
+    const result = render(
+      <MusubiProvider connection={connection}>
+        <SwrReader id="a" keepPreviousData />
+      </MusubiProvider>
+    )
+
+    expect(await screen.findByText("AAA:false:none")).toBeTruthy()
+
+    result.rerender(
+      <MusubiProvider connection={connection}>
+        <SwrReader id="b" keepPreviousData />
+      </MusubiProvider>
+    )
+
+    // Prior store stays mounted with isFetching:true until the new key resolves.
+    expect(await screen.findByText("AAA:true:none")).toBeTruthy()
+
+    await act(async () => {
+      bGate.resolve(fakeB.asProxy())
+      await bGate.promise
+    })
+
+    expect(await screen.findByText("BBB:false:none")).toBeTruthy()
+  })
+})
+
 class FakeMusubiConnection implements MusubiConnection<ReactTestStores> {
   readonly topic = "musubi:connection"
   readonly mounts: Array<MountStoreOptions<Root, ReactTestStores>> = []
@@ -469,6 +564,14 @@ class FakeMusubiConnection implements MusubiConnection<ReactTestStores> {
   mountErrors: Array<Error | null> = []
   mountResult: Promise<StoreProxy<Root, ReactTestStores>> | null = null
   mountResults: Array<Promise<StoreProxy<Root, ReactTestStores>>> = []
+  // Stale-while-revalidate knobs. `fromCacheNext` / `revalidatedResult` are the
+  // defaults; the `*Values` / `*Results` arrays let a test script successive
+  // mounts (e.g. keepPreviousData across an id change).
+  fromCacheNext = false
+  fromCacheValues: boolean[] = []
+  revalidatedResult: Promise<void> | null = null
+  revalidatedResults: Array<Promise<void>> = []
+  readonly clearedTargets: Array<unknown> = []
 
   constructor(private readonly store: StoreProxy<Root, ReactTestStores>) {}
 
@@ -489,12 +592,29 @@ class FakeMusubiConnection implements MusubiConnection<ReactTestStores> {
       ? ((await promise) as unknown as StoreProxy<M, ReactTestStores>)
       : (this.store as unknown as StoreProxy<M, ReactTestStores>)
 
+    const fromCache = this.fromCacheValues.shift() ?? this.fromCacheNext
+    const revalidated = this.revalidatedResults.shift() ?? this.revalidatedResult ?? Promise.resolve()
+    // Pre-attach a no-op catch so a rejecting revalidation gate doesn't surface
+    // as an unhandled rejection before the hook wires up its own handler.
+    revalidated.catch(() => undefined)
+
     return {
       store: proxy,
       unmount: async () => {
         this.unmounts.push(options.id)
-      }
+      },
+      fromCache,
+      isFetching: fromCache,
+      revalidated
     }
+  }
+
+  async clearStoreCache(target?: {
+    module: string
+    id: string
+    params?: Record<string, unknown>
+  }): Promise<void> {
+    this.clearedTargets.push(target ?? null)
   }
 
   async disconnect(): Promise<void> {

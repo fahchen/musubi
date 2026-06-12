@@ -200,7 +200,7 @@ describe("snapshot cache invalidation", () => {
 
 async function mountTestRoot(): Promise<{
   channel: MockChannel
-  connection: Awaited<ReturnType<typeof mountConnectionRoot>>
+  connection: Awaited<ReturnType<typeof mountConnectionRoot>>["connection"]
 }> {
   const socket = new MockSocket()
   const { connection: connectionState, ready: connectionReady } = openConnectionState(socket)
@@ -222,7 +222,7 @@ async function mountTestRoot(): Promise<{
   // separate frames, so the JS event loop drains microtasks between them.
   await Promise.resolve()
   channel.emit("patch", initialConnectionEnvelope("Test.Root:root", rootState()))
-  const connection = await mountPromise
+  const { connection } = await mountPromise
 
   return { channel, connection }
 }
