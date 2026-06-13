@@ -801,7 +801,11 @@ export async function disconnectConnectionState(
     }
     connectionState.cacheEvictionTimers.clear()
     connectionState.cacheRegistry.clear()
-    void Promise.resolve(connectionState.memoryPersister.clear?.()).catch(() => undefined)
+    // Defer into `.then` so a synchronous throw from `clear()` can't abort the
+    // rest of disconnect cleanup.
+    void Promise.resolve()
+      .then(() => connectionState.memoryPersister.clear?.())
+      .catch(() => undefined)
     const runtime = getSharedRuntime(connectionState.socket)
     runtime.connections.delete(connectionState.topic)
   }
@@ -1222,9 +1226,16 @@ function scheduleCacheEviction(connection: RootConnection): void {
     connectionState.cacheEvictionTimers.delete(key)
   }
 
-  void Promise.resolve(registered.persister.getEntry(key))
+  // Defer the read into a `.then` so a synchronous throw from a custom
+  // persister surfaces as a rejection (caught below) instead of bubbling out
+  // of `scheduleCacheEviction`.
+  void Promise.resolve()
+    .then(() => registered.persister.getEntry(key))
     .then((entry) => {
-      const age = entry ? Date.now() - entry.updatedAt : registered.gcMs
+      // No visible entry yet — e.g. an async persister's just-flushed write
+      // hasn't landed. Preserve the full gcTime window rather than evicting
+      // now and racing the in-flight write to deletion.
+      const age = entry ? Date.now() - entry.updatedAt : 0
       const remaining = Math.max(0, registered.gcMs - age)
       const timer = setTimeout(() => {
         connectionState.cacheEvictionTimers.delete(key)
@@ -1234,7 +1245,9 @@ function scheduleCacheEviction(connection: RootConnection): void {
           return
         }
         connectionState.cacheRegistry.delete(key)
-        void Promise.resolve(registered.persister.removeEntry(key)).catch(() => undefined)
+        void Promise.resolve()
+          .then(() => registered.persister.removeEntry(key))
+          .catch(() => undefined)
       }, remaining)
       connectionState.cacheEvictionTimers.set(key, timer)
     })

@@ -29,8 +29,8 @@ export interface CacheOptions {
 
 export const DEFAULT_GC_MS = 300_000
 
-// Per-store identity key. Mirrors `rootMountKey` in @musubi/react so a store
-// mounted by either layer maps to the same cache slot.
+// Per-store identity key. `@musubi/react` imports this for its mount-key so a
+// store mounted by either layer maps to the same cache slot.
 export function storeCacheKey(target: {
   module: string
   id: string

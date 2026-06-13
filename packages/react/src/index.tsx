@@ -332,6 +332,10 @@ export function createMusubi<R>(): MusubiFactory<R> {
             isFetching: mounted.isFetching,
             revalidationError: null
           })
+          // Cold mounts already resolved with `isFetching: false`; only a
+          // cache-seeded mount is still revalidating. Skip the no-op handler
+          // for cold mounts to avoid an extra render.
+          if (!mounted.isFetching) return
           // Settle `isFetching` when revalidation lands. On failure keep the
           // (stale) store visible and surface the error rather than blanking
           // the UI.
