@@ -87,18 +87,38 @@ export function createStorageCachePersister(
 ): MusubiCachePersister {
   const prefix = opts.prefix ?? "musubi:cache:"
   const storageKey = (key: string): string => prefix + key
+  const safeRemove = (storeKey: string): void => {
+    try {
+      storage.removeItem(storeKey)
+    } catch {
+      // best-effort: a throwing storage shouldn't break cache maintenance.
+    }
+  }
 
   return {
     durable: true,
     getEntry: (key) => {
-      const raw = storage.getItem(storageKey(key))
-      if (raw === null) return undefined
+      let raw: string | null
       try {
-        return JSON.parse(raw) as MusubiCacheEntry
+        raw = storage.getItem(storageKey(key))
       } catch {
-        storage.removeItem(storageKey(key))
         return undefined
       }
+      if (raw === null) return undefined
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(raw)
+      } catch {
+        safeRemove(storageKey(key))
+        return undefined
+      }
+      // Drop malformed/older shapes (missing updatedAt/buster, wrong types)
+      // so they can't slip into seeding or eviction.
+      if (!isCacheEntry(parsed)) {
+        safeRemove(storageKey(key))
+        return undefined
+      }
+      return parsed
     },
     setEntry: (key, entry) => {
       try {
@@ -109,19 +129,35 @@ export function createStorageCachePersister(
       }
     },
     removeEntry: (key) => {
-      storage.removeItem(storageKey(key))
+      safeRemove(storageKey(key))
     },
     clear: () => {
-      const length = storage.length ?? 0
       if (typeof storage.key !== "function") return
       const doomed: string[] = []
-      for (let i = 0; i < length; i++) {
-        const k = storage.key(i)
-        if (k !== null && k.startsWith(prefix)) doomed.push(k)
+      // `length` is optional; when absent, walk `key(i)` until it returns null.
+      for (let i = 0; storage.length === undefined || i < storage.length; i++) {
+        let k: string | null
+        try {
+          k = storage.key(i)
+        } catch {
+          break
+        }
+        if (k === null) break
+        if (k.startsWith(prefix)) doomed.push(k)
       }
-      for (const k of doomed) storage.removeItem(k)
+      for (const k of doomed) safeRemove(k)
     }
   }
+}
+
+function isCacheEntry(value: unknown): value is MusubiCacheEntry {
+  if (typeof value !== "object" || value === null) return false
+  const entry = value as Record<string, unknown>
+  return (
+    "data" in entry &&
+    typeof entry.updatedAt === "number" &&
+    typeof entry.buster === "string"
+  )
 }
 
 export interface ThrottledWriter {

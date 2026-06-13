@@ -4,6 +4,7 @@ import {
   DEFAULT_GC_MS,
   storeCacheKey,
   type CacheOptions,
+  type MusubiCacheEntry,
   type MusubiCachePersister,
   type ThrottledWriter
 } from "./cache"
@@ -478,22 +479,31 @@ function resolveCacheConfig(
 
 // Seed the tentative connection's root from cache for stale-while-revalidate.
 // Returns true when a valid entry (or `initialData`) was applied. Entries are
-// invalidated on `buster` mismatch or age beyond `gcTime`.
+// invalidated on `buster` mismatch or age beyond `gcTime`. Cache I/O is
+// best-effort: a throwing/rejecting custom persister degrades to a cold mount
+// rather than aborting `mountConnectionRoot` and leaking a half-mounted root.
 async function trySeedFromCache(
   tentative: RootConnection,
   cfg: ResolvedCacheConfig
 ): Promise<boolean> {
   const now = Date.now()
-  let entry = await cfg.persister.getEntry(cfg.key)
+  let entry: MusubiCacheEntry | undefined
+  try {
+    entry = await cfg.persister.getEntry(cfg.key)
 
-  if (entry && (entry.buster !== cfg.buster || now - entry.updatedAt > cfg.gcMs)) {
-    await cfg.persister.removeEntry(cfg.key)
-    entry = undefined
-  }
+    if (entry && (entry.buster !== cfg.buster || now - entry.updatedAt > cfg.gcMs)) {
+      await cfg.persister.removeEntry(cfg.key)
+      entry = undefined
+    }
 
-  if (!entry && cfg.initialData !== undefined) {
-    entry = { data: cfg.initialData, updatedAt: now, buster: cfg.buster }
-    await cfg.persister.setEntry(cfg.key, entry)
+    if (!entry && cfg.initialData !== undefined) {
+      entry = { data: cfg.initialData, updatedAt: now, buster: cfg.buster }
+      await cfg.persister.setEntry(cfg.key, entry)
+    }
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn("[musubi] cache read failed; falling back to a cold mount:", error)
+    return false
   }
 
   if (!entry) {

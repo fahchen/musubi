@@ -551,4 +551,87 @@ describe("client store cache", () => {
     expect(mounted.isFetching).toBe(false)
     expect(mounted.store.title).toBe("Inbox")
   })
+
+  test("storage getEntry discards malformed entries and survives a throwing getItem", async () => {
+    const backing = new Map<string, string>()
+    backing.set("musubi:cache:k", JSON.stringify({ data: { v: 1 } })) // missing updatedAt/buster
+    const removed: string[] = []
+    const storage: StorageLike = {
+      getItem: (k) => backing.get(k) ?? null,
+      setItem: (k, v) => {
+        backing.set(k, v)
+      },
+      removeItem: (k) => {
+        removed.push(k)
+        backing.delete(k)
+      }
+    }
+    const { createStorageCachePersister } = await import("../src/cache")
+    const persister = createStorageCachePersister(storage)
+
+    expect(await persister.getEntry("k")).toBeUndefined()
+    expect(removed).toContain("musubi:cache:k")
+
+    const throwingStorage: StorageLike = {
+      getItem: () => {
+        throw new Error("SecurityError")
+      },
+      setItem: () => {},
+      removeItem: () => {}
+    }
+    const guarded = createStorageCachePersister(throwingStorage)
+    expect(await guarded.getEntry("k")).toBeUndefined()
+  })
+
+  test("storage clear works when StorageLike exposes key() but not length", async () => {
+    const backing = new Map<string, string>([
+      ["musubi:cache:a", "1"],
+      ["other:b", "2"],
+      ["musubi:cache:c", "3"]
+    ])
+    const keys = (): string[] => [...backing.keys()]
+    const storage: StorageLike = {
+      getItem: (k) => backing.get(k) ?? null,
+      setItem: (k, v) => {
+        backing.set(k, v)
+      },
+      removeItem: (k) => {
+        backing.delete(k)
+      },
+      key: (i) => keys()[i] ?? null
+      // no `length`
+    }
+    const { createStorageCachePersister } = await import("../src/cache")
+    const persister = createStorageCachePersister(storage)
+
+    await persister.clear?.()
+    expect(backing.has("musubi:cache:a")).toBe(false)
+    expect(backing.has("musubi:cache:c")).toBe(false)
+    expect(backing.has("other:b")).toBe(true)
+  })
+
+  test("a throwing custom persister degrades to a cold mount", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const persister: MusubiCachePersister = {
+      durable: false,
+      getEntry: () => {
+        throw new Error("persister boom")
+      },
+      setEntry: () => {},
+      removeEntry: () => {}
+    }
+
+    const socket = new MockSocket()
+    const connection = await openConn(socket)
+
+    const mounted = await mountInitial(socket, connection, {
+      id: "alpha",
+      cache: { persister }
+    })
+    expect(mounted.fromCache).toBe(false)
+    expect(mounted.store.title).toBe("Inbox")
+    expect(
+      warnSpy.mock.calls.some((c) => String(c[0]).includes("falling back to a cold mount"))
+    ).toBe(true)
+  })
 })
