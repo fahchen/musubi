@@ -206,6 +206,113 @@ export function DashboardPage() {
 }
 ```
 
+## Stale-While-Revalidate Cache
+
+Mounting always needs a server round-trip to establish the live channel
+subscription, so a re-mount of a store you held moments ago (a route swap)
+flashes `loading` again. The opt-in cache removes that flash: when a valid
+entry for a store's identity exists, the mount **resolves immediately with the
+last-known state** (`fromCache: true`) while the live mount revalidates in the
+background and swaps in the server's initial patch when it lands.
+
+Because the channel is always live, there is no TanStack-style `staleTime` — a
+cached mount *always* revalidates; the cache only controls what is shown in the
+meantime.
+
+### Enable it per mount
+
+Pass `cache` to `mountStore` (or `useMusubiRoot`). An empty object uses the
+defaults: a connection-scoped in-memory backend and a 5-minute `gcTime`.
+
+```ts
+const { store, fromCache, isFetching, revalidated } = await connection.mountStore({
+  module: "MyApp.Stores.DashboardStore",
+  id: "dashboard",
+  cache: {},
+})
+
+// `revalidated` resolves when the live initial patch replaces the seed
+// (resolves immediately for a cold mount with no cached entry).
+await revalidated
+```
+
+Options:
+
+```ts
+cache: {
+  gcTime: 300_000,        // eviction TTL measured from the last accepted patch
+  buster: "v3",           // data-shape version; a mismatch discards the entry
+  persister: myPersister, // storage backend (default: connection in-memory Map)
+  initialData: seedState, // seed the first mount when no entry exists
+}
+```
+
+### Persist across reloads
+
+The default backend is in-memory and cleared on `disconnect`. For state that
+survives a page reload, use the Web Storage adapter. Always set `buster` for a
+durable backend so a deploy that changes the store's data shape discards stale
+entries (omitting it logs a dev warning).
+
+```ts
+import { createStorageCachePersister } from "@musubi/client"
+
+const persister = createStorageCachePersister(localStorage) // or sessionStorage
+
+await connection.mountStore({
+  module: "MyApp.Stores.DashboardStore",
+  id: "dashboard",
+  cache: { persister, buster: "v3" },
+})
+```
+
+Cache I/O is best-effort: a throwing persister degrades to a cold mount rather
+than failing the mount, and malformed stored entries are discarded on read.
+
+### In React
+
+`useMusubiRoot` forwards `cache` and adds two signals plus `keepPreviousData`:
+
+```tsx
+const root = useMusubiRoot({
+  module: "MyApp.Stores.DashboardStore",
+  id: "dashboard",
+  cache: { persister, buster: "v3" },
+  keepPreviousData: true, // keep the prior store visible across an id/params
+})                        // change instead of flashing loading
+
+if (root.status === "loading") return <Spinner />
+if (root.status === "error") return <p>{root.error.message}</p>
+
+return (
+  <DashboardContent
+    store={root.store}
+    revalidating={root.isFetching}      // showing cached data, refresh in flight
+    staleError={root.revalidationError} // refresh failed; stale store still shown
+  />
+)
+```
+
+`isFetching` is `true` while a cached (or kept-previous) store is shown pending
+revalidation, then settles to `false`. On a revalidation failure the stale
+store stays visible and the error surfaces on `revalidationError` rather than
+blanking the UI. The Suspense variant is unchanged — SWR does not map onto
+throwing a promise.
+
+### Commands during the stale window
+
+A command dispatched while a cache-seeded mount is still revalidating (before
+the live initial patch lands) is **queued** behind the initial patch instead of
+rejecting "Store is not connected"; it dispatches once the store is live, or
+rejects if revalidation fails.
+
+### Clear the cache
+
+```ts
+await connection.clearStoreCache({ module, id, params }) // one entry
+await connection.clearStoreCache()                       // every entry
+```
+
 ## Subscribe To Snapshots
 
 `useMusubiSnapshot` subscribes to proxy updates and returns an immutable

@@ -11,6 +11,31 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Added
+
+- **`@musubi/client` / `@musubi/react`** — Opt-in, TanStack-Query-style
+  stale-while-revalidate store cache. Mounting a store whose identity was
+  seen before seeds last-known state immediately (`fromCache: true`) while the
+  live mount revalidates in the background and swaps in fresh state when the
+  server's initial patch lands. Enabled per call via `MountStoreOptions.cache`
+  (`{ gcTime?, persister?, buster?, initialData? }`). Storage is pluggable
+  through `MusubiCachePersister` — the default is a connection-scoped in-memory
+  Map (cleared on `disconnect`); `createStorageCachePersister` adapts
+  `localStorage` / `sessionStorage`. Accepted patches write through to the
+  cache on a per-key trailing throttle and flush on teardown / disconnect.
+  `gcTime` (default 5 min) is measured from the entry's last update and
+  enforced at read so it survives reloads. A `buster` string discards stale
+  data shapes across deploys, with a dev warning when a durable persister is
+  used without one. Commands dispatched during the stale window are queued
+  behind the live initial patch instead of rejecting. New surface:
+  `MountedStore.{fromCache, isFetching, revalidated}`,
+  `MusubiConnection.clearStoreCache(target?)`, and the
+  `createMemoryPersister` / `createStorageCachePersister` / `storeCacheKey`
+  exports. In `@musubi/react`, `useMusubiRoot`'s result gains `isFetching` and
+  `revalidationError`, plus a `keepPreviousData` option that keeps the prior
+  store visible across an `id` / `params` change until the new mount resolves.
+  Non-cached mounts are unchanged (#74).
+
 ## [0.7.2] — 2026-06-05
 
 ### Fixed

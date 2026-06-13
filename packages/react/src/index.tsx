@@ -11,8 +11,10 @@ import type { FC, ReactNode } from "react"
 import { useSyncExternalStoreWithSelector } from "use-sync-external-store/shim/with-selector"
 
 import {
+  canonicalStringify,
   connect as baseConnect,
   MusubiCommandError,
+  storeCacheKey,
   type ConnectOptions,
   type MountStoreOptions,
   type MountedStore,
@@ -63,15 +65,37 @@ export type {
 // ---------------------------------------------------------------------------
 
 export type MusubiRootMount<M extends StoreModule<R>, R> =
-  | { status: "loading"; store: null; error: null }
-  | { status: "ready"; store: StoreProxy<M, R>; error: null }
-  | { status: "error"; store: null; error: Error }
+  | {
+      status: "loading"
+      store: null
+      error: null
+      isFetching: true
+      revalidationError: null
+    }
+  | {
+      status: "ready"
+      store: StoreProxy<M, R>
+      error: null
+      isFetching: boolean
+      revalidationError: Error | null
+    }
+  | {
+      status: "error"
+      store: null
+      error: Error
+      isFetching: false
+      revalidationError: null
+    }
 
 export type UseMusubiRootOptions<
   M extends StoreModule<R>,
   R
 > = MountStoreOptions<M, R> & {
   unmountOnCleanup?: boolean
+  // Keep the previously-resolved store visible (with `isFetching: true`) while
+  // a new key (id/params/module change) mounts, instead of flashing
+  // `status: "loading"`. The new key's own cache seed, if any, then replaces it.
+  keepPreviousData?: boolean
 }
 
 export type MusubiConnectionStatus<R> =
@@ -269,17 +293,31 @@ export function createMusubi<R>(): MusubiFactory<R> {
     const [state, setState] = useState<MusubiRootMount<M, R>>({
       status: "loading",
       store: null,
-      error: null
+      error: null,
+      isFetching: true,
+      revalidationError: null
     })
 
     const paramsKey = canonicalStringify(options.params ?? null)
+    // Read at transition time, not via deps — toggling it shouldn't force a
+    // mount teardown/remount; it only governs the loading-gap presentation.
+    const keepPreviousDataRef = useRef(options.keepPreviousData ?? false)
+    keepPreviousDataRef.current = options.keepPreviousData ?? false
 
     useEffect(() => {
       let cancelled = false
       const unmountOnCleanup = options.unmountOnCleanup ?? true
       const mountOptions = buildMountOptions<M, R>(options)
 
-      setState({ status: "loading", store: null, error: null })
+      // keepPreviousData governs only the gap before the new mount resolves:
+      // keep the prior `store` visible (flagged `isFetching`) instead of
+      // flashing `loading`. The new key's own cache seed, if any, then resolves
+      // fast and replaces it.
+      setState((prev) =>
+        keepPreviousDataRef.current && prev.status === "ready"
+          ? { ...prev, isFetching: true, revalidationError: null }
+          : { status: "loading", store: null, error: null, isFetching: true, revalidationError: null }
+      )
 
       const sharedMount = ensureRootMount<M, R>(connection, mountOptions)
       bumpMountRef(connection, sharedMount.key)
@@ -290,15 +328,48 @@ export function createMusubi<R>(): MusubiFactory<R> {
           setState({
             status: "ready",
             store: mounted.store as StoreProxy<M, R>,
-            error: null
+            error: null,
+            isFetching: mounted.isFetching,
+            revalidationError: null
           })
+          // Cold mounts already resolved with `isFetching: false`; only a
+          // cache-seeded mount is still revalidating. Skip the no-op handler
+          // for cold mounts to avoid an extra render.
+          if (!mounted.isFetching) return
+          // Settle `isFetching` when revalidation lands. On failure keep the
+          // (stale) store visible and surface the error rather than blanking
+          // the UI.
+          mounted.revalidated
+            .then(() => {
+              if (cancelled) return
+              setState((prev) =>
+                prev.status === "ready"
+                  ? { ...prev, isFetching: false, revalidationError: null }
+                  : prev
+              )
+            })
+            .catch((error: unknown) => {
+              if (cancelled) return
+              setState((prev) =>
+                prev.status === "ready"
+                  ? {
+                      ...prev,
+                      isFetching: false,
+                      revalidationError:
+                        error instanceof Error ? error : new Error(String(error))
+                    }
+                  : prev
+              )
+            })
         })
         .catch((error: unknown) => {
           if (!cancelled) {
             setState({
               status: "error",
               store: null,
-              error: error instanceof Error ? error : new Error(String(error))
+              error: error instanceof Error ? error : new Error(String(error)),
+              isFetching: false,
+              revalidationError: null
             })
           }
         })
@@ -687,11 +758,14 @@ function ensureRootMount<M extends StoreModule<R>, R>(
   connection: MusubiConnection<R>,
   options: MountStoreOptions<M, R>
 ): SharedRootMount {
-  const key = rootMountKey(options)
+  const key = storeCacheKey(options)
   const mounts = rootMountsFor(connection)
   const existing = mounts.get(key)
 
   if (existing) {
+    // Keyed by identity only (module|id|params), not by cache options — like
+    // params, the first caller to mount an identity wins; later callers sharing
+    // that identity reuse its mount (and its cache config).
     cancelCleanupTimer(existing)
     return existing
   }
@@ -807,27 +881,8 @@ function buildMountOptions<M extends StoreModule<R>, R>(
   return {
     module: options.module,
     id: options.id,
-    ...(options.params !== undefined ? { params: options.params } : {})
+    ...(options.params !== undefined ? { params: options.params } : {}),
+    ...(options.cache !== undefined ? { cache: options.cache } : {})
   }
 }
 
-function rootMountKey<M extends StoreModule<R>, R>(
-  options: MountStoreOptions<M, R>
-): string {
-  return `${options.id}|${options.module}|${canonicalStringify(options.params ?? null)}`
-}
-
-function canonicalStringify(value: unknown): string {
-  // Mirror native JSON.stringify semantics for `undefined`:
-  // arrays render undefined slots as "null"; objects drop undefined-valued keys.
-  if (value === undefined) return "null"
-  if (value === null || typeof value !== "object") return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(canonicalStringify).join(",")}]`
-  const obj = value as Record<string, unknown>
-  const keys = Object.keys(obj)
-    .filter((k) => obj[k] !== undefined)
-    .sort()
-  return `{${keys
-    .map((k) => `${JSON.stringify(k)}:${canonicalStringify(obj[k])}`)
-    .join(",")}}`
-}
