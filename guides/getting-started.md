@@ -10,7 +10,7 @@ In the Phoenix app:
 ```elixir
 def deps do
   [
-    {:musubi, "~> 0.7.2"}
+    {:musubi, "~> 0.8.0"}
   ]
 end
 ```
