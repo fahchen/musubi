@@ -109,19 +109,38 @@ defmodule Musubi.AsyncResult do
   def loading(prior), do: %__MODULE__{status: :loading, result: prior}
 
   @doc """
-  Returns an `:ok` `%AsyncResult{}` carrying the produced value. The `prior`
-  argument is accepted for symmetry with `loading/1`/`failed/2`; on success
-  the new `result` always replaces the prior one.
+  Returns a fresh `:ok` `%AsyncResult{}` carrying the produced value, with no
+  prior state to carry forward.
 
   ## Examples
 
-      iex> Musubi.AsyncResult.ok(%Musubi.AsyncResult{status: :loading}, %{name: "ada"})
+      iex> Musubi.AsyncResult.ok(42)
+      %Musubi.AsyncResult{status: :ok, result: 42, reason: nil}
+  """
+  @spec ok(term()) :: t()
+  def ok(value), do: %__MODULE__{status: :ok, result: value, reason: nil}
+
+  @doc """
+  Returns an `:ok` `%AsyncResult{}` carrying the produced value.
+
+  When `prior` is an existing `%AsyncResult{}`, it is updated in place — status
+  flipped to `:ok`, `reason` cleared, `result` replaced — mirroring
+  `Phoenix.LiveView.AsyncResult.ok/2`. Any other `prior` (e.g. `nil`) builds a
+  fresh struct.
+
+  ## Examples
+
+      iex> prior = %Musubi.AsyncResult{status: :failed, result: "stale", reason: {:error, :boom}}
+      iex> Musubi.AsyncResult.ok(prior, %{name: "ada"})
       %Musubi.AsyncResult{status: :ok, result: %{name: "ada"}, reason: nil}
 
       iex> Musubi.AsyncResult.ok(nil, 42)
       %Musubi.AsyncResult{status: :ok, result: 42, reason: nil}
   """
   @spec ok(t() | term(), term()) :: t()
+  def ok(%__MODULE__{} = prior, value),
+    do: %{prior | status: :ok, result: value, reason: nil}
+
   def ok(_prior, value), do: %__MODULE__{status: :ok, result: value, reason: nil}
 
   @doc """
