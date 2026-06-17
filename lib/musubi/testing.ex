@@ -140,6 +140,24 @@ defmodule Musubi.Testing do
   end
 
   @doc """
+  Targets a mounted child store with new assigns via `Musubi.send_update/3`
+  (BDR-0030).
+
+  The `assigns` map is delivered to the store's `update/2`, dirtying that
+  subtree; the resulting coalesced patch lands on the transport pid for
+  `ExUnit.Assertions.assert_receive/2`. A subsequent `render/2` or
+  `assigns/2` observes the update — the peek `GenServer.call` syncs the
+  page mailbox (FIFO), so the send is processed before the read returns.
+  A `store_id` that is not mounted is a no-op (no patch is pushed).
+  """
+  @spec send_update(t(), Socket.store_id(), map()) :: :ok
+  def send_update(%__MODULE__{pid: pid}, store_id, assigns)
+      when is_list(store_id) and is_map(assigns) do
+    Musubi.send_update(pid, store_id, assigns)
+    :ok
+  end
+
+  @doc """
   Sends an external-mode progress event for an entry on the mounted page.
   """
   @spec simulate_external_progress(t(), atom(), String.t(), non_neg_integer(), Socket.store_id()) ::
