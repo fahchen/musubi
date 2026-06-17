@@ -13,11 +13,6 @@ defmodule Musubi.Page.ServerSendUpdateTest do
   alias Musubi.Page.PatchEnvelope
   alias Musubi.Page.Server
 
-  setup do
-    Process.flag(:trap_exit, true)
-    :ok
-  end
-
   defmodule CommentsStore do
     @moduledoc false
     use Musubi.Store
@@ -112,7 +107,8 @@ defmodule Musubi.Page.ServerSendUpdateTest do
     end
 
     test "is a no-op + telemetry for an unmounted store_id, page stays alive" do
-      attach_no_target_handler!()
+      ref = :telemetry_test.attach_event_handlers(self(), [[:musubi, :send_update, :no_target]])
+      on_exit(fn -> :telemetry.detach(ref) end)
       pid = start!()
 
       assert_received :root_render_called
@@ -121,7 +117,7 @@ defmodule Musubi.Page.ServerSendUpdateTest do
       assert :ok = Musubi.send_update(pid, ["does_not_exist"], %{reload_token: make_ref()})
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :send_update, :no_target], _measurements,
+      assert_received {[:musubi, :send_update, :no_target], ^ref, _measurements,
                        %{store_id: ["does_not_exist"]}}
 
       refute_receive {:patch, %PatchEnvelope{}}
@@ -223,21 +219,5 @@ defmodule Musubi.Page.ServerSendUpdateTest do
   defp child_render(pid, store_id) do
     {:ok, %{socket: socket, module: module}} = Server.peek(pid, store_id)
     module.render(socket)
-  end
-
-  defp attach_no_target_handler! do
-    test_pid = self()
-    handler_id = "send-update-no-target-#{System.unique_integer([:positive, :monotonic])}"
-
-    :telemetry.attach(
-      handler_id,
-      [:musubi, :send_update, :no_target],
-      fn event, measurements, metadata, _config ->
-        send(test_pid, {:telemetry, event, measurements, metadata})
-      end,
-      nil
-    )
-
-    on_exit(fn -> :telemetry.detach(handler_id) end)
   end
 end
