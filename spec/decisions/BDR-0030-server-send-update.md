@@ -75,9 +75,24 @@ a mounted store, the runtime emits `[:musubi, :send_update, :no_target]`
 telemetry and pushes no envelope.
 
 **Pushed assigns are passed raw** to `update/2` — no attr normalization, matching
-LiveView which passes the `send_update` map straight through. Caveat (LiveView-
-identical): a later parent re-render that passes the same key overrides the
-pushed value.
+LiveView which passes the `send_update` map straight through.
+
+**Push keys the child owns, not parent-controlled props.** `reconcile_child/4`
+checks `parent_assign_values_changed?` *before* `subtree_dirty?`
+(`lib/musubi/reconciler.ex`). So if a pushed key is one the parent also passes to
+the child, the very next resolve sees the socket value diverge from the (cached,
+per BDR-0023) parent prop and re-runs `update_store/2` with the parent's value —
+reverting the pushed value and double-invoking `update/2` in the same cycle. Net
+effect on an overlapping key is therefore nil. This is the LiveView "parent props
+win" rule, surfaced one resolve earlier because Musubi reconciles every cycle. The
+intended use is an internal trigger/state key the parent does not supply (e.g.
+`%{reload_token: ref}`), which takes the clean `subtree_dirty?` path with a single
+`update/2` invocation.
+
+**Addressing is unrestricted to children.** `store_id` may resolve to any mounted
+store, including the root (`[]`). Targeting the root runs the root's `update/2`
+(or merges assigns when it is not exported) and re-renders the whole tree — valid,
+though the root's own `handle_info/2` remains the idiomatic path for root state.
 
 ### Relationship to BDR-0005 (no built-in PubSub) — explicit non-conflict
 

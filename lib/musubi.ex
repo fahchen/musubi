@@ -65,6 +65,14 @@ defmodule Musubi do
   `Phoenix.PubSub` (BDR-0005 / BDR-0030); Musubi owns the targeting, the
   application owns the broadcast.
 
+  `store_id` may address any mounted store, including the root (`[]`).
+
+  Push keys the **child owns**, not keys the parent passes it — e.g. an
+  internal trigger like `%{reload_token: ref}` the child's `update/2`
+  reacts to by reloading. A key the parent also supplies is reconciled
+  back to the parent's value on the very next resolve (parent props win,
+  LiveView-aligned) and re-invokes `update/2`, so it has no net effect.
+
   ## Examples
 
       iex> me = self()
