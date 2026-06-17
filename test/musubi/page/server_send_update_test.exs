@@ -99,8 +99,9 @@ defmodule Musubi.Page.ServerSendUpdateTest do
 
       assert_receive {:patch, %PatchEnvelope{ops: ops}}
 
-      # Diff is scoped to the child path only — no op touches the root path.
-      assert Enum.all?(ops, fn %{path: path} -> String.starts_with?(path, "/comments/") end)
+      # Diff is scoped to the child subtree — every op is at or under "/comments"
+      # (a whole-object replace at "/comments" is equally valid), none at "/title".
+      assert Enum.all?(ops, fn %{path: path} -> String.starts_with?(path, "/comments") end)
       assert ops != []
 
       # The reload actually happened on the child socket.

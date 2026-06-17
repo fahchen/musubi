@@ -78,7 +78,7 @@ defmodule Musubi do
       iex> me = self()
       iex> Musubi.send_update(["comments"], %{reload_token: :ref})
       :ok
-      iex> receive do msg -> msg end
+      iex> receive do {:musubi_send_update, _, _} = msg -> msg end
       {:musubi_send_update, ["comments"], %{reload_token: :ref}}
       iex> me == self()
       true
@@ -101,7 +101,7 @@ defmodule Musubi do
 
       iex> Musubi.send_update(self(), ["comments"], %{reload_token: :ref})
       :ok
-      iex> receive do msg -> msg end
+      iex> receive do {:musubi_send_update, _, _} = msg -> msg end
       {:musubi_send_update, ["comments"], %{reload_token: :ref}}
   """
   @spec send_update(pid(), store_id(), map()) :: :ok
