@@ -59,9 +59,11 @@ defmodule Musubi.Page.ServerSendUpdateTest do
     @moduledoc false
     use Musubi.Store
 
+    alias Musubi.Page.ServerSendUpdateTest.CommentsStore
+
     state do
       field :title, String.t()
-      field :comments, Musubi.Page.ServerSendUpdateTest.CommentsStore.state()
+      field :comments, CommentsStore.state()
     end
 
     @impl Musubi.Store
@@ -73,7 +75,7 @@ defmodule Musubi.Page.ServerSendUpdateTest do
 
       %{
         title: socket.assigns.title,
-        comments: child(Musubi.Page.ServerSendUpdateTest.CommentsStore, id: "comments")
+        comments: child(CommentsStore, id: "comments")
       }
     end
 
@@ -150,8 +152,10 @@ defmodule Musubi.Page.ServerSendUpdateTest do
     @moduledoc false
     use Musubi.Store
 
+    alias Musubi.Page.ServerSendUpdateTest.OverlapChild
+
     state do
-      field :child, Musubi.Page.ServerSendUpdateTest.OverlapChild.state()
+      field :child, OverlapChild.state()
     end
 
     # `passed_label` is internal state, not part of the render contract, so it is
@@ -163,7 +167,7 @@ defmodule Musubi.Page.ServerSendUpdateTest do
     def render(socket) do
       %{
         child:
-          child(Musubi.Page.ServerSendUpdateTest.OverlapChild,
+          child(OverlapChild,
             id: "c",
             label: socket.assigns.passed_label
           )
