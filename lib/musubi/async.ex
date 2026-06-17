@@ -571,11 +571,14 @@ defmodule Musubi.Async do
     end)
   end
 
+  # Normalize a captured prior into an `%AsyncResult{}` so `ok/2`/`failed/2`
+  # always receive a struct (raw assign or absent key seeds an empty one;
+  # `ok` discards the carried result, `failed` preserves it).
   defp prior_for(%{prior: prior}, key) do
     case Map.fetch(prior, key) do
       {:ok, %AsyncResult{} = ar} -> ar
-      {:ok, other} -> other
-      :error -> nil
+      {:ok, other} -> AsyncResult.loading(other)
+      :error -> AsyncResult.loading()
     end
   end
 

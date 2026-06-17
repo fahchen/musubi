@@ -114,9 +114,9 @@ defmodule Musubi.Page.ServerAsyncTest do
     def mount(socket) do
       socket =
         socket
-        |> Musubi.Socket.assign(:profile, AsyncResult.ok(nil, %{name: "cached"}))
-        |> Musubi.Socket.assign(:user, AsyncResult.ok(nil, "cached-user"))
-        |> Musubi.Socket.assign(:org, AsyncResult.ok(nil, "cached-org"))
+        |> Musubi.Socket.assign(:profile, AsyncResult.ok(%{name: "cached"}))
+        |> Musubi.Socket.assign(:user, AsyncResult.ok("cached-user"))
+        |> Musubi.Socket.assign(:org, AsyncResult.ok("cached-org"))
         |> Musubi.Socket.assign(:cache_status, "cold")
         |> Musubi.Socket.assign(:messages, AsyncResult.loading())
 

@@ -107,7 +107,7 @@ defmodule Musubi.StreamAsyncTest do
 
   describe "stream_async/3 reset" do
     test ":reset re-emits loading without prior" do
-      prior = AsyncResult.ok(nil, true)
+      prior = AsyncResult.ok(true)
 
       socket =
         base_socket()
