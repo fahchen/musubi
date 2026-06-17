@@ -39,7 +39,7 @@ defmodule Musubi.AsyncTest do
     test "applying error result writes AsyncResult.failed with prior preserved" do
       socket =
         base_socket()
-        |> Socket.assign(:profile, AsyncResult.ok(nil, "snapshot"))
+        |> Socket.assign(:profile, AsyncResult.ok("snapshot"))
         |> Async.assign_async(:profile, instant(fn -> {:error, :unauthorized} end))
 
       {classified, entry} = drain_task_result!(socket, :profile)
@@ -70,7 +70,7 @@ defmodule Musubi.AsyncTest do
     end
 
     test "preserves prior result during reload (no :reset)" do
-      prior = AsyncResult.ok(nil, "snapshot")
+      prior = AsyncResult.ok("snapshot")
 
       socket =
         base_socket()
@@ -82,7 +82,7 @@ defmodule Musubi.AsyncTest do
     end
 
     test ":reset re-emits loading without prior" do
-      prior = AsyncResult.ok(nil, "snapshot")
+      prior = AsyncResult.ok("snapshot")
 
       socket =
         base_socket()
@@ -115,8 +115,8 @@ defmodule Musubi.AsyncTest do
     test ":reset subset only resets the listed keys" do
       socket =
         base_socket()
-        |> Socket.assign(:user, AsyncResult.ok(nil, "u_prior"))
-        |> Socket.assign(:org, AsyncResult.ok(nil, "o_prior"))
+        |> Socket.assign(:user, AsyncResult.ok("u_prior"))
+        |> Socket.assign(:org, AsyncResult.ok("o_prior"))
         |> Async.assign_async(
           [:user, :org],
           instant(fn -> {:ok, %{user: "u", org: "o"}} end),

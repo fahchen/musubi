@@ -63,7 +63,7 @@ defmodule Musubi.AsyncResultTest do
                Musubi.Wire.to_wire(AsyncResult.loading())
 
       assert %{"__musubi_async__" => true, "status" => "ok", "result" => 42, "reason" => nil} =
-               Musubi.Wire.to_wire(AsyncResult.ok(nil, 42))
+               Musubi.Wire.to_wire(AsyncResult.ok(42))
     end
   end
 end
