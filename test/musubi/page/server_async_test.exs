@@ -569,7 +569,7 @@ defmodule Musubi.Page.ServerAsyncTest do
     end
 
     test "same-name overwrite keeps the latest result and lazy-discards the stale task" do
-      attach_telemetry_handler!([:musubi, :async, :lazy_discard])
+      ref = attach_telemetry_handler!([:musubi, :async, :lazy_discard])
 
       pid = start!()
 
@@ -593,7 +593,7 @@ defmodule Musubi.Page.ServerAsyncTest do
       assert_receive {:DOWN, ^first_ref, _, _, _}, 200
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :async, :lazy_discard], _measurements, metadata}
+      assert_received {[:musubi, :async, :lazy_discard], ^ref, _measurements, metadata}
       assert %{name: :warm_cache, kind: :start} = metadata
       assert %{assigns: %{cache_status: "warm:second"}} = root_socket(pid)
     end
@@ -601,7 +601,7 @@ defmodule Musubi.Page.ServerAsyncTest do
 
   describe "handle_async/3" do
     test "runtime survives, emits :exception telemetry, processes subsequent commands" do
-      attach_telemetry_handler!([:musubi, :async, :exception])
+      ref = attach_telemetry_handler!([:musubi, :async, :exception])
 
       pid = start!()
 
@@ -610,7 +610,7 @@ defmodule Musubi.Page.ServerAsyncTest do
         await_task!()
         sync_server!(pid)
 
-        assert_received {:telemetry, [:musubi, :async, :exception], _measurements, metadata}
+        assert_received {[:musubi, :async, :exception], ^ref, _measurements, metadata}
         assert metadata.name == :raises
         assert metadata.kind == :start
         assert is_list(metadata.stacktrace)
@@ -715,7 +715,7 @@ defmodule Musubi.Page.ServerAsyncTest do
     end
 
     test "writes failed on {:error, reason} and leaves the stream slot untouched" do
-      attach_telemetry_handler!([:musubi, :async, :stop])
+      ref = attach_telemetry_handler!([:musubi, :async, :stop])
 
       pid = start!()
 
@@ -723,7 +723,7 @@ defmodule Musubi.Page.ServerAsyncTest do
       await_task!()
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :async, :stop], _measurements,
+      assert_received {[:musubi, :async, :stop], ^ref, _measurements,
                        %{name: :messages, kind: :stream}}
 
       assert %AsyncResult{status: :failed, reason: {:error, :rate_limited}} =
@@ -734,7 +734,7 @@ defmodule Musubi.Page.ServerAsyncTest do
     end
 
     test "marks invalid return values as failed" do
-      attach_telemetry_handler!([:musubi, :async, :stop])
+      ref = attach_telemetry_handler!([:musubi, :async, :stop])
 
       pid = start!()
 
@@ -742,7 +742,7 @@ defmodule Musubi.Page.ServerAsyncTest do
       await_task!()
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :async, :stop], _measurements,
+      assert_received {[:musubi, :async, :stop], ^ref, _measurements,
                        %{name: :messages, kind: :stream}}
 
       assert %AsyncResult{status: :failed, reason: {:exit, {:error, %ArgumentError{}, _stack}}} =
@@ -753,7 +753,7 @@ defmodule Musubi.Page.ServerAsyncTest do
     end
 
     test "marks non-enumerable stream results as failed" do
-      attach_telemetry_handler!([:musubi, :async, :stop])
+      ref = attach_telemetry_handler!([:musubi, :async, :stop])
 
       pid = start!()
 
@@ -763,7 +763,7 @@ defmodule Musubi.Page.ServerAsyncTest do
       await_task!()
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :async, :stop], _measurements,
+      assert_received {[:musubi, :async, :stop], ^ref, _measurements,
                        %{name: :messages, kind: :stream}}
 
       assert %AsyncResult{status: :failed, reason: {:exit, {:error, %ArgumentError{}, _stack}}} =
@@ -774,7 +774,7 @@ defmodule Musubi.Page.ServerAsyncTest do
     end
 
     test "marks raised stream tasks as failed" do
-      attach_telemetry_handler!([:musubi, :async, :stop])
+      ref = attach_telemetry_handler!([:musubi, :async, :stop])
 
       pid = start!()
 
@@ -782,7 +782,7 @@ defmodule Musubi.Page.ServerAsyncTest do
       await_task!()
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :async, :stop], _measurements,
+      assert_received {[:musubi, :async, :stop], ^ref, _measurements,
                        %{name: :messages, kind: :stream}}
 
       assert %AsyncResult{
@@ -792,7 +792,7 @@ defmodule Musubi.Page.ServerAsyncTest do
     end
 
     test "marks exited stream tasks as failed" do
-      attach_telemetry_handler!([:musubi, :async, :stop])
+      ref = attach_telemetry_handler!([:musubi, :async, :stop])
 
       pid = start!()
 
@@ -800,7 +800,7 @@ defmodule Musubi.Page.ServerAsyncTest do
       await_task!()
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :async, :stop], _measurements,
+      assert_received {[:musubi, :async, :stop], ^ref, _measurements,
                        %{name: :messages, kind: :stream}}
 
       assert %AsyncResult{status: :failed, reason: {:exit, :boom}} =
@@ -808,7 +808,7 @@ defmodule Musubi.Page.ServerAsyncTest do
     end
 
     test "cancel_async by name resolves the stream assign to failed" do
-      attach_telemetry_handler!([:musubi, :async, :stop])
+      telemetry_ref = attach_telemetry_handler!([:musubi, :async, :stop])
 
       pid = start!()
 
@@ -828,7 +828,7 @@ defmodule Musubi.Page.ServerAsyncTest do
       assert_receive {:DOWN, ^ref, _, _, _}, 200
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :async, :stop], _measurements,
+      assert_received {[:musubi, :async, :stop], ^telemetry_ref, _measurements,
                        %{name: :messages, kind: :stream}}
 
       assert %AsyncResult{status: :failed, reason: {:exit, :user_navigated}} =
@@ -865,18 +865,8 @@ defmodule Musubi.Page.ServerAsyncTest do
   end
 
   defp attach_telemetry_handler!(event) do
-    test_pid = self()
-    handler_id = "test-#{System.unique_integer([:positive])}"
-
-    :telemetry.attach(
-      handler_id,
-      event,
-      fn name, measurements, metadata, _config ->
-        send(test_pid, {:telemetry, name, measurements, metadata})
-      end,
-      nil
-    )
-
-    on_exit(fn -> :telemetry.detach(handler_id) end)
+    ref = :telemetry_test.attach_event_handlers(self(), [event])
+    on_exit(fn -> :telemetry.detach(ref) end)
+    ref
   end
 end

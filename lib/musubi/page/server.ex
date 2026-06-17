@@ -634,6 +634,30 @@ defmodule Musubi.Page.Server do
     {:stop, reason, state}
   end
 
+  # Server-authoritative targeting primitive (BDR-0030). Delivers `assigns`
+  # to the addressed child store's `update/2`, dirtying only that subtree.
+  # Placed before the catch-all so it is not swallowed by the root
+  # `handle_info` dispatch. A missing target is a no-op + telemetry (LV-aligned).
+  def handle_info({:musubi_send_update, store_id, assigns}, %State{} = state)
+      when is_list(store_id) and is_map(assigns) do
+    case StoreTable.get(state.store_table, store_id) do
+      %Entry{socket: socket} = entry ->
+        next_socket = Reconciler.update_store(socket, assigns)
+        next_state = put_entry(state, store_id, %{entry | socket: next_socket})
+        {next_state, envelope} = render_and_envelope(next_state)
+        {:noreply, next_state, {:continue, {:push_patch, envelope}}}
+
+      nil ->
+        Telemetry.emit(
+          [:musubi, :send_update, :no_target],
+          %{system_time: System.system_time()},
+          %{store_id: store_id, page_id: page_id(state)}
+        )
+
+        {:noreply, state, {:continue, {:push_patch, nil}}}
+    end
+  end
+
   # Catch-all dispatch path for application messages (typically Phoenix.PubSub
   # broadcasts the root store subscribed to inside `mount/1`). Runs the
   # `:handle_info` hook chain on the root socket, dispatches to the root

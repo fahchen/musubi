@@ -163,16 +163,8 @@ defmodule Musubi.Page.ServerTest do
   end
 
   test "catch-all handle_info dispatches to root store and emits [:musubi, :pubsub, :receive]" do
-    handler = self()
-
-    :telemetry.attach(
-      "pubsub-receive-test",
-      [:musubi, :pubsub, :receive],
-      fn _name, _meas, meta, _config -> send(handler, {:pubsub_receive, meta}) end,
-      nil
-    )
-
-    on_exit(fn -> :telemetry.detach("pubsub-receive-test") end)
+    ref = :telemetry_test.attach_event_handlers(self(), [[:musubi, :pubsub, :receive]])
+    on_exit(fn -> :telemetry.detach(ref) end)
 
     assert {:ok, pid} =
              Server.start_link({HandleInfoStore, %{}, %{transport_pid: self()}})
@@ -182,7 +174,7 @@ defmodule Musubi.Page.ServerTest do
 
     send(pid, :bump)
 
-    assert_receive {:pubsub_receive, %{module: HandleInfoStore}}
+    assert_receive {[:musubi, :pubsub, :receive], ^ref, _measurements, %{module: HandleInfoStore}}
     assert_receive {:patch, %{ops: ops}}
     assert Enum.any?(ops, fn op -> op[:path] == "/counter" and op[:value] == 1 end)
   end
@@ -220,23 +212,16 @@ defmodule Musubi.Page.ServerTest do
   end
 
   test "graceful denial via :before_command halt-with-reply emits [:musubi, :auth, :deny]" do
-    handler = self()
-
-    :telemetry.attach(
-      "auth-deny-test",
-      [:musubi, :auth, :deny],
-      fn _name, _meas, meta, _config -> send(handler, {:auth_deny, meta}) end,
-      nil
-    )
-
-    on_exit(fn -> :telemetry.detach("auth-deny-test") end)
+    ref = :telemetry_test.attach_event_handlers(self(), [[:musubi, :auth, :deny]])
+    on_exit(fn -> :telemetry.detach(ref) end)
 
     assert {:ok, pid} = Server.start_link({DenyStore, %{}, %{transport_pid: self()}})
     assert_receive {:patch, _envelope}
 
     assert {:ok, %{"error" => "forbidden"}} = Server.command(pid, [], :do_thing, %{})
 
-    assert_receive {:auth_deny, %{command: :do_thing, module: DenyStore, path: []}}
+    assert_receive {[:musubi, :auth, :deny], ^ref, _measurements,
+                    %{command: :do_thing, module: DenyStore, path: []}}
   end
 
   test "mount/2 runs even when the store module has been purged before init" do

@@ -184,18 +184,8 @@ defmodule Musubi.Hooks.ValidateReplySchemaTest do
   end
 
   test "successful validation emits [:musubi, :validate, :reply, :stop]" do
-    handler_id = "validate-reply-#{System.unique_integer([:positive, :monotonic])}"
-
-    :telemetry.attach(
-      handler_id,
-      [:musubi, :validate, :reply, :stop],
-      fn event, measurements, metadata, pid ->
-        send(pid, {:telemetry_event, event, measurements, metadata})
-      end,
-      self()
-    )
-
-    on_exit(fn -> :telemetry.detach(handler_id) end)
+    ref = :telemetry_test.attach_event_handlers(self(), [[:musubi, :validate, :reply, :stop]])
+    on_exit(fn -> :telemetry.detach(ref) end)
 
     socket = host_socket_targeting(TargetStore)
 
@@ -207,7 +197,7 @@ defmodule Musubi.Hooks.ValidateReplySchemaTest do
                socket
              )
 
-    assert_receive {:telemetry_event, [:musubi, :validate, :reply, :stop], %{count: 1},
+    assert_receive {[:musubi, :validate, :reply, :stop], ^ref, %{count: 1},
                     %{store_module: TargetStore, command: :with_reply}}
   end
 end

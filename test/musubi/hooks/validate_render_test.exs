@@ -167,20 +167,20 @@ defmodule Musubi.Hooks.ValidateRenderTest do
 
   test "Scenario: Validation exception telemetry is emitted before raise mode raises" do
     socket = %Socket{module: TitleStore, assigns: %{}, private: %{}}
-    attach_telemetry_handler(self())
+    ref = attach_telemetry_handler(self())
 
     assert_raise ArgumentError, ~r/\$\.title/, fn ->
       ValidateRender.after_serialize(:raise, %{"title" => 42}, socket)
     end
 
-    assert_receive {:telemetry_event, [:musubi, :validate, :exception], %{count: 1}, metadata}
+    assert_receive {[:musubi, :validate, :exception], ^ref, %{count: 1}, metadata}
 
     assert %{store_module: TitleStore, errors: [{"$.title", _msg} | _rest]} = metadata
   end
 
   test "Scenario: telemetry validation mode reports errors without raising" do
     socket = %Socket{module: TitleStore, assigns: %{}, private: %{}}
-    attach_telemetry_handler(self())
+    ref = attach_telemetry_handler(self())
 
     assert {:cont, ^socket} =
              ValidateRender.after_serialize(:telemetry, %{"title" => 42}, socket)
@@ -188,13 +188,13 @@ defmodule Musubi.Hooks.ValidateRenderTest do
     # Filter on `store_module: TitleStore` at receive-time so concurrent tests
     # emitting `[:musubi, :validate, :exception]` for their own stores don't
     # race this assertion.
-    assert_receive {:telemetry_event, [:musubi, :validate, :exception], %{count: 1},
+    assert_receive {[:musubi, :validate, :exception], ^ref, %{count: 1},
                     %{store_module: TitleStore, errors: [{"$.title", _msg} | _rest]}}
   end
 
   test "Scenario: successful validation emits stop telemetry" do
     socket = %Socket{module: TitleStore, assigns: %{}, private: %{}}
-    attach_telemetry_handler(self())
+    ref = attach_telemetry_handler(self())
 
     assert {:cont, ^socket} =
              ValidateRender.after_serialize(:raise, %{"title" => "Inbox"}, socket)
@@ -202,25 +202,18 @@ defmodule Musubi.Hooks.ValidateRenderTest do
     # Filter on `store_module: TitleStore` at receive-time so concurrent tests
     # emitting `[:musubi, :validate, :stop]` for their own stores don't race
     # this assertion.
-    assert_receive {:telemetry_event, [:musubi, :validate, :stop], %{count: 1},
+    assert_receive {[:musubi, :validate, :stop], ^ref, %{count: 1},
                     %{store_module: TitleStore, errors: []}}
   end
 
   defp attach_telemetry_handler(test_pid) do
-    handler_id = "validate-render-#{System.unique_integer([:positive, :monotonic])}"
-
-    :telemetry.attach_many(
-      handler_id,
-      [
+    ref =
+      :telemetry_test.attach_event_handlers(test_pid, [
         [:musubi, :validate, :stop],
         [:musubi, :validate, :exception]
-      ],
-      fn event, measurements, metadata, pid ->
-        send(pid, {:telemetry_event, event, measurements, metadata})
-      end,
-      test_pid
-    )
+      ])
 
-    on_exit(fn -> :telemetry.detach(handler_id) end)
+    on_exit(fn -> :telemetry.detach(ref) end)
+    ref
   end
 end

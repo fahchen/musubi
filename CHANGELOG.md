@@ -11,6 +11,21 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Added
+
+- **`musubi`** — `Musubi.send_update/2,3`, aligned with
+  `Phoenix.LiveView.send_update`, lets the server target one mounted child store
+  by `store_id` with new assigns. The map is delivered to the store's `update/2`;
+  only that subtree re-renders and one scoped JSON Patch envelope ships (the
+  clean root short-circuits its own `render/1`). It is the intra-page last hop
+  for cross-connection fan-out coordinated over `Phoenix.PubSub` — Musubi owns
+  the targeting, the application owns the broadcast (no built-in PubSub
+  abstraction). The two-arity form sends to `self()` (call it from the root's
+  `handle_info/2`); the three-arity form targets an explicit page pid.
+  Addressing the root (`[]`) is allowed. A `store_id` that no longer resolves to
+  a mounted store is a no-op and emits `[:musubi, :send_update, :no_target]`
+  telemetry (BDR-0030, #76).
+
 ## [0.8.0] — 2026-06-13
 
 ### Added

@@ -308,3 +308,21 @@ Feature: Command Routing
       When a server-side message triggers handle_info that leaves the rendered output unchanged
       Then no transport reply envelope is sent
       And no patch push is emitted
+
+  Rule: The server can target a mounted child store with new assigns
+
+    Scenario: send_update to a mounted child refreshes only that child
+      Given the root store renders a child store under field "comments"
+      And the child store's update/2 reacts to a "reload_token" assign by reloading its data
+      When the server calls Musubi.send_update for store_id ["comments"] with %{reload_token: ref}
+      Then the runtime delivers the assigns to the child store's update/2
+      And the child subtree re-renders so its reloaded data surfaces in the wire diff
+      And the root store's render/1 is not re-invoked (BDR-0023 short-circuit)
+      And a single patch push carries a diff scoped to the child's path only
+
+    Scenario: send_update to an unmounted store_id is a no-op
+      Given the most recent render cycle no longer mounts a child at store_id ["comments"]
+      When the server calls Musubi.send_update for store_id ["comments"] with new assigns
+      Then the runtime emits [:musubi, :send_update, :no_target] telemetry
+      And no patch push is emitted
+      And the page runtime stays alive

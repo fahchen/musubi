@@ -186,6 +186,8 @@ Pipeline order follows hook attachment order; the addressed store's `handle_comm
 
 Stores receive arbitrary in-process messages via `handle_info(msg, socket)`. Typical use: `mount/1` calls `Phoenix.PubSub.subscribe(MyApp.PubSub, "topic")` directly; broadcast messages arrive via `handle_info`. There is no Musubi `subscribe` block, no `handle_broadcast/3` callback, no `broadcast/4` socket helper (BDR-0005). `handle_info/2` returns `{:noreply, socket}` only; no transport reply is associated with `handle_info` (it was not triggered by a client command).
 
+To refresh one specific mounted child from such a message, call `Musubi.send_update(store_id, assigns)` (aligned with `Phoenix.LiveView.send_update`, BDR-0030). It delivers `assigns` to the addressed store's `update/2`, dirties only that subtree, and ships one scoped patch — the clean root short-circuits its own `render/1` (BDR-0023). This is the intra-page last hop for cross-connection fan-out: each page broadcasts over `Phoenix.PubSub`, every page's root `handle_info/2` receives it and calls `send_update`. Musubi owns the intra-page targeting; the application owns the broadcast (still no built-in PubSub abstraction, BDR-0005).
+
 ### Streams
 
 LiveView-parity stream API for collections that should not live in server memory after delivery. Declaration:
@@ -356,6 +358,7 @@ There is no wire enum of error categories. Malformed or impossible commands (unk
 | `update(new_assigns, socket)` | React to attr changes | Returns `{:ok, socket}`; default merges new_assigns |
 | `handle_command(name, payload, socket)` | Client command handler | Required |
 | `handle_info(msg, socket)` | Server-side message handler (also receives upward callback effects via `send/2`) | Returns `{:noreply, socket}` |
+| `Musubi.send_update(store_id, assigns)` / `send_update(pid, store_id, assigns)` | Target a mounted child store with new assigns (LV-aligned) | Delivers to the target's `update/2`; only that subtree re-renders (BDR-0030); missing target is a no-op + `[:musubi, :send_update, :no_target]` telemetry |
 | `handle_async(name, result, socket)` | Async task completion handler | Returns `{:noreply, socket}`; async flows are runtime-only via `assign_async`/`start_async`/`handle_async` |
 | `terminate(reason, socket)` | Root page store termination | Optional |
 | `render(socket)` | Produce the public output shape | Required |
@@ -544,6 +547,7 @@ end
 | `[:musubi, :patch, :stop]` | Patch envelope size + op count + stream_op count |
 | `[:musubi, :pubsub, :receive]` | (when handle_info dispatches) |
 | `[:musubi, :auth, :deny]` | Authorization denials |
+| `[:musubi, :send_update, :no_target]` | `send_update` addressed an unmounted store_id; no-op (BDR-0030); metadata: store_id, page_id |
 | `[:musubi, :async, :start | :stop | :exception | :cancel | :lazy_discard]` | Async task lifecycle |
 | `[:musubi, :stream, :flush]` | Stream op flush per cycle |
 

@@ -49,7 +49,9 @@ defmodule Musubi.Telemetry do
     {[:musubi, :pubsub, :receive],
      "`handle_info/2` dispatched on the root store; observability for app PubSub messages (BDR-0005)."},
     {[:musubi, :auth, :deny],
-     "A `:before_command` hook returned `{:halt, reply, socket}` — graceful authorization denial (BDR-0008)."}
+     "A `:before_command` hook returned `{:halt, reply, socket}` — graceful authorization denial (BDR-0008)."},
+    {[:musubi, :send_update, :no_target],
+     "`Musubi.send_update/2,3` addressed a store_id that is not mounted; no-op, no envelope pushed (BDR-0030). Metadata: store_id, page_id."}
   ]
 
   @doc """
