@@ -549,35 +549,27 @@ defmodule Musubi.Page.ServerCommandTest do
 
   describe "Scenario: Successful command emits start and stop telemetry" do
     test "emits :start and :stop with metadata page_id, store_id, command, status" do
-      handler_id = "command-telemetry-#{System.unique_integer([:positive, :monotonic])}"
-
-      :telemetry.attach_many(
-        handler_id,
-        [
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
           [:musubi, :command, :start],
           [:musubi, :command, :stop]
-        ],
-        fn event, measurements, metadata, pid ->
-          send(pid, {:telemetry, event, measurements, metadata})
-        end,
-        self()
-      )
+        ])
 
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+      on_exit(fn -> :telemetry.detach(ref) end)
 
       pid =
         start_supervised!({Server, {RootStore, %{"page_id" => "home"}, %{transport_pid: self()}}})
 
       assert {:ok, _reply} = Server.command(pid, ["filters"], :wipe, %{})
 
-      assert_receive {:telemetry, [:musubi, :command, :start], _,
+      assert_receive {[:musubi, :command, :start], ^ref, _,
                       %{
                         page_id: "home",
                         store_id: ["filters"],
                         command: :wipe
                       }}
 
-      assert_receive {:telemetry, [:musubi, :command, :stop], _,
+      assert_receive {[:musubi, :command, :stop], ^ref, _,
                       %{
                         page_id: "home",
                         store_id: ["filters"],
@@ -587,25 +579,15 @@ defmodule Musubi.Page.ServerCommandTest do
     end
 
     test "stop metadata excludes the payload contents" do
-      handler_id = "command-stop-meta-#{System.unique_integer([:positive, :monotonic])}"
-
-      :telemetry.attach(
-        handler_id,
-        [:musubi, :command, :stop],
-        fn event, measurements, metadata, pid ->
-          send(pid, {:telemetry, event, measurements, metadata})
-        end,
-        self()
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+      ref = :telemetry_test.attach_event_handlers(self(), [[:musubi, :command, :stop]])
+      on_exit(fn -> :telemetry.detach(ref) end)
 
       pid = start_supervised!({Server, {RootStore, %{}, %{transport_pid: self()}}})
 
       assert {:ok, _reply} =
                Server.command(pid, ["filters"], :change_query, %{"query" => "secret-payload"})
 
-      assert_receive {:telemetry, [:musubi, :command, :stop], _, metadata}
+      assert_receive {[:musubi, :command, :stop], ^ref, _, metadata}
 
       refute Map.has_key?(metadata, :payload)
       refute String.contains?(inspect(metadata), "secret-payload")
@@ -614,18 +596,8 @@ defmodule Musubi.Page.ServerCommandTest do
 
   describe "Scenario: Handler crash emits an exception event" do
     test "telemetry exception fires with kind/reason/stacktrace" do
-      handler_id = "command-exception-#{System.unique_integer([:positive, :monotonic])}"
-
-      :telemetry.attach(
-        handler_id,
-        [:musubi, :command, :exception],
-        fn event, measurements, metadata, pid ->
-          send(pid, {:telemetry, event, measurements, metadata})
-        end,
-        self()
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+      ref = :telemetry_test.attach_event_handlers(self(), [[:musubi, :command, :exception]])
+      on_exit(fn -> :telemetry.detach(ref) end)
 
       pid = start_supervised!({Server, {CrashingStore, %{}, %{transport_pid: self()}}})
       Process.link(pid)
@@ -634,7 +606,7 @@ defmodule Musubi.Page.ServerCommandTest do
         catch_exit(Server.command(pid, [], :boom, %{}))
         assert_receive {:EXIT, ^pid, _reason}
 
-        assert_receive {:telemetry, [:musubi, :command, :exception], _,
+        assert_receive {[:musubi, :command, :exception], ^ref, _,
                         %{kind: :error, reason: %RuntimeError{}, stacktrace: stacktrace}}
 
         assert is_list(stacktrace)

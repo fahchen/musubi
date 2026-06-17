@@ -1,5 +1,11 @@
 defmodule Musubi.Page.ServerDiffShortcutTest do
-  use ExUnit.Case, async: true
+  # Runs synchronously: this module `refute_receive`s `[:musubi, :diff, :stop]`,
+  # and `:telemetry_test.attach_event_handlers/2` keys handlers on the event
+  # name globally (it cannot scope by the emitting pid the way the previous
+  # hand-rolled handler did). Under `async: true`, sibling page-server modules
+  # emitting the same event would race into the refute. `async: false` isolates
+  # this negative assertion to this module's own server.
+  use ExUnit.Case, async: false
 
   alias Musubi.Page.PatchEnvelope
   alias Musubi.Page.Server
@@ -27,29 +33,18 @@ defmodule Musubi.Page.ServerDiffShortcutTest do
   end
 
   setup do
-    handler_id = "diff-shortcut-#{System.unique_integer([:positive, :monotonic])}"
-
-    :ok =
-      :telemetry.attach(
-        handler_id,
-        [:musubi, :diff, :stop],
-        fn event, measurements, metadata, test_pid ->
-          send(test_pid, {{event, measurements, metadata}, self()})
-        end,
-        self()
-      )
-
-    on_exit(fn -> :telemetry.detach(handler_id) end)
-    :ok
+    ref = :telemetry_test.attach_event_handlers(self(), [[:musubi, :diff, :stop]])
+    on_exit(fn -> :telemetry.detach(ref) end)
+    {:ok, ref: ref}
   end
 
-  test "no-op render cycle skips diff telemetry when the wire root is unchanged" do
+  test "no-op render cycle skips diff telemetry when the wire root is unchanged", %{ref: ref} do
     pid = start_supervised!({Server, {NoopStore, %{}, %{transport_pid: self()}}})
     assert_receive {:patch, %PatchEnvelope{base_version: 0, version: 1}}
 
     assert {:ok, %{}} = Server.command(pid, [], :ping, %{})
     assert %State{version: 1, previous_wire_root: %{"ok" => true}} = :sys.get_state(pid)
-    refute_receive {{[:musubi, :diff, :stop], _measurements, _metadata}, ^pid}, 100
+    refute_receive {[:musubi, :diff, :stop], ^ref, _measurements, _metadata}, 100
     refute_receive {:patch, _envelope}, 100
   end
 end

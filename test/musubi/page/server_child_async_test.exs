@@ -153,14 +153,14 @@ defmodule Musubi.Page.ServerChildAsyncTest do
 
   describe "child store async + hook routing" do
     test "scenario 1: assign_async from a child writes AsyncResult onto the child's assigns" do
-      attach_async_terminal_handler!()
+      ref = attach_async_terminal_handler!()
       pid = start!()
 
       assert {:ok, _reply} = Server.command(pid, ["w1"], :load, %{"id" => "abc"})
       await_task!()
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :async, :stop], _, %{name: :data, status: :ok}}
+      assert_received {[:musubi, :async, :stop], ^ref, _, %{name: :data, status: :ok}}
       assert %AsyncResult{status: :ok, result: "loaded:abc"} = child_assign(pid, :data)
     end
 
@@ -195,7 +195,7 @@ defmodule Musubi.Page.ServerChildAsyncTest do
     end
 
     test "scenario 5: cancel_async from a child resolves the slot to failed/{:exit, reason}" do
-      attach_async_terminal_handler!()
+      telemetry_ref = attach_async_terminal_handler!()
       pid = start!()
 
       assert {:ok, _reply} = Server.command(pid, ["w1"], :start_slow, %{})
@@ -209,14 +209,15 @@ defmodule Musubi.Page.ServerChildAsyncTest do
       assert_receive {:DOWN, ^ref, _, _, _}, 200
       sync_server!(pid)
 
-      assert_received {:telemetry, [:musubi, :async, :stop], _, %{name: :slow, status: :failed}}
+      assert_received {[:musubi, :async, :stop], ^telemetry_ref, _,
+                       %{name: :slow, status: :failed}}
 
       assert %AsyncResult{status: :failed, reason: {:exit, :user_navigated}} =
                child_assign(pid, :slow)
     end
 
     test "scenario 6: stream_async from a child seeds stream ops + AsyncResult on the child" do
-      attach_async_terminal_handler!()
+      ref = attach_async_terminal_handler!()
       pid = start!()
 
       assert {:ok, _reply} = Server.command(pid, ["w1"], :load_messages, %{})
@@ -231,7 +232,7 @@ defmodule Musubi.Page.ServerChildAsyncTest do
                          ]
                        }}
 
-      assert_received {:telemetry, [:musubi, :async, :stop], _, %{name: :messages, status: :ok}}
+      assert_received {[:musubi, :async, :stop], ^ref, _, %{name: :messages, status: :ok}}
       assert %AsyncResult{status: :ok, result: true} = child_assign(pid, :messages)
     end
   end
@@ -248,19 +249,9 @@ defmodule Musubi.Page.ServerChildAsyncTest do
   end
 
   defp attach_async_terminal_handler! do
-    test_pid = self()
-    handler_id = "child-async-terminal-#{System.unique_integer([:positive, :monotonic])}"
-
-    :telemetry.attach_many(
-      handler_id,
-      @async_terminal_events,
-      fn event, measurements, metadata, _config ->
-        send(test_pid, {:telemetry, event, measurements, metadata})
-      end,
-      nil
-    )
-
-    on_exit(fn -> :telemetry.detach(handler_id) end)
+    ref = :telemetry_test.attach_event_handlers(self(), @async_terminal_events)
+    on_exit(fn -> :telemetry.detach(ref) end)
+    ref
   end
 
   defp child_assign(pid, key) do

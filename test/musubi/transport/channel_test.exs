@@ -234,23 +234,17 @@ defmodule Musubi.Transport.ChannelTest do
   end
 
   test "join + leave emit channel telemetry and stop the linked page server" do
-    handler = self()
-
-    :telemetry.attach_many(
-      "musubi-channel-test",
-      [
+    ref =
+      :telemetry_test.attach_event_handlers(self(), [
         [:musubi, :channel, :join],
         [:musubi, :channel, :terminate]
-      ],
-      fn name, _meas, meta, _config -> send(handler, {:channel_event, name, meta}) end,
-      nil
-    )
+      ])
 
-    on_exit(fn -> :telemetry.detach("musubi-channel-test") end)
+    on_exit(fn -> :telemetry.detach(ref) end)
 
     {:ok, _reply, channel_socket} = join_root()
 
-    assert_receive {:channel_event, [:musubi, :channel, :join],
+    assert_receive {[:musubi, :channel, :join], ^ref, _measurements,
                     %{module: RootStore, id: @root_id, page_pid: page_pid}}
 
     assert is_pid(page_pid)
@@ -261,7 +255,7 @@ defmodule Musubi.Transport.ChannelTest do
     leave_ref = Phoenix.ChannelTest.leave(channel_socket)
     assert_reply(leave_ref, :ok)
 
-    assert_receive {:channel_event, [:musubi, :channel, :terminate],
+    assert_receive {[:musubi, :channel, :terminate], ^ref, _measurements,
                     %{module: RootStore, id: @root_id}}
 
     assert_receive {:DOWN, ^page_ref, :process, ^page_pid, _reason}, 1_000

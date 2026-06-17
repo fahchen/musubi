@@ -118,18 +118,8 @@ defmodule Musubi.Hooks.ValidateCommandSchemaTest do
   end
 
   test "successful validation emits [:musubi, :validate, :command, :stop]" do
-    handler_id = "validate-command-#{System.unique_integer([:positive, :monotonic])}"
-
-    :telemetry.attach(
-      handler_id,
-      [:musubi, :validate, :command, :stop],
-      fn event, measurements, metadata, pid ->
-        send(pid, {:telemetry_event, event, measurements, metadata})
-      end,
-      self()
-    )
-
-    on_exit(fn -> :telemetry.detach(handler_id) end)
+    ref = :telemetry_test.attach_event_handlers(self(), [[:musubi, :validate, :command, :stop]])
+    on_exit(fn -> :telemetry.detach(ref) end)
 
     socket = host_socket_targeting(TargetStore)
 
@@ -140,7 +130,7 @@ defmodule Musubi.Hooks.ValidateCommandSchemaTest do
                socket
              )
 
-    assert_receive {:telemetry_event, [:musubi, :validate, :command, :stop], %{count: 1},
+    assert_receive {[:musubi, :validate, :command, :stop], ^ref, %{count: 1},
                     %{store_module: TargetStore, command: :change_query}}
   end
 
