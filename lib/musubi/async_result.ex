@@ -65,8 +65,7 @@ defmodule Musubi.AsyncResult do
       doc:
         "Discriminated-union tag the client pattern-matches on. Serialized as a string on the wire."
 
-    field :result, value | nil,
-      default: nil,
+    field :result, value,
       doc:
         "The value produced by the user function (when `status: :ok`), or the prior `:ok` result preserved for stale-while-loading/failed UX."
 
