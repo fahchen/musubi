@@ -183,6 +183,25 @@ set — `MusubiProvider` (accepts `connection` or `socket`),
 `{ dispatch, isPending, error, data, reset }`). Use `keyOf(proxy)` for
 stable React list keys over child proxies.
 
+## Server-driven child refresh
+
+To push new assigns to one specific mounted child store from the server, call
+`Musubi.send_update/2,3` — aligned with `Phoenix.LiveView.send_update`:
+
+```elixir
+# Inside the root store's handle_info/2 (self() is the page process):
+def handle_info({:comments_changed, file_id}, socket) do
+  Musubi.send_update(["files", file_id, "comments"], %{reload_token: make_ref()})
+  {:noreply, socket}
+end
+```
+
+The assigns map is delivered to the addressed store's `update/2`; only that
+subtree re-renders and one scoped JSON Patch envelope ships. This is the
+intra-page last hop for cross-connection fan-out: broadcast over
+`Phoenix.PubSub`, and each page's root `handle_info/2` calls `send_update`.
+Musubi has no built-in PubSub abstraction — the application owns the broadcast.
+
 ## Documentation
 
 - [Getting Started](guides/getting-started.md)
