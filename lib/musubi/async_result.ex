@@ -52,19 +52,20 @@ defmodule Musubi.AsyncResult do
           | {:exit, term()}
 
   @typedoc "Compile-time field-type marker used inside `state do` declarations."
-  @type of(value) :: %__MODULE__{
-          status: status(),
-          result: value | nil,
-          reason: failure_reason() | nil
-        }
+  @type of(value) :: t(value)
+
+  @typedoc "An AsyncResult whose result type is unconstrained."
+  @type t() :: t(term())
 
   typed_structor do
+    parameter :value
+
     field :status, status(),
       default: :loading,
       doc:
         "Discriminated-union tag the client pattern-matches on. Serialized as a string on the wire."
 
-    field :result, term(),
+    field :result, value | nil,
       default: nil,
       doc:
         "The value produced by the user function (when `status: :ok`), or the prior `:ok` result preserved for stale-while-loading/failed UX."
