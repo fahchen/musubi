@@ -56,12 +56,12 @@ Feature: stream_async
       Then socket.assigns.messages becomes Musubi.AsyncResult.failed(prior, {:error, :network_failure})
       And the stream's previously delivered items remain on the client
 
-  Rule: :reset cancels the prior task and re-emits Musubi.AsyncResult.loading; stream contents controlled by the user fn
+  Rule: :reset re-emits Musubi.AsyncResult.loading without killing the prior task (LiveView parity); stream contents controlled by the user fn
 
     Scenario: Reset re-emits loading
       Given a prior stream_async task is in flight for :messages
       When the application calls stream_async(socket, :messages, fun, reset: true)
-      Then the prior task is cancelled
+      Then the prior task is left running and its result lazy-discards by ref
       And socket.assigns.messages re-emits Musubi.AsyncResult.loading()
 
     Scenario: Stream reset only when the user fn returns it
