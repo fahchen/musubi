@@ -118,7 +118,7 @@ defmodule Musubi.StreamAsyncTest do
     end
 
     test "re-assign leaves the prior in-flight task running (BDR-0031, LiveView parity)" do
-      blocking = instrument(self(), fn -> receive(do: ({:never, _} -> {:ok, []})) end)
+      blocking = instrument(self(), fn -> receive(do: ({:never, _msg} -> {:ok, []})) end)
 
       socket = Async.stream_async(base_socket(), :messages, blocking)
       prior_pid = receive_task_pid!()
