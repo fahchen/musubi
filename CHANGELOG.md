@@ -11,6 +11,18 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`musubi`** — `assign_async`/`stream_async` re-assigning a name already in
+  flight no longer kills the prior task (including with `:reset`). The runtime
+  drops its tracking instead; the prior task runs to completion and its result /
+  `:DOWN` lazy-discards by ref. This matches `Phoenix.LiveView` (which never
+  exits a producer on re-assign) and extends the `start_async` rule (BDR-0019)
+  to all three async APIs. Only `cancel_async/2,3` and `:timeout` actively kill.
+  Previously the unconditional kill could terminate a task mid-DB-call and tear
+  down a shared Ecto sandbox connection (`:CONNECTION_DEAD`) — see
+  `docs/review-store-async-sqlite-problem.md` (BDR-0031).
+
 ## [0.9.0] — 2026-06-17
 
 ### Added

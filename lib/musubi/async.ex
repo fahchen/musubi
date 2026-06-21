@@ -105,7 +105,8 @@ defmodule Musubi.Async do
 
     * `:reset` — `true` re-emits `loading()` (with no prior) for every managed
       key; a list of keys re-emits loading for that subset only. The prior
-      task (if any) is cancelled.
+      task (if any) is NOT killed (LiveView parity); it keeps running and its
+      result lazy-discards by ref. Use `cancel_async/2,3` to actively kill.
     * `:timeout` — milliseconds; on expiry the task is killed and the result
       becomes `failed(prior, {:exit, :timeout})`.
     * `:supervisor` — `Task.Supervisor` name; defaults to `Musubi.AsyncSupervisor`.
@@ -133,7 +134,11 @@ defmodule Musubi.Async do
     {timeout, opts} = Keyword.pop(opts, :timeout)
     {supervisor, _opts} = Keyword.pop(opts, :supervisor, AsyncSupervisor)
 
-    socket = cancel_prior_for_reassign(socket, name)
+    # Re-assign never kills the prior task (LiveView parity): drop its tracking
+    # so its result/`:DOWN` lazy-discard by ref. Only `cancel_async`/`:timeout`
+    # kill. Killing a prior task mid-DB-call tears down a shared Ecto sandbox
+    # connection — see docs/review-store-async-sqlite-problem.md.
+    socket = drop_tracking(socket, name)
     prior = snapshot_prior(socket, keys)
     socket = write_loading_for_keys(socket, keys, prior, reset)
 
@@ -318,10 +323,11 @@ defmodule Musubi.Async do
 
   ## Options
 
-    * `:reset` — `true` cancels the prior task (if any), re-emits
-      `Musubi.AsyncResult.loading(prior)` for the assign, and leaves stream
-      contents alone. The user fun decides whether to actually reset the
-      stream by returning `{:ok, items, reset: true}`.
+    * `:reset` — `true` re-emits `Musubi.AsyncResult.loading(prior)` for the
+      assign and leaves stream contents alone. The prior task (if any) is NOT
+      killed (LiveView parity); it keeps running and its result lazy-discards
+      by ref. Use `cancel_async/2,3` to actively kill. The user fun decides
+      whether to actually reset the stream by returning `{:ok, items, reset: true}`.
     * `:timeout` — milliseconds; on expiry the task is killed and the assign
       becomes `failed(prior, {:exit, :timeout})`. Stream untouched.
     * `:supervisor` — `Task.Supervisor` name; defaults to `Musubi.AsyncSupervisor`.
@@ -343,7 +349,11 @@ defmodule Musubi.Async do
     {timeout, opts} = Keyword.pop(opts, :timeout)
     {supervisor, _opts} = Keyword.pop(opts, :supervisor, AsyncSupervisor)
 
-    socket = cancel_prior_for_reassign(socket, name)
+    # Re-assign never kills the prior task (LiveView parity): drop its tracking
+    # so its result/`:DOWN` lazy-discard by ref. Only `cancel_async`/`:timeout`
+    # kill. Killing a prior task mid-DB-call tears down a shared Ecto sandbox
+    # connection — see docs/review-store-async-sqlite-problem.md.
+    socket = drop_tracking(socket, name)
     prior = snapshot_prior(socket, [name])
 
     socket =
@@ -613,21 +623,6 @@ defmodule Musubi.Async do
         :error -> acc
       end
     end)
-  end
-
-  defp cancel_prior_for_reassign(socket, name) do
-    case fetch_tracking(socket, name) do
-      {:ok, entry} ->
-        cancel_timer(entry.timer_ref)
-        kill_task(entry.pid, {:shutdown, :reassign})
-        # Drop tracking so the inevitable :DOWN finds nothing and is a no-op
-        # — this matches the reset-cancels-prior-task semantics in the spec
-        # without surfacing a spurious failed write for the new tracking.
-        drop_tracking_only(socket, name)
-
-      :error ->
-        socket
-    end
   end
 
   defp drop_tracking(socket, name) do

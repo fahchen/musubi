@@ -83,18 +83,18 @@ Feature: Async Task Lifecycle
       Then the runtime kills the associated task pid
       And the resulting :DOWN message triggers socket.assigns.profile = Musubi.AsyncResult.failed(prior, {:exit, :user_navigated_away})
 
-  Rule: assign_async :reset cancels the prior task before re-emitting loading
+  Rule: assign_async :reset re-emits loading without killing the prior task (LiveView parity)
 
     Scenario: Reset all keys
       Given the prior assign_async for [:user, :org] is still in flight
       When the application calls assign_async(socket, [:user, :org], fun, reset: true)
-      Then the prior task is cancelled
+      Then the prior task is left running and its result lazy-discards by ref
       And both keys re-emit Musubi.AsyncResult.loading()
 
     Scenario: Reset subset of keys
       Given the prior assign_async for [:user, :org] is still in flight
       When the application calls assign_async(socket, [:user, :org], fun, reset: [:user])
-      Then the prior task is cancelled
+      Then the prior task is left running and its result lazy-discards by ref
       And :user re-emits Musubi.AsyncResult.loading(); :org preserves its prior loading state unchanged
 
     Scenario: No reset preserves prior result during reload
