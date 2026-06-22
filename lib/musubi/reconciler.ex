@@ -12,9 +12,9 @@ defmodule Musubi.Reconciler do
   @type identity_key() :: StoreTable.key()
 
   @type reconcile_result() ::
-          {:mount, identity_key(), Socket.t(), [Socket.assign_key()]}
-          | {:update, identity_key(), Socket.t(), [Socket.assign_key()]}
-          | {:reuse, identity_key(), Entry.t(), [Socket.assign_key()]}
+          {:mount, identity_key(), Socket.t(), map()}
+          | {:update, identity_key(), Socket.t(), map()}
+          | {:reuse, identity_key(), Entry.t(), map()}
 
   @doc """
   Reconciles one child placeholder against the existing registry entry.
@@ -27,7 +27,7 @@ defmodule Musubi.Reconciler do
 
       iex> parent_socket = Musubi.Socket.assign(%Musubi.Socket{}, :title, "Inbox")
       iex> child = Musubi.Child.child(ExampleChild, id: "child", title: "Inbox")
-      iex> {:mount, ["child"], %Musubi.Socket{}, [:title]} =
+      iex> {:mount, ["child"], %Musubi.Socket{}, %{title: "Inbox"}} =
       ...>   Musubi.Reconciler.reconcile_child(child, parent_socket, [], Musubi.Page.StoreTable.new())
   """
   @spec reconcile_child(Child.t(), Socket.t(), [String.t()], StoreTable.t()) ::
@@ -41,42 +41,37 @@ defmodule Musubi.Reconciler do
       when is_list(parent_path) do
     id = validate_id!(child)
     assigns = normalize_assigns(child.module, child.assigns)
-    consumed_keys = Map.keys(assigns)
     store_id = List.insert_at(parent_path, -1, id)
 
     case StoreTable.get(registry, store_id) do
       %Entry{module: existing_module} = entry when existing_module == child.module ->
         cond do
-          parent_assign_values_changed?(entry.socket, assigns, consumed_keys) ->
+          # Did the parent pass different props than last render? Compared
+          # against a snapshot of the previously-passed props — NOT the child's
+          # live `socket.assigns`, which the child mutates itself (reload,
+          # command, async write). Reading live assigns would report a phantom
+          # change whenever the child overwrote a consumed-key-named assign,
+          # re-firing `update/2` every render (an infinite loop when `update/2`
+          # calls `send_update`).
+          entry.consumed_assigns !== assigns ->
             next_socket = update_store(entry.socket, assigns)
-            {:update, store_id, next_socket, consumed_keys}
+            {:update, store_id, next_socket, assigns}
 
           # Child has internal mutations queued (from a command handler, an
           # async result write, or a stream insert) since the last render. The
           # parent did not change so `update/2` does not run, but the child
           # still needs to re-render so its new state surfaces in the wire diff.
           subtree_dirty?(registry, store_id) ->
-            {:update, store_id, entry.socket, consumed_keys}
+            {:update, store_id, entry.socket, assigns}
 
           true ->
-            {:reuse, store_id, %{entry | consumed_keys: consumed_keys}, consumed_keys}
+            {:reuse, store_id, %{entry | consumed_assigns: assigns}, assigns}
         end
 
       _missing_or_module_change ->
         {:mount, store_id,
-         new_child_socket(parent_socket, parent_path, child.module, id, assigns), consumed_keys}
+         new_child_socket(parent_socket, parent_path, child.module, id, assigns), assigns}
     end
-  end
-
-  @spec parent_assign_values_changed?(Socket.t(), map(), [Socket.assign_key()]) :: boolean()
-  defp parent_assign_values_changed?(%Socket{} = socket, assigns, consumed_keys)
-       when is_map(assigns) and is_list(consumed_keys) do
-    Enum.any?(consumed_keys, fn key ->
-      case Map.fetch(socket.assigns, key) do
-        {:ok, current_value} -> current_value !== Map.fetch!(assigns, key)
-        :error -> true
-      end
-    end)
   end
 
   @spec subtree_dirty?(StoreTable.t(), identity_key()) :: boolean()

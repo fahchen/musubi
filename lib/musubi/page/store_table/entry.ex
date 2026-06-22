@@ -66,9 +66,9 @@ defmodule Musubi.Page.StoreTable.Entry do
       doc:
         "Last serialized render output (wire form, after `Musubi.Wire.to_wire/1`). Stored alongside `resolved_state` so the M4 diff engine can compare wire-form trees without re-serializing."
 
-    field :consumed_keys, [Socket.assign_key()],
-      default: [],
+    field :consumed_assigns, %{optional(Socket.assign_key()) => term()},
+      default: %{},
       doc:
-        "Assign keys this child consumes (the keys the parent passed via `child(Module, id: ..., key: value, ...)`). Memoization skips this child when none of these intersect the parent's `socket.assigns.__changed__`."
+        "Snapshot of the normalized props the parent passed to this child on the previous render (via `child(Module, id: ..., key: value, ...)`). The reconciler compares the next render's props against this snapshot to decide whether to re-run `update/2` — independent of the child's live `socket.assigns`, which the child mutates itself."
   end
 end

@@ -77,17 +77,22 @@ telemetry and pushes no envelope.
 **Pushed assigns are passed raw** to `update/2` — no attr normalization, matching
 LiveView which passes the `send_update` map straight through.
 
-**Push keys the child owns, not parent-controlled props.** `reconcile_child/4`
-checks `parent_assign_values_changed?` *before* `subtree_dirty?`
-(`lib/musubi/reconciler.ex`). So if a pushed key is one the parent also passes to
-the child, the very next resolve sees the socket value diverge from the (cached,
-per BDR-0023) parent prop and re-runs `update_store/2` with the parent's value —
-reverting the pushed value and double-invoking `update/2` in the same cycle. Net
-effect on an overlapping key is therefore nil. This is the LiveView "parent props
-win" rule, surfaced one resolve earlier because Musubi reconciles every cycle. The
-intended use is an internal trigger/state key the parent does not supply (e.g.
-`%{reload_token: ref}`), which takes the clean `subtree_dirty?` path with a single
-`update/2` invocation.
+**A pushed key the parent also controls persists until the parent prop
+changes.** `reconcile_child/4` checks the parent-prop gate *before*
+`subtree_dirty?` (`lib/musubi/reconciler.ex`), but that gate compares the
+parent's incoming props against `entry.consumed_assigns` — a snapshot of the
+props the parent passed on the previous render — **not** the child's live
+`socket.assigns`. So a `send_update` write to an overlapping key does not make
+the gate fire: the snapshot still equals the (cached, per BDR-0023) parent prop,
+so `update/2` is not re-run, and the pushed value survives on the clean
+`subtree_dirty?` path. The parent only re-asserts the key when its own value
+actually changes — the real LiveView change-tracking rule ("parent props win
+*when they change*"). An earlier implementation compared against the child's
+live assigns, which reverted the pushed value and double-invoked `update/2`
+every cycle; that was a phantom-change bug (it also looped forever when a store
+called `send_update` from its own `update/2`) and has been removed. The
+idiomatic use is still an internal trigger/state key the parent does not supply
+(e.g. `%{reload_token: ref}`).
 
 **Addressing is unrestricted to children.** `store_id` may resolve to any mounted
 store, including the root (`[]`). Targeting the root runs the root's `update/2`

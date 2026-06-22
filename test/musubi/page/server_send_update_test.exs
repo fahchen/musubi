@@ -178,21 +178,24 @@ defmodule Musubi.Page.ServerSendUpdateTest do
     def handle_command(_name, _payload, socket), do: {:noreply, socket}
   end
 
-  describe "send_update on a parent-controlled key (BDR-0030 caveat)" do
-    test "is reconciled back to the parent's value — net no-op" do
+  describe "send_update on a parent-controlled key (BDR-0030)" do
+    test "persists until the parent prop actually changes (LiveView parity)" do
       pid =
         start_supervised!({Server, {OverlapRoot, %{"page_id" => "p1"}, %{transport_pid: self()}}})
 
       assert_received {:patch, %PatchEnvelope{base_version: 0, version: 1}}
       assert %{label: "from_parent"} = child_render(pid, ["c"])
 
-      # `label` is a key the parent passes, so the next resolve reverts it.
+      # `label` is also a parent prop, but the reconcile gate compares the
+      # parent's props against a snapshot of the previously-passed props — not
+      # the child's live assigns — so the pushed value is NOT reverted on the
+      # next resolve. The parent only re-asserts `label` when its own value
+      # changes (LiveView change-tracking parity).
       assert :ok = Musubi.send_update(pid, ["c"], %{label: "pushed"})
       sync_server!(pid)
 
-      assert %{label: "from_parent"} = child_render(pid, ["c"])
-      # Net diff is empty (from_parent -> pushed -> from_parent), so no envelope.
-      refute_receive {:patch, %PatchEnvelope{}}
+      assert %{label: "pushed"} = child_render(pid, ["c"])
+      assert_receive {:patch, %PatchEnvelope{}}
     end
   end
 

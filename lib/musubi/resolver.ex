@@ -137,7 +137,7 @@ defmodule Musubi.Resolver do
           raw_state: raw_state,
           resolved_state: resolved_state,
           wire_state: wire_state,
-          consumed_keys: entry_consumed_keys(registry, store_id)
+          consumed_assigns: entry_consumed_assigns(registry, store_id)
         }
       )
 
@@ -504,45 +504,45 @@ defmodule Musubi.Resolver do
        )
        when is_list(path) do
     case Reconciler.reconcile_child(child, parent_socket, path, registry) do
-      {:reuse, store_id, %Entry{} = entry, consumed_keys} ->
+      {:reuse, store_id, %Entry{} = entry, consumed_assigns} ->
         ensure_unique_identity!(store_id, live)
 
         next_registry =
-          StoreTable.put(registry, store_id, %{entry | consumed_keys: consumed_keys})
+          StoreTable.put(registry, store_id, %{entry | consumed_assigns: consumed_assigns})
 
         {entry.resolved_state, next_registry, mark_subtree_live(registry, store_id, live)}
 
-      {:mount, store_id, %Socket{} = child_socket, consumed_keys} ->
+      {:mount, store_id, %Socket{} = child_socket, consumed_assigns} ->
         ensure_unique_identity!(store_id, live)
         mounted_socket = Reconciler.mount_store(child_socket)
 
         {resolved_state, next_socket, next_registry, next_live} =
           render_store(mounted_socket, registry, live)
 
-        next_registry = put_consumed_keys(next_registry, store_id, consumed_keys)
+        next_registry = put_consumed_assigns(next_registry, store_id, consumed_assigns)
 
         {resolved_state, next_socket_registry_socket(next_registry, store_id, next_socket),
          Map.put(next_live, store_id, true)}
 
-      {:update, store_id, %Socket{} = child_socket, consumed_keys} ->
+      {:update, store_id, %Socket{} = child_socket, consumed_assigns} ->
         ensure_unique_identity!(store_id, live)
 
         {resolved_state, next_socket, next_registry, next_live} =
           render_store(child_socket, registry, live)
 
-        next_registry = put_consumed_keys(next_registry, store_id, consumed_keys)
+        next_registry = put_consumed_assigns(next_registry, store_id, consumed_assigns)
 
         {resolved_state, next_socket_registry_socket(next_registry, store_id, next_socket),
          Map.put(next_live, store_id, true)}
     end
   end
 
-  @spec entry_consumed_keys(StoreTable.t(), StoreTable.key()) ::
-          [Socket.assign_key()]
-  defp entry_consumed_keys(%StoreTable{} = registry, store_id) do
+  @spec entry_consumed_assigns(StoreTable.t(), StoreTable.key()) ::
+          %{optional(Socket.assign_key()) => term()}
+  defp entry_consumed_assigns(%StoreTable{} = registry, store_id) do
     case StoreTable.get(registry, store_id) do
-      %Entry{consumed_keys: consumed_keys} -> consumed_keys
-      nil -> []
+      %Entry{consumed_assigns: consumed_assigns} -> consumed_assigns
+      nil -> %{}
     end
   end
 
@@ -557,12 +557,14 @@ defmodule Musubi.Resolver do
     :ok
   end
 
-  @spec put_consumed_keys(StoreTable.t(), StoreTable.key(), [Socket.assign_key()]) ::
+  @spec put_consumed_assigns(StoreTable.t(), StoreTable.key(), %{
+          optional(Socket.assign_key()) => term()
+        }) ::
           StoreTable.t()
-  defp put_consumed_keys(%StoreTable{} = registry, store_id, consumed_keys) do
+  defp put_consumed_assigns(%StoreTable{} = registry, store_id, consumed_assigns) do
     case StoreTable.get(registry, store_id) do
       %Entry{} = entry ->
-        StoreTable.put(registry, store_id, %{entry | consumed_keys: consumed_keys})
+        StoreTable.put(registry, store_id, %{entry | consumed_assigns: consumed_assigns})
 
       nil ->
         registry

@@ -11,6 +11,21 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`musubi`** — `Reconciler.reconcile_child/4` no longer re-runs a child's
+  `update/2` on every render when the parent passes byte-for-byte identical
+  props. The parent-prop change gate now compares incoming props against a
+  snapshot of the previously-passed props (`Entry.consumed_assigns`) instead of
+  the child's live `socket.assigns`, which the child mutates itself (reload,
+  command, async write). Previously a child that overwrote a consumed-key-named
+  assign looked like a parent change every cycle, re-firing `update/2` — an
+  infinite render loop when a store called `Musubi.send_update` from its own
+  `update/2`. **Behavior change (BDR-0030):** a `send_update` write to a key the
+  parent also controls now persists until the parent prop actually changes,
+  instead of reverting each cycle — the real `Phoenix.LiveView` change-tracking
+  rule (#81).
+
 ## [0.9.1] — 2026-06-21
 
 ### Fixed
