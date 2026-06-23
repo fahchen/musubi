@@ -11,6 +11,24 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`@musubi/client` / `@musubi/react`** — Snapshotting a store whose node is
+  absent from the index now returns `undefined` instead of a stub object cast to
+  the fully-hydrated snapshot type. The stub typechecked as complete, so a
+  consumer dereferencing a "guaranteed" field (`snap.artifact.id`) crashed at
+  runtime — most visibly on a websocket reconnect (e.g. iOS Safari backgrounded
+  then resumed) when a re-render hit the reset index. `StoreProxy.snapshot()`
+  and `useMusubiSnapshot` now return `StoreSnapshot<M, R> | undefined`.
+  **Breaking (types):** unguarded `.field` access on a snapshot is now a `tsc`
+  error — guard with `if (!snap) …` (the same skeleton you render on cold mount).
+- **`@musubi/client`** — Version-mismatch recovery no longer empties the store
+  index before re-mounting. It keeps serving the last-good (stale-but-complete)
+  snapshot through the remount window and lets the remount's initial patch
+  (whole-root `replace ""`) swap in fresh state atomically, closing the
+  reconnect-window stub on the self-healing path. The terminal disconnect path
+  still resets; the type guard above covers it.
+
 ## [0.9.2] — 2026-06-23
 
 ### Fixed

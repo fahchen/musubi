@@ -165,7 +165,9 @@ export interface StoreRuntime<M extends StoreModule<R>, R> {
     payload: CommandPayload<M, K, R>
   ): Promise<CommandReply<M, K, R>>
   subscribe(listener: () => void): () => void
-  snapshot(): StoreSnapshot<M, R>
+  // `undefined` while the store node is absent from the index (not yet
+  // mounted, or mid-reconnect after a state reset). Callers must guard.
+  snapshot(): StoreSnapshot<M, R> | undefined
 }
 
 export type StoreProxy<M extends StoreModule<R>, R> = StoreRuntime<M, R> & {

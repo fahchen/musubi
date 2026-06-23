@@ -71,6 +71,10 @@ function DashboardView({
 }) {
   const page = useMusubiSnapshot(root)
 
+  // Snapshot is `undefined` during the reconnect window (index reset mid-
+  // recovery). Show the same skeleton as cold mount instead of crashing.
+  if (!page) return <LoadingShell />
+
   const header = page.header
   const polls = page.polls ?? []
 
@@ -166,6 +170,10 @@ function PollRoomView({
 
   const [feedback, setFeedback] = useState("")
   const busy = voteCmd.isPending || resetVoteCmd.isPending
+
+  // Snapshot is `undefined` during the reconnect window (index reset mid-
+  // recovery). Show the same skeleton as cold mount instead of crashing.
+  if (!page) return <LoadingShell />
 
   const poll = page.poll
   const options = page.options ?? []

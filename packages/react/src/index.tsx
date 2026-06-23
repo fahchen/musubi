@@ -134,10 +134,10 @@ export interface MusubiFactory<R> {
     options: UseMusubiRootOptions<M, R>
   ) => StoreProxy<M, R>
   useMusubiSnapshot: {
-    <M extends StoreModule<R>>(proxy: StoreProxy<M, R>): StoreSnapshot<M, R>
+    <M extends StoreModule<R>>(proxy: StoreProxy<M, R>): StoreSnapshot<M, R> | undefined
     <M extends StoreModule<R>, Selected>(
       proxy: StoreProxy<M, R>,
-      selector: (snapshot: StoreSnapshot<M, R>) => Selected,
+      selector: (snapshot: StoreSnapshot<M, R> | undefined) => Selected,
       equalityFn?: (a: Selected, b: Selected) => boolean
     ): Selected
   }
@@ -498,13 +498,13 @@ export function createMusubi<R>(): MusubiFactory<R> {
 
   function useMusubiSnapshotImpl<M extends StoreModule<R>, Selected>(
     proxy: StoreProxy<M, R>,
-    selector?: (snapshot: StoreSnapshot<M, R>) => Selected,
+    selector?: (snapshot: StoreSnapshot<M, R> | undefined) => Selected,
     equalityFn?: (a: Selected, b: Selected) => boolean
-  ): Selected | StoreSnapshot<M, R> {
+  ): Selected | StoreSnapshot<M, R> | undefined {
     const subscribe = useCallback((onChange: () => void) => proxy.subscribe(onChange), [proxy])
     const getSnapshot = useCallback(() => proxy.snapshot(), [proxy])
     const resolvedSelector =
-      selector ?? ((value: StoreSnapshot<M, R>) => value as unknown as Selected)
+      selector ?? ((value: StoreSnapshot<M, R> | undefined) => value as unknown as Selected)
     // Default to shallowEqual when a selector is supplied so callers that
     // return fresh object/tuple literals don't re-render on every patch.
     const resolvedEquality =

@@ -800,13 +800,13 @@ describe("connect", () => {
     })
     expect(proxy.metadata.messages).toBe("literal")
     expect(proxy.users).toEqual([{ id: "u1", name: "Ada" }])
-    expect(proxy.snapshot().feed.messages).toEqual([{ body: "hello" }])
-    expect(proxy.snapshot().async_messages).toEqual({
+    expect(proxy.snapshot()?.feed.messages).toEqual([{ body: "hello" }])
+    expect(proxy.snapshot()?.async_messages).toEqual({
       status: "loading",
       data: [{ id: "a1", body: "loaded" }],
       error: null
     })
-    expect(proxy.snapshot().metadata.messages).toBe("literal")
+    expect(proxy.snapshot()?.metadata.messages).toBe("literal")
   })
 
   test("unmount sends an unmount push and resets the root runtime", async () => {
@@ -1089,6 +1089,62 @@ describe("connect", () => {
       errorSpy.mockRestore()
       process.off("unhandledRejection", onUnhandled)
     }
+  })
+
+  test("serves last-good snapshot through the version-mismatch recovery window", async () => {
+    const { connect } = await import("../src/connect")
+    const socket = new MockSocket()
+    const connectionPromise = connect<TestStores>(socket)
+    const channel = lastChannel(socket)
+    channel.resolveJoin()
+    const connection = await connectionPromise
+
+    const mountedPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "alpha-1"
+    })
+    await Promise.resolve()
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+    await Promise.resolve()
+    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Inbox")))
+    const mounted = await mountedPromise
+
+    expect(mounted.store.snapshot()?.title).toBe("Inbox")
+
+    // Version-mismatch patch → schedules recovery (soft reset + remount).
+    channel.emit(
+      "patch",
+      connectionEnvelope(
+        "Test.Store:alpha-1",
+        99,
+        100,
+        [{ op: "replace", path: "/counter", value: 99 }],
+        []
+      )
+    )
+
+    // Recovery is parked awaiting the unmount reply. The index was NOT
+    // emptied, so the mounted proxy still serves the complete last-good
+    // snapshot rather than the bare stub that crashed consumers.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(mounted.store.snapshot()?.title).toBe("Inbox")
+    expect(mounted.store.snapshot()?.counter).toBe(1)
+
+    const unmountPush = lastPush(channel)
+    expect(unmountPush.event).toBe("unmount")
+    unmountPush.push.resolve("ok", {})
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    const remountPush = lastPush(channel)
+    expect(remountPush.event).toBe("mount")
+    remountPush.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    // Remount's initial patch atomically swaps in fresh state.
+    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Fresh")))
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    expect(mounted.store.snapshot()?.title).toBe("Fresh")
   })
 })
 

@@ -159,7 +159,7 @@ describe("snapshot cache invalidation", () => {
     const child2 = snapshotStore(connection, ["a", "child"])
 
     expect(Object.is(child1, child2)).toBe(false)
-    expect(child2).toEqual({ __musubi_store_id__: ["a", "child"] })
+    expect(child2).toBeUndefined()
   })
 
   test("invalidates stream owner snapshots and their ancestors", async () => {

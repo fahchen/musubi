@@ -267,7 +267,7 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 export function snapshotStore<M extends StoreModule<R>, R = unknown>(
   connection: RootConnection,
   storeId: StoreId
-): StoreSnapshot<M, R> {
+): StoreSnapshot<M, R> | undefined {
   const key = storeIdKey(storeId)
   const cached = connection.snapshotCache.get(key)
 
@@ -277,10 +277,13 @@ export function snapshotStore<M extends StoreModule<R>, R = unknown>(
 
   const node = connection.storeIndex.get(key) as Record<string, unknown> | undefined
 
+  // Node absent from the index (store not mounted, or a reconnect window where
+  // the index was reset). Return `undefined` rather than a stub cast to the
+  // full snapshot type: a stub typed as fully-hydrated lets consumers deref a
+  // "guaranteed" field and crash at runtime. `undefined` forces a compile-time
+  // guard instead. Stable identity, so `useSyncExternalStore` doesn't churn.
   if (!node) {
-    const missing = { __musubi_store_id__: storeId } as StoreSnapshot<M, R>
-    connection.snapshotCache.set(key, missing)
-    return missing
+    return undefined
   }
 
   const out: Record<string, unknown> = { __musubi_store_id__: storeId }

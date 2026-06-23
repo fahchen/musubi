@@ -46,16 +46,20 @@ function ChatRoom({ root }: { root: Store<RootModule> }) {
   const [feedback, setFeedback] = useState("")
   const busy = setName.isPending ? "name" : sendMessage.isPending ? "send" : null
 
+  useEffect(() => {
+    setNameDraft(room?.current_user.name ?? "")
+  }, [room?.current_user.name])
+
+  // Snapshot is `undefined` during the reconnect window (index reset mid-
+  // recovery). Show the connecting shell instead of crashing on deref.
+  if (!room) return <main className="chat-shell">Connecting...</main>
+
   const currentUser = room.current_user
   const onlineUsers = room.online_users
   const messages = room.messages
   const onlineCount = onlineUsers.status === "ok" ? onlineUsers.data.length : 0
   const messagesList = messages.data ?? []
   const messagesCount = messagesList.length
-
-  useEffect(() => {
-    setNameDraft(currentUser.name)
-  }, [currentUser.name])
 
   async function handleSetName(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault()
