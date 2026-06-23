@@ -11,6 +11,8 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-06-24
+
 ### Fixed
 
 - **`@musubi/client` / `@musubi/react`** — Snapshotting a store whose node is
@@ -344,7 +346,8 @@ Initial public release of the Musubi runtime (then `Arbor`):
 - TypeScript client and React adapter that materialize the diff stream
   into immutable snapshots.
 
-[Unreleased]: https://github.com/fahchen/musubi/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/fahchen/musubi/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/fahchen/musubi/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/fahchen/musubi/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/fahchen/musubi/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/fahchen/musubi/compare/v0.8.0...v0.9.0
