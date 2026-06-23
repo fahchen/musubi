@@ -1392,7 +1392,15 @@ async function recoverConnectionRootFromVersionMismatch(
   connection.pendingConnect?.reject(new Error("Version mismatch"))
   connection.pendingConnect = null
   rejectPendingCommands(connection, new Error("Version mismatch"))
-  resetConnectionState(connection)
+  // Soft reset: keep the last-good root/index/streams/snapshots so mounted
+  // proxies keep serving complete (stale) data through the remount window
+  // instead of a bare stub. `version = 0` makes the remount's initial patch
+  // (whole-root `replace ""`) the initial envelope, which atomically swaps in
+  // fresh state and clears the stale snapshot cache (see `acceptEnvelope` /
+  // `invalidateSnapshotsForOps`). Unlike `handleConnectionDisconnect`, this
+  // path self-heals on the same connection, so emptying the index here only
+  // opens a crash window with no benefit.
+  connection.version = 0
 
   try {
     if (connectionState.channel) {

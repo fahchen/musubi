@@ -85,16 +85,21 @@ function CartPage({ root }: { root: Store<RootModule> }) {
   )
 
   const headerLabel = useMemo(() => {
-    if (!page.header) {
+    const header = page?.header
+    if (!header) {
       return "Connecting to Musubi..."
     }
 
-    if (!page.header.signed_in) {
+    if (!header.signed_in) {
       return "Guest checkout is disabled"
     }
 
-    return `Signed in as ${page.header.user_name ?? "Unknown"}`
-  }, [page.header])
+    return `Signed in as ${header.user_name ?? "Unknown"}`
+  }, [page?.header])
+
+  // Snapshot is `undefined` during the reconnect window (index reset mid-
+  // recovery). Show the connecting shell instead of crashing on deref.
+  if (!page) return <main className="shell">Connecting...</main>
 
   async function handleAddItem(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -297,7 +302,11 @@ function CartLine({
   const decQty = useMusubiCommand(lineProxy, "dec_qty")
   const pending = incQty.isPending ? "inc" : decQty.isPending ? "dec" : null
 
-  async function step(kind: "inc" | "dec") {
+  // Child snapshot is `undefined` during the reconnect window; drop the row
+  // rather than crash. The parent shell renders its own skeleton.
+  if (!line) return null
+
+  const step = async (kind: "inc" | "dec") => {
     try {
       const reply = await (kind === "inc" ? incQty.dispatch({}) : decQty.dispatch({}))
       onFeedback(`Line ${line.sku} -> qty ${reply.qty}`)
