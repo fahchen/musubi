@@ -88,6 +88,8 @@ class MockSocket {
     this.connected = true
   }
 
+  onOpen(_callback: () => void): void {}
+
   disconnect(): void {
     this.connected = false
   }

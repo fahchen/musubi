@@ -78,6 +78,8 @@ class MockSocket {
 
   connect(): void {}
 
+  onOpen(_callback: () => void): void {}
+
   channel(_topic: string, _payload?: object): MockChannel {
     const channel = new MockChannel()
     this.channels.push(channel)

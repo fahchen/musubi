@@ -100,12 +100,26 @@ class MockSocket {
   readonly channels: MockChannel[] = []
   connected = false
 
+  private readonly openHandlers: Array<() => void> = []
+
   constructor(_url?: string, _options?: unknown) {
     MockSocket.instances.push(this)
   }
 
   connect(): void {
     this.connected = true
+  }
+
+  onOpen(callback: () => void): void {
+    this.openHandlers.push(callback)
+  }
+
+  // Simulate Phoenix re-opening the transport after a drop.
+  simulateReopen(): void {
+    this.connected = true
+    for (const callback of this.openHandlers) {
+      callback()
+    }
   }
 
   disconnect(): void {
