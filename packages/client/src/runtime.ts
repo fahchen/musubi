@@ -1462,15 +1462,35 @@ function handleConnectionDisconnect(
     root.pendingConnect = null
     root.initialPatchPromise = null
     rejectPendingCommands(root, disconnectError)
-    resetConnectionState(root)
     root.channel = undefined
+
+    if (root.refCount === 0) {
+      // No live consumer — a release was mid grace-timer (just settled by
+      // `cancelGraceTimer` above). Drop it so `handleSocketReopen` doesn't
+      // re-mount an orphan on reconnect; server-side state dies with the
+      // closed socket.
+      connectionState.roots.delete(root.id)
+      continue
+    }
+
+    // Keep last-good for live roots. A hard socket drop (iOS Safari resume,
+    // network loss, server restart) used to `resetConnectionState` here,
+    // collapsing every mounted `proxy.snapshot()` to a missing-snapshot stub
+    // and blanking the consumer until it navigated/refreshed. Instead keep the
+    // stale-but-complete root/index/streams/snapshots so mounted proxies keep
+    // rendering through the reconnect window. `version = 0` makes the reconnect
+    // remount's initial patch (whole-root `replace ""`) the initial envelope,
+    // which atomically swaps fresh state in (see `handlePatch` /
+    // `acceptEnvelope`). Mirrors the soft reset in
+    // `recoverConnectionRootFromVersionMismatch`; `handleSocketReopen` drives
+    // the remount once the socket reopens.
+    root.version = 0
   }
 
-  // Drop stale `roots` entries — otherwise a subsequent mount on the
-  // (about-to-be-reconnected) state could find a disconnected entry
-  // and alias to it via `:already_mounted`, handing the caller a
-  // dead RootConnection.
-  connectionState.roots.clear()
+  // Keep `roots` (live entries only). They are "awaiting reconnect", not dead:
+  // `handleSocketReopen` re-mounts each on the next socket open, and
+  // `mountConnectionRoot`'s `:already_mounted` alias path can reuse a still-live
+  // entry in the meantime.
 
   connectionState.channel = undefined
 }
