@@ -1160,6 +1160,60 @@ describe("connect", () => {
 
     expect(mounted.store.snapshot()?.title).toBe("Fresh")
   })
+
+  test("keeps last-good snapshot on hard disconnect and auto-remounts on reconnect", async () => {
+    const { connect } = await import("../src/connect")
+    const socket = new MockSocket()
+    const connectionPromise = connect<TestStores>(socket)
+    const channel = lastChannel(socket)
+    channel.resolveJoin()
+    const connection = await connectionPromise
+
+    const mountedPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "alpha-1"
+    })
+    await Promise.resolve()
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+    await Promise.resolve()
+    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Inbox")))
+    const mounted = await mountedPromise
+
+    expect(mounted.store.snapshot()?.title).toBe("Inbox")
+
+    // Hard socket drop (channel onClose → handleConnectionDisconnect).
+    channel.disconnect({ reason: "socket closed" })
+
+    // A: the last-good snapshot stays complete and readable through the
+    // disconnected window instead of collapsing to a missing-snapshot stub.
+    expect(mounted.store.snapshot()?.title).toBe("Inbox")
+    expect(mounted.store.title).toBe("Inbox")
+
+    // B: socket re-opens → re-join the channel and auto-remount the live root.
+    socket.simulateReopen()
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    const reconnectChannel = lastChannel(socket)
+    expect(reconnectChannel).not.toBe(channel)
+    reconnectChannel.resolveJoin()
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    // Exactly one remount push on the fresh channel — no duplicate mount churn.
+    const mountPushes = reconnectChannel.pushes.filter((p) => p.event === "mount")
+    expect(mountPushes.length).toBe(1)
+    mountPushes[0]!.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    // The server's fresh initial patch atomically replaces the stale snapshot.
+    reconnectChannel.emit(
+      "patch",
+      initialConnectionEnvelope("Test.Store:alpha-1", rootState("Fresh"))
+    )
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    expect(mounted.store.snapshot()?.title).toBe("Fresh")
+    expect(mounted.store.title).toBe("Fresh")
+  })
 })
 
 function lastChannel(socket: MockSocket): MockChannel {
