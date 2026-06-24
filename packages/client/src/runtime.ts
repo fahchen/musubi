@@ -52,6 +52,10 @@ export interface ChannelLike {
 export interface SocketLike {
   connect(): unknown
   channel(topic: string, payload?: object): ChannelLike
+  // Fires whenever the underlying transport (re)opens. Phoenix re-opens the
+  // socket after a drop but does not re-join our channel or re-mount roots;
+  // `handleSocketReopen` hooks this to drive reconnect recovery.
+  onOpen(callback: () => void): unknown
 }
 
 type PendingConnect = {
@@ -208,6 +212,17 @@ export function getSharedRuntime(socket: SocketLike): SharedRuntime {
 
   const runtime: SharedRuntime = { socket, connections: new Map() }
   RUNTIMES.set(socket, runtime)
+
+  // One socket-level reopen handler drives reconnect recovery for every
+  // connection on this socket. Registered once per socket (survives connection
+  // churn) and iterates only the currently-live connections. On the initial
+  // open it is a no-op (no roots yet / channel already being set up).
+  socket.onOpen(() => {
+    for (const connectionState of runtime.connections.values()) {
+      handleSocketReopen(connectionState)
+    }
+  })
+
   return runtime
 }
 
@@ -1462,17 +1477,86 @@ function handleConnectionDisconnect(
     root.pendingConnect = null
     root.initialPatchPromise = null
     rejectPendingCommands(root, disconnectError)
-    resetConnectionState(root)
     root.channel = undefined
+
+    if (root.refCount === 0) {
+      // No live consumer — a release was mid grace-timer (just settled by
+      // `cancelGraceTimer` above). Drop it so `handleSocketReopen` doesn't
+      // re-mount an orphan on reconnect; server-side state dies with the
+      // closed socket.
+      connectionState.roots.delete(root.id)
+      continue
+    }
+
+    // Keep last-good for live roots. A hard socket drop (iOS Safari resume,
+    // network loss, server restart) used to `resetConnectionState` here,
+    // collapsing every mounted `proxy.snapshot()` to a missing-snapshot stub
+    // and blanking the consumer until it navigated/refreshed. Instead keep the
+    // stale-but-complete root/index/streams/snapshots so mounted proxies keep
+    // rendering through the reconnect window. `version = 0` makes the reconnect
+    // remount's initial patch (whole-root `replace ""`) the initial envelope,
+    // which atomically swaps fresh state in (see `handlePatch` /
+    // `acceptEnvelope`). Mirrors the soft reset in
+    // `recoverConnectionRootFromVersionMismatch`; `handleSocketReopen` drives
+    // the remount once the socket reopens.
+    root.version = 0
   }
 
-  // Drop stale `roots` entries — otherwise a subsequent mount on the
-  // (about-to-be-reconnected) state could find a disconnected entry
-  // and alias to it via `:already_mounted`, handing the caller a
-  // dead RootConnection.
-  connectionState.roots.clear()
+  // Keep `roots` (live entries only). They are "awaiting reconnect", not dead:
+  // `handleSocketReopen` re-mounts each on the next socket open, and
+  // `mountConnectionRoot`'s `:already_mounted` alias path can reuse a still-live
+  // entry in the meantime.
 
   connectionState.channel = undefined
+}
+
+// Socket transport (re)opened. Restore a connection that lost its channel while
+// holding live roots — i.e. a reconnect after `handleConnectionDisconnect`. On
+// the initial open this is a no-op: either the channel is already being set up
+// by `connectConnectionChannel`, or there are no roots yet.
+function handleSocketReopen(connectionState: ConnectionState): void {
+  if (connectionState.channel) {
+    return
+  }
+
+  if (connectionState.roots.size === 0) {
+    return
+  }
+
+  void reestablishConnectionRoots(connectionState)
+}
+
+async function reestablishConnectionRoots(
+  connectionState: ConnectionState
+): Promise<void> {
+  try {
+    // Re-join the connection channel (bumps `channelGeneration`, wires fresh
+    // patch/close handlers). Deduped via `connectPromise` with any concurrent
+    // mount-triggered connect.
+    await connectConnectionChannel(connectionState)
+  } catch {
+    // Join failed; the socket fires `onOpen` again on its next successful
+    // reconnect and we retry then.
+    return
+  }
+
+  for (const root of connectionState.roots.values()) {
+    // Skip roots a concurrent path is already restoring: version-mismatch
+    // recovery (`recovering`), or a mount that re-attached a channel during
+    // the window.
+    if (root.recovering || root.channel) {
+      continue
+    }
+
+    // Re-mount on the fresh channel. The server's initial patch (whole-root
+    // `replace ""`) atomically replaces the stale last-good snapshot kept by
+    // `handleConnectionDisconnect`; the old snapshot keeps rendering until then
+    // so there is no blank window.
+    remountExistingConnection(root).catch((error: unknown) => {
+      // eslint-disable-next-line no-console
+      console.error("[musubi] root reconnect remount failed:", error)
+    })
+  }
 }
 
 function rejectPendingCommands(connection: RootConnection, reason: Error): void {

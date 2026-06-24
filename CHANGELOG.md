@@ -11,6 +11,27 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`@musubi/client`** — A hard WebSocket drop (iOS Safari backgrounded then
+  resumed, network loss, server restart) no longer blanks downstream consumers.
+  `handleConnectionDisconnect` now keeps the last-good root/index/streams/
+  snapshots for live roots (only resetting `version` to 0) instead of wiping
+  them and clearing the roots map, so mounted `proxy.snapshot()` keeps returning
+  complete stale data through the reconnect window rather than collapsing to a
+  missing-snapshot stub. On socket reopen, a new `onOpen` hook re-joins the
+  connection channel and re-mounts each live root; the server's initial patch
+  (whole-root `replace ""`) atomically swaps fresh state in, so consumers
+  refresh automatically with no navigation or manual reload. Completes the
+  reconnect story from 0.10.0, which only covered the version-mismatch recovery
+  path (`The terminal disconnect path still resets`).
+
+### Changed
+
+- **`@musubi/client`** — `SocketLike` gains a required `onOpen(callback)` method,
+  used to drive reconnect recovery. `Phoenix.Socket` already implements it;
+  custom `SocketLike` implementations must add it.
+
 ## [0.10.0] — 2026-06-24
 
 ### Fixed

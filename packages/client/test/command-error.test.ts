@@ -60,6 +60,7 @@ class MockChannel {
 class MockSocket {
   readonly channels: MockChannel[] = []
   connect(): void {}
+  onOpen(_callback: () => void): void {}
   channel(_topic: string, _payload?: unknown): MockChannel {
     const ch = new MockChannel()
     this.channels.push(ch)
