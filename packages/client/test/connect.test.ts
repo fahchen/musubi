@@ -1214,6 +1214,63 @@ describe("connect", () => {
     expect(mounted.store.snapshot()?.title).toBe("Fresh")
     expect(mounted.store.title).toBe("Fresh")
   })
+
+  test("auto-remounts live roots on reopen after a silent drop leaves a stale channel (bfcache resume)", async () => {
+    const { connect } = await import("../src/connect")
+    const socket = new MockSocket()
+    const connectionPromise = connect<TestStores>(socket)
+    const channel = lastChannel(socket)
+    channel.resolveJoin()
+    const connection = await connectionPromise
+
+    const mountedPromise = connection.mountStore({
+      module: "Test.Store",
+      id: "alpha-1"
+    })
+    await Promise.resolve()
+    expect(channel.pushes.filter((p) => p.event === "mount").length).toBe(1)
+    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+    await Promise.resolve()
+    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Inbox")))
+    const mounted = await mountedPromise
+
+    expect(mounted.store.snapshot()?.title).toBe("Inbox")
+
+    // Silent drop: an iOS Safari bfcache freeze swallows a clean
+    // `socket.disconnect()` — the WS closes without delivering the channel
+    // onClose/onError that drives `handleConnectionDisconnect`, so
+    // `connectionState.channel` and the live `root.channel` stay set. We
+    // deliberately do NOT call `channel.disconnect()` here (that is the
+    // already-covered clean-drop path); only the transport reopens.
+    socket.simulateReopen()
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    // A fresh transport channel must be created and the live root re-mounted
+    // on it. Pre-fix, `handleSocketReopen` bailed on the truthy stale
+    // `connectionState.channel`, so no second channel appeared and the
+    // consumer was left with no live data.
+    const reconnectChannel = lastChannel(socket)
+    expect(reconnectChannel).not.toBe(channel)
+    reconnectChannel.resolveJoin()
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    const mountPushes = reconnectChannel.pushes.filter((p) => p.event === "mount")
+    expect(mountPushes.length).toBe(1)
+    expect(mountPushes[0]!.payload).toMatchObject({ module: "Test.Store", id: "alpha-1" })
+    mountPushes[0]!.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    // The server's fresh initial patch lands on the new channel → live data
+    // restored, no manual reload or navigation.
+    reconnectChannel.emit(
+      "patch",
+      initialConnectionEnvelope("Test.Store:alpha-1", rootState("Fresh"))
+    )
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    expect(mounted.store.snapshot()?.title).toBe("Fresh")
+    expect(mounted.store.title).toBe("Fresh")
+  })
 })
 
 function lastChannel(socket: MockSocket): MockChannel {

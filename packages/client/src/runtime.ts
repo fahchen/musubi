@@ -1511,16 +1511,36 @@ function handleConnectionDisconnect(
 }
 
 // Socket transport (re)opened. Restore a connection that lost its channel while
-// holding live roots — i.e. a reconnect after `handleConnectionDisconnect`. On
-// the initial open this is a no-op: either the channel is already being set up
-// by `connectConnectionChannel`, or there are no roots yet.
+// holding live roots — i.e. a reconnect. Guarded by `connectPromise`, not by a
+// channel check: `onOpen` fires only on a *fresh* transport, so any channel we
+// still hold is a zombie bound to the now-dead prior transport. When a connect
+// is already in flight (initial open, or a mount-triggered connect) it joins the
+// channel and mounts roots itself, so we no-op and let it win; with no live
+// roots there is nothing to restore. Otherwise we normalize any stale channel
+// via `handleConnectionDisconnect` before re-establishing.
 function handleSocketReopen(connectionState: ConnectionState): void {
-  if (connectionState.channel) {
+  // A connect is already in flight (initial open, or a mount-triggered
+  // connect): it will join the channel and mount roots itself. Don't race it.
+  if (connectionState.connectPromise) {
     return
   }
 
   if (connectionState.roots.size === 0) {
     return
+  }
+
+  // Still holding a channel here means its disconnect bookkeeping never ran:
+  // `onOpen` only fires on a *fresh* transport, so any channel we still hold
+  // was bound to the now-dead prior transport. A clean `socket.disconnect()`
+  // swallowed by a bfcache freeze (iOS Safari resume) closes the WS without
+  // delivering the channel `onClose`/`onError` that drives
+  // `handleConnectionDisconnect`, leaving `connectionState.channel` and each
+  // live `root.channel` stale. Run that teardown now (version -> 0, channels
+  // cleared) so `reestablishConnectionRoots` actually re-mounts the roots
+  // instead of skipping them on a truthy `root.channel` and leaving the
+  // consumer with no live data.
+  if (connectionState.channel) {
+    handleConnectionDisconnect(connectionState, new Error("Stale channel on socket reopen"))
   }
 
   void reestablishConnectionRoots(connectionState)
