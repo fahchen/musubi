@@ -11,6 +11,23 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`@musubi/client`** — A silent WebSocket drop (clean `socket.disconnect()`
+  swallowed by an iOS Safari bfcache freeze) no longer leaves the client with no
+  live data after resume. `handleSocketReopen` bailed whenever
+  `connectionState.channel` was set, but `socket.onOpen` fires only on a *fresh*
+  transport — a channel still held at that point is a zombie bound to the dead
+  prior transport. When the WS `onclose` is never delivered,
+  `handleConnectionDisconnect` never runs, so `connectionState.channel` and every
+  live `root.channel` stay stale and the bail skipped the remount entirely. The
+  reopen guard now keys on `connectPromise` (the real "connect in flight" signal)
+  and, when a stale channel is present, runs `handleConnectionDisconnect` to
+  normalize state (`version` → 0, channels cleared) before re-establishing, so
+  the live roots are actually re-mounted. Completes the reconnect story from
+  0.11.0, which only covered the drop path where the channel `onClose`/`onError`
+  fires.
+
 ## [0.11.0] — 2026-06-24
 
 ### Fixed
