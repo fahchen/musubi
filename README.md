@@ -34,7 +34,7 @@ Add Musubi to your Phoenix application:
 ```elixir
 def deps do
   [
-    {:musubi, "~> 0.11.0"}
+    {:musubi, "~> 0.11.1"}
   ]
 end
 ```
