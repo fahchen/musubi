@@ -61,7 +61,8 @@ defmodule Musubi.Transport.ConnectionChannel do
          root_id <- compose_root_id(module_str, caller_id),
          {:ok, root_module} <- fetch_declared_root(socket_module, module_str),
          :ok <- ensure_root_store(root_module),
-         {:ok, page_pid} <- start_root_page(root_module, root_id, root_params, joined_socket, topic) do
+         {:ok, page_pid} <-
+           start_root_page(root_module, root_id, root_params, joined_socket, topic) do
       Telemetry.emit(
         [:musubi, :channel, :join],
         %{system_time: System.system_time()},

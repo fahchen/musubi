@@ -168,8 +168,11 @@ defmodule Musubi.Transport.ConnectionChannelTest do
 
     # handle_join runs per channel and now sees the mount params on the join.
     assert_receive {:connection_join,
-                    %{"module" => @alpha_module_str, "id" => "alpha-1", "params" => %{"room_id" => "general"}},
-                    "connect-user"}
+                    %{
+                      "module" => @alpha_module_str,
+                      "id" => "alpha-1",
+                      "params" => %{"room_id" => "general"}
+                    }, "connect-user"}
 
     assert_receive {:alpha_mount, alpha_pid, %{"room_id" => "general"}, "connect-user"}
     assert_receive {:alpha_init, "general"}
