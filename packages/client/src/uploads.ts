@@ -132,7 +132,6 @@ export class UploadHandleImpl implements UploadHandle {
       errors: { client_ref: string; error: UploadError }[]
     }>(
       channel.push("allow_upload", {
-        root_id: this.connection.id,
         store_id: [...this.storeId],
         name: this.uploadName,
         entries: entriesPayload
@@ -237,7 +236,6 @@ export class UploadHandleImpl implements UploadHandle {
 
       await pushReceive(
         channel.push("cancel_upload", {
-          root_id: this.connection.id,
           store_id: [...this.storeId],
           name: this.uploadName,
           ref
@@ -411,7 +409,6 @@ export class UploadHandleImpl implements UploadHandle {
       meta: entry.meta,
       onProgress: (pct: number) => {
         channel.push("upload_progress", {
-          root_id: this.connection.id,
           store_id: [...this.storeId],
           name: this.uploadName,
           ref: entry.ref,
@@ -430,7 +427,6 @@ export class UploadHandleImpl implements UploadHandle {
       // entry transitions to `:error` (spec/domains/uploads/features/
       // external.feature § "Registered uploader rejects the PUT").
       channel.push("upload_error", {
-        root_id: this.connection.id,
         store_id: [...this.storeId],
         name: this.uploadName,
         ref: entry.ref,

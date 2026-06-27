@@ -102,6 +102,8 @@ defmodule Musubi.Transport.UploadConnectionTest do
   import Phoenix.ChannelTest
 
   @endpoint TestEndpoint
+  @cart_module "Musubi.Transport.UploadConnectionTest.CartStore"
+  @external_module "Musubi.Transport.UploadConnectionTest.ExternalStore"
 
   setup_all do
     # Keyed by this test module's full `TestEndpoint` alias, so no other
@@ -120,24 +122,13 @@ defmodule Musubi.Transport.UploadConnectionTest do
 
   setup do
     Process.flag(:trap_exit, true)
-    {:ok, _r, socket} = join_connection()
-
-    mount_ref =
-      push(socket, "mount", %{
-        "module" => "Musubi.Transport.UploadConnectionTest.CartStore",
-        "id" => "cart-1",
-        "params" => %{}
-      })
-
-    assert_reply(mount_ref, :ok, _reply)
-
+    {:ok, _reply, socket} = join_root(@cart_module, "cart-1", %{})
     {:ok, socket: socket}
   end
 
   test "allow_upload on a child store_id resolves the child upload", %{socket: socket} do
     push_ref =
       push(socket, "allow_upload", %{
-        "root_id" => "Musubi.Transport.UploadConnectionTest.CartStore:cart-1",
         "store_id" => ["lines", "line-2"],
         "name" => "attachment",
         "entries" => [
@@ -156,7 +147,6 @@ defmodule Musubi.Transport.UploadConnectionTest do
   test "allow_upload on the root rejects when the upload is not declared there", %{socket: socket} do
     push_ref =
       push(socket, "allow_upload", %{
-        "root_id" => "Musubi.Transport.UploadConnectionTest.CartStore:cart-1",
         "store_id" => [],
         "name" => "attachment",
         "entries" => [
@@ -171,7 +161,6 @@ defmodule Musubi.Transport.UploadConnectionTest do
   test "cancel_upload routes by child store_id", %{socket: socket} do
     push_ref =
       push(socket, "allow_upload", %{
-        "root_id" => "Musubi.Transport.UploadConnectionTest.CartStore:cart-1",
         "store_id" => ["lines", "line-1"],
         "name" => "attachment",
         "entries" => [
@@ -184,7 +173,6 @@ defmodule Musubi.Transport.UploadConnectionTest do
 
     push_ref =
       push(socket, "cancel_upload", %{
-        "root_id" => "Musubi.Transport.UploadConnectionTest.CartStore:cart-1",
         "store_id" => ["lines", "line-1"],
         "name" => "attachment",
         "ref" => entry_ref
@@ -194,22 +182,14 @@ defmodule Musubi.Transport.UploadConnectionTest do
   end
 
   describe "upload_error event (external mode)" do
-    setup %{socket: socket} do
-      mount_ref =
-        push(socket, "mount", %{
-          "module" => "Musubi.Transport.UploadConnectionTest.ExternalStore",
-          "id" => "ext-1",
-          "params" => %{}
-        })
-
-      assert_reply(mount_ref, :ok, _r)
-      :ok
+    setup do
+      {:ok, _reply, socket} = join_root(@external_module, "ext-1", %{})
+      {:ok, socket: socket}
     end
 
     test "client-pushed upload_error emits {op: error, code: external_failed}", %{socket: socket} do
       push_ref =
         push(socket, "allow_upload", %{
-          "root_id" => "Musubi.Transport.UploadConnectionTest.ExternalStore:ext-1",
           "store_id" => [],
           "name" => "avatar",
           "entries" => [
@@ -222,7 +202,6 @@ defmodule Musubi.Transport.UploadConnectionTest do
 
       push_ref =
         push(socket, "upload_error", %{
-          "root_id" => "Musubi.Transport.UploadConnectionTest.ExternalStore:ext-1",
           "store_id" => [],
           "name" => "avatar",
           "ref" => entry_ref,
@@ -236,7 +215,6 @@ defmodule Musubi.Transport.UploadConnectionTest do
     test "unknown error codes degrade to external_failed", %{socket: socket} do
       push_ref =
         push(socket, "allow_upload", %{
-          "root_id" => "Musubi.Transport.UploadConnectionTest.ExternalStore:ext-1",
           "store_id" => [],
           "name" => "avatar",
           "entries" => [
@@ -251,7 +229,6 @@ defmodule Musubi.Transport.UploadConnectionTest do
       # does not let the client invent arbitrary `Musubi.Upload.Error.code()`.
       push_ref =
         push(socket, "upload_error", %{
-          "root_id" => "Musubi.Transport.UploadConnectionTest.ExternalStore:ext-1",
           "store_id" => [],
           "name" => "avatar",
           "ref" => entry_ref,
@@ -263,18 +240,21 @@ defmodule Musubi.Transport.UploadConnectionTest do
     end
   end
 
-  defp join_connection do
+  # Connect a socket and join this root's own channel (join IS the mount).
+  defp join_root(module_str, id, params) do
     session = %{"test_pid" => self()}
     connect_info = %{session: session}
-    phoenix_socket = socket(MusubiSocket, "x", %{})
+    root_id = module_str <> ":" <> id
+    topic = "musubi:connection:" <> root_id
+    phoenix_socket = socket(MusubiSocket, root_id, %{})
 
     {:ok, connected_socket} = MusubiSocket.connect(%{}, phoenix_socket, connect_info)
 
     subscribe_and_join(
       connected_socket,
       Musubi.Transport.ConnectionChannel,
-      "musubi:connection",
-      %{}
+      topic,
+      %{"module" => module_str, "id" => id, "params" => params}
     )
   end
 end

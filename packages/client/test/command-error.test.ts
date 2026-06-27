@@ -98,17 +98,16 @@ function initialEnvelope(rootId: string) {
 async function setupProxy() {
   const { connect } = await import("../src/connect")
   const socket = new MockSocket()
-  const connectionPromise = connect<TestStores>(socket)
-  const channel = socket.channels[socket.channels.length - 1]!
-  channel.resolveJoin()
-  const connection = await connectionPromise
+  // No connection channel anymore — `connect` resolves immediately; the
+  // per-root channel is created (and joined) by `mountStore`. Join IS the mount.
+  const connection = await connect<TestStores>(socket)
   const mountedPromise = connection.mountStore({
     module: "Test.Store",
     id: "alpha-1"
   })
   await Promise.resolve()
-  const mountPush = channel.pushes[channel.pushes.length - 1]!
-  mountPush.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+  const channel = socket.channels[socket.channels.length - 1]!
+  channel.resolveJoin({ root_id: "Test.Store:alpha-1" })
   await Promise.resolve()
   channel.emit("patch", initialEnvelope("Test.Store:alpha-1"))
   const { store: proxy } = await mountedPromise

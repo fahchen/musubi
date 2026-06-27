@@ -1,22 +1,28 @@
 defmodule Musubi.Transport.ConnectionChannel do
   @moduledoc """
-  Phoenix Channel adapter for Musubi sockets with multiple root stores.
+  Phoenix Channel adapter for one Musubi root store.
 
-  The channel owns one joined Musubi socket and a dynamic set of root page
-  servers. `join/3` runs the socket module's `Musubi.Socket.handle_join/2` once.
-  Each client `"mount"` message starts one root store page server using the
-  shared joined socket assigns and private connection context.
+  Each root store gets its own channel on topic `"musubi:connection:<root_id>"`.
+  Join is the mount: `join/3` runs the socket module's
+  `Musubi.Socket.handle_join/2`, composes the `root_id` from the join params,
+  and starts exactly one root page server bound to this channel. Leaving the
+  channel (client `leave()` or a transport drop) stops that root via
+  `terminate/2`.
+
+  Phoenix owns reconnect: on a dropped socket it automatically re-joins each
+  channel, which re-runs `join/3` and rebuilds the root — the client drives the
+  rest from the per-channel `join` reply. There is no separate `"mount"` /
+  `"unmount"` message and no multiplexing of multiple roots over one channel.
 
   ## Telemetry
 
     * `[:musubi, :channel, :join]` — `%{system_time: integer}`. Metadata:
-      `module`, `id`, `topic`, `page_pid`. For this adapter `module` is the
-      Musubi socket module, and `id`/`page_pid` are `nil` because roots mount
-      later inside the joined connection.
+      `module`, `id`, `topic`, `page_pid`. `module` is the Musubi socket module,
+      `id` is the composed `root_id`, and `page_pid` is the started root page
+      server.
     * `[:musubi, :channel, :terminate]` — `%{system_time: integer}`.
       Metadata: `module`, `id`, `topic`, `reason`, `page_pid`, `root_count`.
-      `root_count` is the number of mounted root page servers the connection is
-      stopping.
+      `root_count` is `1` when a root was mounted on this channel, else `0`.
   """
 
   use Phoenix.Channel
@@ -28,35 +34,46 @@ defmodule Musubi.Transport.ConnectionChannel do
   alias Musubi.Transport.Socket, as: TransportSocket
   alias Musubi.Wire
 
+  # Topic prefix for per-root connection channels; the suffix is the root id.
+  @topic_prefix "musubi:connection:"
+
   # Phoenix socket assign containing the Musubi socket module.
   @socket_module_key :__musubi_socket_module__
   # Phoenix socket assign containing the joined Musubi socket context.
   @connection_socket_key :__musubi_connection_socket__
-  # Phoenix socket assign containing mounted root runtime entries keyed by root id.
-  @mounted_roots_key :__musubi_mounted_roots__
+  # Phoenix socket assign containing this channel's single root runtime entry.
+  @root_key :__musubi_root__
   # Phoenix socket assign containing the channel topic.
   @topic_key :__musubi_topic__
 
   @impl Phoenix.Channel
   @spec join(String.t(), map(), Phoenix.Socket.t()) ::
-          {:ok, Phoenix.Socket.t()} | {:error, map()}
-  def join(topic, params, %Phoenix.Socket{} = socket)
-      when is_binary(topic) and is_map(params) do
+          {:ok, map(), Phoenix.Socket.t()} | {:error, map()}
+  def join(@topic_prefix <> _suffix = topic, params, %Phoenix.Socket{} = socket)
+      when is_map(params) do
     with {:ok, socket_module} <- fetch_socket_module(socket),
          {:ok, connect_socket} <- TransportSocket.fetch_connect_socket(socket),
          musubi_socket <- build_connection_socket(topic, connect_socket),
-         {:ok, joined_socket} <- socket_module.handle_join(params, musubi_socket) do
+         {:ok, joined_socket} <- socket_module.handle_join(params, musubi_socket),
+         {:ok, module_str} <- fetch_string(params, "module"),
+         {:ok, caller_id} <- fetch_root_id(params),
+         {:ok, root_params} <- fetch_params(params),
+         root_id <- compose_root_id(module_str, caller_id),
+         {:ok, root_module} <- fetch_declared_root(socket_module, module_str),
+         :ok <- ensure_root_store(root_module),
+         {:ok, page_pid} <-
+           start_root_page(root_module, root_id, root_params, joined_socket, topic) do
       Telemetry.emit(
         [:musubi, :channel, :join],
         %{system_time: System.system_time()},
-        %{module: socket_module, id: nil, topic: topic, page_pid: nil}
+        %{module: socket_module, id: root_id, topic: topic, page_pid: page_pid}
       )
 
-      {:ok,
+      {:ok, %{"root_id" => root_id},
        socket
        |> Phoenix.Socket.assign(@socket_module_key, socket_module)
        |> Phoenix.Socket.assign(@connection_socket_key, joined_socket)
-       |> Phoenix.Socket.assign(@mounted_roots_key, %{})
+       |> Phoenix.Socket.assign(@root_key, %{pid: page_pid, module: root_module, root_id: root_id})
        |> Phoenix.Socket.assign(@topic_key, topic)}
     else
       :error -> {:error, %{reason: "unauthorized"}}
@@ -64,26 +81,14 @@ defmodule Musubi.Transport.ConnectionChannel do
     end
   end
 
+  def join(_topic, _params, %Phoenix.Socket{}), do: {:error, %{reason: "unauthorized"}}
+
   @impl Phoenix.Channel
   @spec handle_in(String.t(), map(), Phoenix.Socket.t()) ::
           {:reply, {:ok, map()} | {:error, map()}, Phoenix.Socket.t()}
-  def handle_in("mount", payload, %Phoenix.Socket{} = socket) when is_map(payload) do
-    with {:ok, module_str} <- fetch_string(payload, "module"),
-         {:ok, caller_id} <- fetch_root_id(payload),
-         {:ok, params} <- fetch_params(payload),
-         root_id <- compose_root_id(module_str, caller_id),
-         {:ok, root_module} <- fetch_declared_root(socket, module_str),
-         :ok <- ensure_root_store(root_module) do
-      handle_mount(socket, root_id, root_module, params)
-    else
-      {:error, reason} -> {:reply, {:error, %{reason: error_reason(reason)}}, socket}
-    end
-  end
-
   def handle_in("command", payload, %Phoenix.Socket{} = socket) when is_map(payload) do
     with {:ok, name} <- fetch_string(payload, "name"),
-         {:ok, root_id} <- fetch_string(payload, "root_id"),
-         {:ok, page_pid} <- fetch_root_pid(socket, root_id),
+         {:ok, page_pid} <- fetch_root_pid(socket),
          {:ok, reply} <-
            Server.command_by_name(
              page_pid,
@@ -97,23 +102,9 @@ defmodule Musubi.Transport.ConnectionChannel do
     end
   end
 
-  def handle_in("unmount", payload, %Phoenix.Socket{} = socket) when is_map(payload) do
-    with {:ok, root_id} <- fetch_string(payload, "root_id"),
-         {:ok, root_entry} <- fetch_root_entry(socket, root_id) do
-      stop_root(root_entry.pid, {:shutdown, :unmounted})
-
-      socket = update_mounted_roots(socket, &Map.delete(&1, root_id))
-
-      {:reply, {:ok, %{}}, socket}
-    else
-      {:error, reason} -> {:reply, {:error, %{reason: error_reason(reason)}}, socket}
-    end
-  end
-
   def handle_in("allow_upload", payload, %Phoenix.Socket{} = socket) when is_map(payload) do
-    with {:ok, root_id} <- fetch_string(payload, "root_id"),
-         {:ok, name_str} <- fetch_string(payload, "name"),
-         {:ok, page_pid} <- fetch_root_pid(socket, root_id),
+    with {:ok, name_str} <- fetch_string(payload, "name"),
+         {:ok, page_pid} <- fetch_root_pid(socket),
          store_id <- normalize_store_id(Map.get(payload, "store_id", [])),
          {:ok, name} <- resolve_upload_name_at(page_pid, store_id, name_str),
          entries <- Map.get(payload, "entries", []),
@@ -127,10 +118,9 @@ defmodule Musubi.Transport.ConnectionChannel do
   end
 
   def handle_in("cancel_upload", payload, %Phoenix.Socket{} = socket) when is_map(payload) do
-    with {:ok, root_id} <- fetch_string(payload, "root_id"),
-         {:ok, name_str} <- fetch_string(payload, "name"),
+    with {:ok, name_str} <- fetch_string(payload, "name"),
          {:ok, ref} <- fetch_string(payload, "ref"),
-         {:ok, page_pid} <- fetch_root_pid(socket, root_id),
+         {:ok, page_pid} <- fetch_root_pid(socket),
          store_id <- normalize_store_id(Map.get(payload, "store_id", [])),
          {:ok, name} <- resolve_upload_name_at(page_pid, store_id, name_str),
          :ok <- Server.cancel_upload(page_pid, store_id, name, ref) do
@@ -141,10 +131,9 @@ defmodule Musubi.Transport.ConnectionChannel do
   end
 
   def handle_in("upload_error", payload, %Phoenix.Socket{} = socket) when is_map(payload) do
-    with {:ok, root_id} <- fetch_string(payload, "root_id"),
-         {:ok, name_str} <- fetch_string(payload, "name"),
+    with {:ok, name_str} <- fetch_string(payload, "name"),
          {:ok, ref} <- fetch_string(payload, "ref"),
-         {:ok, page_pid} <- fetch_root_pid(socket, root_id),
+         {:ok, page_pid} <- fetch_root_pid(socket),
          store_id <- normalize_store_id(Map.get(payload, "store_id", [])),
          {:ok, name} <- resolve_upload_name_at(page_pid, store_id, name_str),
          error <- build_client_error(payload),
@@ -156,10 +145,9 @@ defmodule Musubi.Transport.ConnectionChannel do
   end
 
   def handle_in("upload_progress", payload, %Phoenix.Socket{} = socket) when is_map(payload) do
-    with {:ok, root_id} <- fetch_string(payload, "root_id"),
-         {:ok, name_str} <- fetch_string(payload, "name"),
+    with {:ok, name_str} <- fetch_string(payload, "name"),
          {:ok, ref} <- fetch_string(payload, "ref"),
-         {:ok, page_pid} <- fetch_root_pid(socket, root_id),
+         {:ok, page_pid} <- fetch_root_pid(socket),
          store_id <- normalize_store_id(Map.get(payload, "store_id", [])),
          {:ok, name} <- resolve_upload_name_at(page_pid, store_id, name_str),
          progress <- normalize_progress(payload),
@@ -188,7 +176,7 @@ defmodule Musubi.Transport.ConnectionChannel do
   @impl Phoenix.Channel
   @spec terminate(term(), Phoenix.Socket.t()) :: :ok
   def terminate(reason, %Phoenix.Socket{} = socket) do
-    roots = mounted_roots(socket)
+    root = Map.get(socket.assigns, @root_key)
     topic = Map.get(socket.assigns, @topic_key)
     socket_module = Map.get(socket.assigns, @socket_module_key)
 
@@ -197,55 +185,17 @@ defmodule Musubi.Transport.ConnectionChannel do
       %{system_time: System.system_time()},
       %{
         module: socket_module,
-        id: nil,
+        id: root && root.root_id,
         topic: topic,
         reason: reason,
-        page_pid: nil,
-        root_count: map_size(roots)
+        page_pid: root && root.pid,
+        root_count: if(root, do: 1, else: 0)
       }
     )
 
-    Enum.each(roots, fn {_root_id, root_entry} ->
-      stop_root(root_entry.pid, reason)
-    end)
+    if root, do: stop_root(root.pid, reason)
 
     :ok
-  end
-
-  # Dispatch a mount request to either the fresh-start or the alias path
-  # depending on whether `mounted_roots[root_id]` already has an entry.
-  @spec handle_mount(Phoenix.Socket.t(), String.t(), module(), map()) ::
-          {:reply, {:ok, map()} | {:error, map()}, Phoenix.Socket.t()}
-  defp handle_mount(%Phoenix.Socket{} = socket, root_id, root_module, params) do
-    case Map.get(mounted_roots(socket), root_id) do
-      nil -> start_fresh_root(socket, root_id, root_module, params)
-      _existing -> reply_already_mounted(socket, root_id)
-    end
-  end
-
-  @spec start_fresh_root(Phoenix.Socket.t(), String.t(), module(), map()) ::
-          {:reply, {:ok, map()} | {:error, map()}, Phoenix.Socket.t()}
-  defp start_fresh_root(%Phoenix.Socket{} = socket, root_id, root_module, params) do
-    case start_root_page(root_module, root_id, params, socket) do
-      {:ok, page_pid} ->
-        entry = %{pid: page_pid, module: root_module}
-        socket = update_mounted_roots(socket, &Map.put(&1, root_id, entry))
-        {:reply, {:ok, %{"root_id" => root_id}}, socket}
-
-      {:error, reason} ->
-        {:reply, {:error, %{reason: error_reason(reason)}}, socket}
-    end
-  end
-
-  # The (module, caller_id) pair is already mounted on this connection.
-  # Reply with the canonical root_id so the client can alias to its local
-  # RootConnection without spinning up a second server entry. The
-  # `"already_mounted"` reason is a structured signal the client treats as
-  # an alias hint, not as a hard error.
-  @spec reply_already_mounted(Phoenix.Socket.t(), String.t()) ::
-          {:reply, {:error, map()}, Phoenix.Socket.t()}
-  defp reply_already_mounted(%Phoenix.Socket{} = socket, root_id) do
-    {:reply, {:error, %{"reason" => "already_mounted", "root_id" => root_id}}, socket}
   end
 
   @spec fetch_socket_module(Phoenix.Socket.t()) :: {:ok, module()} | {:error, :missing_socket}
@@ -270,12 +220,10 @@ defmodule Musubi.Transport.ConnectionChannel do
     end
   end
 
-  # Connection-wide wire root_id composes the declared module string with the
-  # caller-supplied id so two roots of different modules can share one caller
-  # id on a single connection without colliding in `mounted_roots` or the
-  # patch envelope. The composed string is opaque to downstream consumers —
-  # they receive it back in the mount reply and round-trip it on subsequent
-  # `unmount` / `command` / `patch` payloads.
+  # The wire root_id composes the declared module string with the caller-supplied
+  # id so two roots of different modules can share one caller id without
+  # colliding. It is opaque to downstream consumers — they receive it back in the
+  # join reply and round-trip it in the patch envelope.
   @spec compose_root_id(String.t(), String.t()) :: String.t()
   defp compose_root_id(module_str, caller_id)
        when is_binary(module_str) and is_binary(caller_id) do
@@ -290,13 +238,10 @@ defmodule Musubi.Transport.ConnectionChannel do
     end
   end
 
-  @spec fetch_declared_root(Phoenix.Socket.t(), String.t()) ::
-          {:ok, module()} | {:error, :unknown_root}
-  defp fetch_declared_root(%Phoenix.Socket{} = socket, module_str) when is_binary(module_str) do
-    socket.assigns
-    |> Map.fetch!(@socket_module_key)
-    |> Socket.fetch_root_by_module(module_str)
-    |> case do
+  @spec fetch_declared_root(module(), String.t()) :: {:ok, module()} | {:error, :unknown_root}
+  defp fetch_declared_root(socket_module, module_str)
+       when is_atom(socket_module) and is_binary(module_str) do
+    case Socket.fetch_root_by_module(socket_module, module_str) do
       {:ok, module} -> {:ok, module}
       :error -> {:error, :unknown_root}
     end
@@ -313,60 +258,36 @@ defmodule Musubi.Transport.ConnectionChannel do
     end
   end
 
-  @spec start_root_page(module(), String.t(), map(), Phoenix.Socket.t()) ::
-          {:ok, pid()} | {:error, :missing_connection_socket}
-  defp start_root_page(root_module, root_id, params, %Phoenix.Socket{} = socket)
-       when is_atom(root_module) and is_binary(root_id) and is_map(params) do
-    case Map.fetch(socket.assigns, @connection_socket_key) do
-      {:ok, %Socket{} = connection_socket} ->
-        root_socket =
-          Socket.inherit_context(connection_socket, %Socket{
-            assigns: connection_socket.assigns,
-            private: %{},
-            topic: Map.get(socket.assigns, @topic_key),
-            transport_pid: self()
-          })
+  @spec start_root_page(module(), String.t(), map(), Socket.t(), String.t()) ::
+          {:ok, pid()} | {:error, term()}
+  defp start_root_page(root_module, root_id, params, %Socket{} = connection_socket, topic)
+       when is_atom(root_module) and is_binary(root_id) and is_map(params) and is_binary(topic) do
+    root_socket =
+      Socket.inherit_context(connection_socket, %Socket{
+        assigns: connection_socket.assigns,
+        private: %{},
+        topic: topic,
+        transport_pid: self()
+      })
 
-        Server.start_link(
-          {root_module, params, root_socket, %{transport_pid: self(), root_id: root_id}}
-        )
+    Server.start_link(
+      {root_module, params, root_socket, %{transport_pid: self(), root_id: root_id}}
+    )
+  end
 
-      :error ->
-        {:error, :missing_connection_socket}
+  @spec fetch_root_pid(Phoenix.Socket.t()) :: {:ok, pid()} | {:error, :unknown_root}
+  defp fetch_root_pid(%Phoenix.Socket{} = socket) do
+    case Map.get(socket.assigns, @root_key) do
+      %{pid: pid} when is_pid(pid) -> {:ok, pid}
+      _other -> {:error, :unknown_root}
     end
-  end
-
-  @spec fetch_root_pid(Phoenix.Socket.t(), String.t()) :: {:ok, pid()} | {:error, :unknown_root}
-  defp fetch_root_pid(%Phoenix.Socket{} = socket, root_id) when is_binary(root_id) do
-    case fetch_root_entry(socket, root_id) do
-      {:ok, %{pid: pid}} when is_pid(pid) -> {:ok, pid}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @spec fetch_root_entry(Phoenix.Socket.t(), String.t()) ::
-          {:ok, %{pid: pid(), module: module()}} | {:error, :unknown_root}
-  defp fetch_root_entry(%Phoenix.Socket{} = socket, root_id) when is_binary(root_id) do
-    case Map.fetch(mounted_roots(socket), root_id) do
-      {:ok, root_entry} -> {:ok, root_entry}
-      :error -> {:error, :unknown_root}
-    end
-  end
-
-  @spec update_mounted_roots(Phoenix.Socket.t(), (map() -> map())) :: Phoenix.Socket.t()
-  defp update_mounted_roots(%Phoenix.Socket{} = socket, fun) when is_function(fun, 1) do
-    Phoenix.Socket.assign(socket, @mounted_roots_key, fun.(mounted_roots(socket)))
-  end
-
-  @spec mounted_roots(Phoenix.Socket.t()) :: map()
-  defp mounted_roots(%Phoenix.Socket{assigns: assigns}) do
-    Map.get(assigns, @mounted_roots_key, %{})
   end
 
   @spec stop_root(pid(), term()) :: :ok
   defp stop_root(pid, reason) when is_pid(pid) do
     # Page servers are started with `start_link/1`; unlink before controlled
-    # stops so unmounting one root does not terminate the connection channel.
+    # stops so stopping the root does not take down the connection channel via
+    # the link.
     Process.unlink(pid)
 
     if Process.alive?(pid) do
@@ -386,18 +307,7 @@ defmodule Musubi.Transport.ConnectionChannel do
     end
   end
 
-  @spec error_reason(
-          :invalid_params
-          | :missing_field
-          | :missing_root_id
-          | :missing_connection_socket
-          | :missing_socket
-          | :not_root_store
-          | :unauthorized
-          | :unknown_command
-          | :unknown_root
-          | :unknown_store
-        ) :: String.t()
+  @spec error_reason(term()) :: String.t()
   @spec resolve_upload_name_at(pid(), [String.t()], String.t()) ::
           {:ok, atom()} | {:error, :unknown_store | :unknown_upload}
   defp resolve_upload_name_at(page_pid, store_id, name_str)
@@ -468,4 +378,5 @@ defmodule Musubi.Transport.ConnectionChannel do
   defp error_reason(:unknown_root), do: "unknown root"
   defp error_reason(:unknown_store), do: "unknown store"
   defp error_reason(:unknown_upload), do: "unknown upload"
+  defp error_reason(_other), do: "internal error"
 end
