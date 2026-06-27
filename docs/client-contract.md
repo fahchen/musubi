@@ -111,8 +111,9 @@ type Connect = {
 }
 ```
 
-The default topic is `"musubi:connection"`. The client sends an empty channel join
-payload for the connection. Auth and transport-level data should come from
+The default base topic is `"musubi:connection"`. Each mounted root gets its own
+channel on `"<base>:<root_id>"` and joins it with the mount payload (join is the
+mount — see Wire Contract). Auth and transport-level data should come from
 Phoenix socket params/connect_info; root business params belong to `mountStore`.
 
 Root mount identity is:
@@ -151,59 +152,52 @@ type StoreNodeRef = {
 
 ## Wire Contract
 
-Mounting a declared root sends:
+One root store = one channel. Mounting a declared root opens a channel on topic
+`"<base>:<root_id>"` and joins it; the join payload is the mount:
 
 ```ts
-type MountMessage = {
+type JoinPayload = {
   module: string
   id: string
   params: Record<string, unknown>
 }
 ```
 
-The `id` field is the caller-supplied `MountStoreOptions.id`. The server
-composes the canonical wire root id as `"<module>:<caller-id>"` and
-returns it on the `:ok` mount reply under the `root_id` key. Every
-subsequent `unmount` / `command` / upload / `patch` message uses that
-server-assigned `root_id`. The client never composes the wire id itself
-— it round-trips whatever the server returned.
+`id` is the caller-supplied `MountStoreOptions.id`. The wire `root_id` is
+`"<module>:<id>"`, composed identically on both sides: the client builds it to
+form the topic, and the server composes the same value and returns it on the
+join `:ok` reply (`{ root_id }`) for confirmation. Composing on both module and
+caller id lets two roots of different modules share one caller-facing id on a
+connection without colliding.
 
-Composing on both module and caller id is what lets two roots of
-different modules share the same caller-facing id on one connection
-without colliding in the server's `mounted_roots` map. Duplicate
-detection is the server's responsibility.
+Joining **is** mounting: the server starts the root page server on join and
+emits the initial patch. Leaving the channel **is** unmounting: a client
+`leave()` (or a transport drop) stops that root via the channel's `terminate/2`.
+There are no separate `mount` / `unmount` messages.
 
-### Aliasing on duplicate `(module, id)`
+### Reconnect
 
-A second mount of the same `(module, id)` on one connection is a
-multi-observer scenario, not an error. The server replies with:
+Phoenix owns reconnect: after a drop it automatically re-joins each channel,
+which re-runs the server join and rebuilds that one root. The client drives
+recovery from the channel's own join reply — no socket-level reopen handling.
+The last-good snapshot keeps rendering until the rebuilt root's initial patch
+(`replace ""`) atomically swaps in.
 
-```json
-{ "reason": "already_mounted", "root_id": "<existing root id>" }
-```
+### Duplicate `(module, id)`
 
-…on the `:error` channel reply. The client looks the returned `root_id`
-up in its local `connectionState.roots` map and:
+A second `mountStore` of the same `(module, id)` is a multi-observer scenario,
+handled entirely client-side: it aliases the existing `RootConnection` (bumps a
+local `refCount`, returns the same `StoreProxy`), without opening a second
+channel or any server round-trip. The last release (refCount → 0) schedules a
+brief grace timer before leaving the channel; a remount within the window
+cancels it and reuses the mount — covers React 19 route-swap commit batching and
+StrictMode effect replay.
 
-- **Hit**: bumps the existing `RootConnection`'s local `refCount`,
-  cancels any pending grace-timer teardown, discards the tentative
-  connection it built before the mount push, and returns the canonical
-  one. The aliased caller shares the same `StoreProxy`. The server
-  never starts a second page runtime.
-- **Miss**: throws `MusubiInconsistencyError`. The server claims a
-  mount that the client has no record of (reconnect race, dropped
-  unmount, server-side leak); fail loud rather than fabricate state.
-
-The last `unmount` (refCount → 0) schedules a brief grace timer instead
-of pushing immediately. A remount of the same `(module, id)` within the
-grace window cancels the timer and reuses the existing mount — covers
-React 19 route-swap commit batching and StrictMode effect replay.
-
-Commands target mounted stores by `root_id` plus `store_id`:
+Commands target a store within the channel's root by `store_id` (one root per
+channel, so no `root_id` on the wire):
 
 ```ts
 type CommandMessage = {
-  root_id: string
   store_id: StoreId
   name: string
   payload: Record<string, unknown>
@@ -262,8 +256,8 @@ Envelope rules:
 - each later envelope must apply to the client's current version
 - idle render cycles emit no envelope
 - reconnect creates a fresh page runtime and fresh version sequence
-- in connection transport, every patch envelope includes `root_id`; the client
-  applies it only to the matching mounted root runtime
+- each channel carries one root; the patch envelope still includes `root_id`
+  (matching that channel's root) for envelope symmetry
 - stream placement paths contain `WireStreamMarker` objects in `ops`
 - stream contents move through `stream_ops`
 
