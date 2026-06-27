@@ -163,7 +163,8 @@ function controllablePersister(durable = false): MusubiCachePersister & {
   }
 }
 
-// Drive one open connection through join + the first mount's initial patch.
+// Drive one mount through its per-root channel join (join IS the mount) + the
+// initial patch.
 async function mountInitial(
   socket: MockSocket,
   connection: Awaited<ReturnType<typeof openConn>>,
@@ -174,15 +175,15 @@ async function mountInitial(
     counter?: number
   }
 ) {
-  const channel = lastChannel(socket)
   const mountedPromise = connection.mountStore({
     module: "Test.Store",
     id: opts.id,
     ...(opts.cache !== undefined ? { cache: opts.cache } : {})
   })
   await Promise.resolve()
+  const channel = lastChannel(socket)
   const rootId = `Test.Store:${opts.id}`
-  lastPush(channel).push.resolve("ok", { root_id: rootId })
+  channel.resolveJoin({ root_id: rootId })
   await Promise.resolve()
   channel.emit("patch", initialEnvelope(rootId, opts.title ?? "Inbox", opts.counter ?? 1))
   return mountedPromise
@@ -190,26 +191,20 @@ async function mountInitial(
 
 async function openConn(socket: MockSocket) {
   const { connect } = await import("../src/connect")
-  const promise = connect<TestStores>(socket)
-  lastChannel(socket).resolveJoin()
-  return promise
+  // No connection channel — `connect` resolves immediately; per-root channels
+  // join lazily on `mountStore`.
+  return connect<TestStores>(socket)
 }
 
 const nextTask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
 
-// Release the last handle and settle the deferred server `unmount` push so the
-// returned promise resolves. The grace timer (0ms) fires on the next task,
-// flushes the cache writer, then emits the unmount push.
+// Release the last handle and let the grace timer (0ms) fire on the next task,
+// which flushes the cache writer and leaves the root's channel.
 async function unmountAndSettle(
-  socket: MockSocket,
   mounted: { unmount: () => Promise<void> }
 ): Promise<void> {
   const done = mounted.unmount()
   await nextTask()
-  const push = lastChannel(socket).pushes.at(-1)
-  if (push && push.event === "unmount") {
-    push.push.resolve("ok", {})
-  }
   await done
 }
 
@@ -222,7 +217,6 @@ describe("client store cache", () => {
   test("cold mount with cache enabled stays loading until the initial patch (fromCache false)", async () => {
     const socket = new MockSocket()
     const connection = await openConn(socket)
-    const channel = lastChannel(socket)
 
     const mountedPromise = connection.mountStore({
       module: "Test.Store",
@@ -230,12 +224,13 @@ describe("client store cache", () => {
       cache: {}
     })
     await Promise.resolve()
+    const channel = lastChannel(socket)
     let resolved = false
     void mountedPromise.then(() => {
       resolved = true
     })
 
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha" })
+    channel.resolveJoin({ root_id: "Test.Store:alpha" })
     await Promise.resolve()
     expect(resolved).toBe(false)
 
@@ -249,12 +244,11 @@ describe("client store cache", () => {
   test("re-mount of a cached identity seeds stale data before any patch, then swaps", async () => {
     const socket = new MockSocket()
     const connection = await openConn(socket)
-    const channel = lastChannel(socket)
 
     const firstMounted = await mountInitial(socket, connection, { id: "alpha", cache: {} })
 
     // Teardown flushes the throttled write into the (default memory) cache.
-    await unmountAndSettle(socket, firstMounted)
+    await unmountAndSettle(firstMounted)
 
     const secondPromise = connection.mountStore({
       module: "Test.Store",
@@ -262,9 +256,9 @@ describe("client store cache", () => {
       cache: {}
     })
     await Promise.resolve()
-    const remountPush = lastPush(channel)
-    expect(remountPush.event).toBe("mount")
-    remountPush.push.resolve("ok", { root_id: "Test.Store:alpha" })
+    // The re-mount opens a fresh per-root channel; its join IS the mount.
+    const channel = lastChannel(socket)
+    channel.resolveJoin({ root_id: "Test.Store:alpha" })
 
     // Resolves from cache BEFORE the live initial patch arrives.
     const secondMounted = await secondPromise
@@ -294,7 +288,6 @@ describe("client store cache", () => {
 
     const socket = new MockSocket()
     const connection = await openConn(socket)
-    const channel = lastChannel(socket)
 
     const mountedPromise = connection.mountStore({
       module: "Test.Store",
@@ -302,11 +295,12 @@ describe("client store cache", () => {
       cache: { persister, gcTime: 1000 }
     })
     await Promise.resolve()
+    const channel = lastChannel(socket)
     let resolved = false
     void mountedPromise.then(() => {
       resolved = true
     })
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha" })
+    channel.resolveJoin({ root_id: "Test.Store:alpha" })
     await nextTask()
 
     // Stale entry discarded → no seed → still loading.
@@ -328,7 +322,6 @@ describe("client store cache", () => {
 
     const socket = new MockSocket()
     const connection = await openConn(socket)
-    const channel = lastChannel(socket)
 
     const mountedPromise = connection.mountStore({
       module: "Test.Store",
@@ -336,11 +329,12 @@ describe("client store cache", () => {
       cache: { persister, buster: "v2" }
     })
     await Promise.resolve()
+    const channel = lastChannel(socket)
     let resolved = false
     void mountedPromise.then(() => {
       resolved = true
     })
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha" })
+    channel.resolveJoin({ root_id: "Test.Store:alpha" })
     await nextTask()
 
     expect(resolved).toBe(false)
@@ -353,14 +347,14 @@ describe("client store cache", () => {
   test("commands dispatched in the stale window queue until revalidation lands", async () => {
     const socket = new MockSocket()
     const connection = await openConn(socket)
-    const channel = lastChannel(socket)
 
     const firstMounted = await mountInitial(socket, connection, { id: "alpha", cache: {} })
-    await unmountAndSettle(socket, firstMounted)
+    await unmountAndSettle(firstMounted)
 
     const secondPromise = connection.mountStore({ module: "Test.Store", id: "alpha", cache: {} })
     await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha" })
+    const channel = lastChannel(socket)
+    channel.resolveJoin({ root_id: "Test.Store:alpha" })
     const secondMounted = await secondPromise
     expect(secondMounted.fromCache).toBe(true)
 
@@ -384,14 +378,13 @@ describe("client store cache", () => {
   test("a queued command rejects if the connection disconnects before revalidation", async () => {
     const socket = new MockSocket()
     const connection = await openConn(socket)
-    const channel = lastChannel(socket)
 
     const firstMounted = await mountInitial(socket, connection, { id: "alpha", cache: {} })
-    await unmountAndSettle(socket, firstMounted)
+    await unmountAndSettle(firstMounted)
 
     const secondPromise = connection.mountStore({ module: "Test.Store", id: "alpha", cache: {} })
     await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha" })
+    lastChannel(socket).resolveJoin({ root_id: "Test.Store:alpha" })
     const secondMounted = await secondPromise
 
     const replyPromise = secondMounted.store.dispatchCommand("rename", { title: "Doomed" })
@@ -417,7 +410,6 @@ describe("client store cache", () => {
 
     const socket = new MockSocket()
     const connection = await openConn(socket)
-    const channel = lastChannel(socket)
 
     const firstMounted = await mountInitial(socket, connection, {
       id: "alpha",
@@ -428,7 +420,7 @@ describe("client store cache", () => {
     expect(backing.size).toBe(0)
 
     // Teardown flushes the pending write into storage.
-    await unmountAndSettle(socket, firstMounted)
+    await unmountAndSettle(firstMounted)
     expect(backing.size).toBe(1)
 
     // Re-mount restores from storage before the live patch.
@@ -438,7 +430,7 @@ describe("client store cache", () => {
       cache: { persister, buster: "v1" }
     })
     await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha" })
+    lastChannel(socket).resolveJoin({ root_id: "Test.Store:alpha" })
     const secondMounted = await secondPromise
     expect(secondMounted.fromCache).toBe(true)
     expect(secondMounted.store.title).toBe("Inbox")
@@ -464,7 +456,7 @@ describe("client store cache", () => {
       cache: { persister, buster: "v1" }
     })
     // Flush the throttled write (which throws inside setItem → caught).
-    await unmountAndSettle(socket, mounted)
+    await unmountAndSettle(mounted)
 
     expect(warnSpy).toHaveBeenCalledWith(
       "[musubi] cache persist failed (quota / serialization):",
@@ -478,7 +470,6 @@ describe("client store cache", () => {
 
     const socket = new MockSocket()
     const connection = await openConn(socket)
-    const channel = lastChannel(socket)
 
     const mountedPromise = connection.mountStore({
       module: "Test.Store",
@@ -486,9 +477,10 @@ describe("client store cache", () => {
       cache: { persister }
     })
     await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha" })
+    const channel = lastChannel(socket)
+    channel.resolveJoin({ root_id: "Test.Store:alpha" })
     await Promise.resolve()
-    lastChannel(socket).emit("patch", initialEnvelope("Test.Store:alpha"))
+    channel.emit("patch", initialEnvelope("Test.Store:alpha"))
     await mountedPromise
 
     expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("durable cache persister"))).toBe(
@@ -501,7 +493,6 @@ describe("client store cache", () => {
 
     const socket = new MockSocket()
     const connection = await openConn(socket)
-    const channel = lastChannel(socket)
 
     const mountedPromise = connection.mountStore({
       module: "Test.Store",
@@ -509,7 +500,8 @@ describe("client store cache", () => {
       cache: { persister, initialData: { title: "Seeded", counter: 0, __musubi_store_id__: [] } }
     })
     await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha" })
+    const channel = lastChannel(socket)
+    channel.resolveJoin({ root_id: "Test.Store:alpha" })
 
     const mounted = await mountedPromise
     expect(mounted.fromCache).toBe(true)
@@ -534,7 +526,7 @@ describe("client store cache", () => {
       id: "alpha",
       cache: { persister }
     })
-    await unmountAndSettle(socket, mounted)
+    await unmountAndSettle(mounted)
     expect(persister.store.has("alpha|Test.Store|null")).toBe(true)
 
     await connection.clearStoreCache({ module: "Test.Store", id: "alpha" })

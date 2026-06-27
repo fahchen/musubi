@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
 import type { PatchEnvelope, ConnectionPatchEnvelope, SnapshotValue } from "../src/types"
+import type { MountedStore, MusubiConnection } from "../src/connect"
 
 type PushStatus = "ok" | "error" | "timeout"
 type PushCallback = (payload: unknown) => void
@@ -71,8 +72,15 @@ class MockChannel {
     }
   }
 
+  // Resolve the join push with `:ok`. Phoenix re-fires the joinPush receive
+  // hooks on every (re)join, so calling this more than once models a reconnect
+  // rejoin on the same channel object.
   resolveJoin(payload: unknown = {}): void {
     this.joinPush.resolve("ok", payload)
+  }
+
+  failJoin(payload: unknown = {}): void {
+    this.joinPush.resolve("error", payload)
   }
 
   emit(event: string, payload: unknown): void {
@@ -81,6 +89,9 @@ class MockChannel {
     }
   }
 
+  // Transport drop: Phoenix fires the channel `onError` (state → errored) and
+  // schedules a rejoin. We model the drop as `onClose` here — the runtime treats
+  // both the same (keep last-good, await rejoin).
   disconnect(reason: unknown): void {
     for (const callback of this.closeHandlers) {
       callback(reason)
@@ -100,34 +111,12 @@ class MockSocket {
   readonly channels: MockChannel[] = []
   connected = false
 
-  private readonly openHandlers: Array<() => void> = []
-
   constructor(_url?: string, _options?: unknown) {
     MockSocket.instances.push(this)
   }
 
   connect(): void {
     this.connected = true
-  }
-
-  onOpen(callback: () => void): void {
-    this.openHandlers.push(callback)
-  }
-
-  // Simulate Phoenix re-opening the transport after a drop.
-  simulateReopen(): void {
-    this.connected = true
-    for (const callback of this.openHandlers) {
-      callback()
-    }
-  }
-
-  disconnect(): void {
-    this.connected = false
-
-    for (const channel of this.channels) {
-      channel.disconnect({ reason: "socket closed" })
-    }
   }
 
   channel(topic: string, payload?: unknown): MockChannel {
@@ -204,48 +193,35 @@ describe("connect", () => {
     vi.resetModules()
   })
 
-  test("joins one Musubi connection channel", async () => {
+  test("connect opens the transport and resolves without joining a channel", async () => {
     const { connect } = await import("../src/connect")
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
+    const connection = await connect<TestStores>(socket)
 
-    const channel = lastChannel(socket)
-    expect(channel.joinPayload).toEqual({})
+    // No connection-level channel — each root channel joins lazily on mount.
     expect(socket.connected).toBe(true)
-
-    channel.resolveJoin()
-
-    const connection = await connectionPromise
-    expect(channel.topic).toBe("musubi:connection")
+    expect(socket.channels.length).toBe(0)
     expect(connection).toBeTruthy()
   })
 
   test("mountStore requires an explicit id at compile time", async () => {
     const { connect } = await import("../src/connect")
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
+    const connection = await connect<TestStores>(socket)
 
     if (false) {
       // @ts-expect-error -- id is required
       void connection.mountStore({ module: "Test.Store" })
     }
 
-    expect(channel.topic).toBe("musubi:connection")
     expect(connection).toBeTruthy()
   })
 
-  test("mountStore resolves only after the root initial envelope is applied", async () => {
-    const { connect } = await import("../src/connect")
+  test("mountStore joins a per-root channel and resolves only after the initial envelope", async () => {
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-    let resolved = false
+    const connection = await openConnection(socket)
 
+    let resolved = false
     const mountedPromise = connection.mountStore({
       module: "Test.Store",
       id: "alpha-1",
@@ -253,19 +229,19 @@ describe("connect", () => {
     })
     await Promise.resolve()
 
-    void mountedPromise.then(() => {
-      resolved = true
-    })
-
-    const mountPush = lastPush(channel)
-    expect(mountPush.event).toBe("mount")
-    expect(mountPush.payload).toEqual({
+    const channel = lastChannel(socket)
+    expect(channel.topic).toBe("musubi:connection:Test.Store:alpha-1")
+    expect(channel.joinPayload).toEqual({
       module: "Test.Store",
       id: "alpha-1",
       params: { room_id: "general" }
     })
 
-    mountPush.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+    void mountedPromise.then(() => {
+      resolved = true
+    })
+
+    channel.resolveJoin({ root_id: "Test.Store:alpha-1" })
     await Promise.resolve()
     expect(resolved).toBe(false)
 
@@ -278,56 +254,25 @@ describe("connect", () => {
   })
 
   test("nested store field returns a stable child proxy", async () => {
-    const { connect } = await import("../src/connect")
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "alpha-1"
-    })
-    await Promise.resolve()
+    const connection = await openConnection(socket)
+    const { mounted } = await mountRoot(socket, connection, { id: "alpha-1" })
 
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-
-
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
-
-    const { store: proxy } = await mountedPromise
-
-    expect(proxy.child).toBe(proxy.child)
-    expect(proxy.child.count).toBe(1)
+    expect(mounted.store.child).toBe(mounted.store.child)
+    expect(mounted.store.child.count).toBe(1)
   })
 
-  test("dispatchCommand sends root_id with the command", async () => {
-    const { connect } = await import("../src/connect")
+  test("dispatchCommand pushes the command on the root channel without a root_id", async () => {
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "alpha-1"
-    })
-    await Promise.resolve()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1" })
 
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-
-
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
-
-    const { store: proxy } = await mountedPromise
-    const replyPromise = proxy.dispatchCommand("rename", { title: "Outbox" })
+    const replyPromise = mounted.store.dispatchCommand("rename", { title: "Outbox" })
 
     const commandPush = lastPush(channel)
     expect(commandPush.event).toBe("command")
+    // One root per channel — the command no longer carries a `root_id`.
     expect(commandPush.payload).toEqual({
-      root_id: "Test.Store:alpha-1",
       store_id: [],
       name: "rename",
       payload: { title: "Outbox" }
@@ -337,405 +282,124 @@ describe("connect", () => {
     await expect(replyPromise).resolves.toEqual({ ok: true })
   })
 
-  test("patches are routed by root_id", async () => {
-    const { connect } = await import("../src/connect")
+  test("distinct roots get distinct channels and patches route per channel", async () => {
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
+    const connection = await openConnection(socket)
 
-    const alphaMountedPromise = connection.mountStore({
-      module: "Test.Store",
+    const { mounted: alpha, channel: alphaChannel } = await mountRoot(socket, connection, {
       id: "alpha-1"
     })
-    await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
-    const { store: alpha } = await alphaMountedPromise
-
-    const betaMountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "beta-1"
+    const { mounted: beta, channel: betaChannel } = await mountRoot(socket, connection, {
+      id: "beta-1",
+      title: "Secondary"
     })
-    await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:beta-1" })
 
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:beta-1", rootState("Secondary")))
-    const { store: beta } = await betaMountedPromise
+    expect(alphaChannel).not.toBe(betaChannel)
+    expect(socket.channels.length).toBe(2)
 
     const alphaListener = vi.fn()
     const betaListener = vi.fn()
-    alpha.subscribe(alphaListener)
-    beta.subscribe(betaListener)
+    alpha.store.subscribe(alphaListener)
+    beta.store.subscribe(betaListener)
 
-    channel.emit(
+    betaChannel.emit(
       "patch",
-      connectionEnvelope(
-        "Test.Store:beta-1",
-        1,
-        2,
-        [{ op: "replace", path: "/counter", value: 9 }],
-        []
-      )
+      connectionEnvelope("Test.Store:beta-1", 1, 2, [{ op: "replace", path: "/counter", value: 9 }], [])
     )
 
-    expect(alpha.counter).toBe(1)
-    expect(beta.counter).toBe(9)
+    expect(alpha.store.counter).toBe(1)
+    expect(beta.store.counter).toBe(9)
     expect(alphaListener).not.toHaveBeenCalled()
     expect(betaListener).toHaveBeenCalledTimes(1)
   })
 
-  test("mountStore reuses the existing root for duplicate ids in one connection", async () => {
-    const { connect } = await import("../src/connect")
+  test("distinct modules sharing one caller id get distinct channels and roots", async () => {
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
+    const connection = await openConnection(socket)
 
-    const firstPromise = connection.mountStore({
+    const { mounted: store, channel: storeChannel } = await mountRoot(socket, connection, {
       module: "Test.Store",
-      id: "shared-root"
-    })
-    await Promise.resolve()
-    const firstPushCount = channel.pushes.length
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared-root" })
-
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:shared-root", rootState()))
-    await firstPromise
-
-    // No client-side prediction: the second mount for the same (module, id)
-    // hits the wire; the server replies with :already_mounted carrying the
-    // canonical root_id; the client aliases to the existing RootConnection
-    // and bumps the shared refCount. Multi-observer ergonomic — both
-    // callers share one server mount and one StoreProxy.
-    const firstMounted = await firstPromise
-    const secondPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "shared-root"
-    })
-    await Promise.resolve()
-    expect(channel.pushes.length).toBe(firstPushCount + 1)
-    const secondMountPush = lastPush(channel)
-    expect(secondMountPush.event).toBe("mount")
-    secondMountPush.push.resolve("error", {
-      reason: "already_mounted",
-      root_id: "Test.Store:shared-root"
+      id: "shared"
     })
 
-    const secondMounted = await secondPromise
-    expect(secondMounted.store).toBe(firstMounted.store)
-    // No second initial-patch envelope is required; aliased caller reuses
-    // the existing connection's data tree.
-  })
-
-  test("mountStore throws MusubiInconsistencyError when server says already_mounted but client has no record", async () => {
-    const { connect } = await import("../src/connect")
-    const { MusubiInconsistencyError } = await import("../src/runtime")
-    const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "orphan"
-    })
+    const otherPromise = connection.mountStore({ module: "Test.Other", id: "shared" })
     await Promise.resolve()
-    const mountPush = lastPush(channel)
-    // Server claims an entry exists for a root_id the client has never seen
-    // — out-of-sync state, not a legitimate alias case. Client must throw,
-    // not silently fabricate an entry.
-    mountPush.push.resolve("error", {
-      reason: "already_mounted",
-      root_id: "Test.Store:phantom"
-    })
-
-    await expect(mountedPromise).rejects.toBeInstanceOf(MusubiInconsistencyError)
-  })
-
-  test("the last unmount fires the server push only after the grace timer; an in-window remount cancels it", async () => {
-    const { connect } = await import("../src/connect")
-    const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-
-    const firstPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "shared-root"
-    })
+    const otherChannel = lastChannel(socket)
+    expect(otherChannel).not.toBe(storeChannel)
+    expect(otherChannel.topic).toBe("musubi:connection:Test.Other:shared")
+    otherChannel.resolveJoin({ root_id: "Test.Other:shared" })
     await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared-root" })
-    await Promise.resolve()
-    channel.emit(
+    otherChannel.emit(
       "patch",
-      initialConnectionEnvelope("Test.Store:shared-root", rootState())
+      connectionEnvelope("Test.Other:shared", 0, 1, [{ op: "replace", path: "", value: { label: "other" } }], [])
     )
-    const firstMounted = await firstPromise
+    await otherPromise
 
-    const pushCountBefore = channel.pushes.length
-
-    // Last caller unmounts. The grace timer is scheduled but hasn't fired
-    // yet — no unmount push on the wire.
-    void firstMounted.unmount()
-    expect(channel.pushes.length).toBe(pushCountBefore)
-
-    // In-window remount: server replies :already_mounted with the same
-    // root_id (server never tore down because the unmount push never went
-    // out), client aliases back to the same RootConnection, the pending
-    // grace timer is cancelled.
-    const secondPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "shared-root"
-    })
-    await Promise.resolve()
-    const secondMountPush = lastPush(channel)
-    expect(secondMountPush.event).toBe("mount")
-    secondMountPush.push.resolve("error", {
-      reason: "already_mounted",
-      root_id: "Test.Store:shared-root"
-    })
-    const secondMounted = await secondPromise
-    expect(secondMounted.store).toBe(firstMounted.store)
-
-    // Let the original grace timer would-have-fired tick pass; no unmount
-    // push should be emitted because refCount went back to 1 before the
-    // timer ran.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-    const unmountPushes = channel.pushes.filter((p) => p.event === "unmount")
-    expect(unmountPushes.length).toBe(0)
-  })
-
-  test("an orphaned root after grace-timer skip + failed pending mount re-arms teardown", async () => {
-    // Variant of the alias-deferred race: timer skipped teardown
-    // because a pending mount existed, but that mount then settles
-    // with `:error` (server returned an unrelated failure). Without
-    // re-arming, the prior root would leak at refCount=0 forever.
-    const { connect } = await import("../src/connect")
-    const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-
-    const firstPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "shared"
-    })
-    await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared" })
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:shared", rootState()))
-    const firstMounted = await firstPromise
-
-    void firstMounted.unmount()
-    const secondPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "shared"
-    })
-    await Promise.resolve()
-    const secondMountPush = lastPush(channel)
-    expect(secondMountPush.event).toBe("mount")
-
-    // Grace timer fires, sees pending mount, skips teardown.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-    expect(channel.pushes.filter((p) => p.event === "unmount").length).toBe(0)
-
-    // Pending mount FAILS (not :already_mounted) — leaves the
-    // original root orphaned at refCount=0.
-    secondMountPush.push.resolve("error", { reason: "params must be a map" })
-    await expect(secondPromise).rejects.toThrow(/Root mount failed/)
-
-    // `mountConnectionRoot`'s finally re-armed teardown for the
-    // orphaned root. Let the new grace timer fire.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-    const unmountPushes = channel.pushes.filter((p) => p.event === "unmount")
-    expect(unmountPushes.length).toBe(1)
-    expect(unmountPushes[0]!.payload).toEqual({ root_id: "Test.Store:shared" })
-  })
-
-  test("a grace timer firing while a remount push is in flight defers teardown and lets the alias succeed", async () => {
-    // Race: `mountConnectionRoot` issued a fresh push (whose reply
-    // will be `:already_mounted`), but the grace timer from a prior
-    // `unmount()` fires before the reply arrives. If the timer
-    // unconditionally tore the entry down, the alias path would hit
-    // `MusubiInconsistencyError`. The timer must skip teardown when
-    // a pending mount for the same `(module, callerId)` exists.
-    const { connect } = await import("../src/connect")
-    const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-
-    const firstPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "shared"
-    })
-    await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared" })
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:shared", rootState()))
-    const firstMounted = await firstPromise
-
-    // Last caller releases — grace timer scheduled.
-    void firstMounted.unmount()
-
-    // New caller starts a mount with the same (module, callerId);
-    // push goes out but the reply is held.
-    const secondPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "shared"
-    })
-    await Promise.resolve()
-    const remountPush = lastPush(channel)
-    expect(remountPush.event).toBe("mount")
-
-    // Let the grace timer fire — it must skip teardown because a
-    // mount with the same (module, callerId) is in `pendingMounts`.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-    expect(channel.pushes.filter((p) => p.event === "unmount").length).toBe(0)
-
-    // Server replies :already_mounted; alias path looks up the still-
-    // present `roots` entry, succeeds, returns the same proxy.
-    remountPush.push.resolve("error", {
-      reason: "already_mounted",
-      root_id: "Test.Store:shared"
-    })
-    const secondMounted = await secondPromise
-    expect(secondMounted.store).toBe(firstMounted.store)
-  })
-
-  test("distinct modules sharing one id get distinct server mounts and patches", async () => {
-    const { connect } = await import("../src/connect")
-    const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-
-    const firstPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "shared"
-    })
-    await Promise.resolve()
-    const firstMountPush = lastPush(channel)
-    expect(firstMountPush.event).toBe("mount")
-    // Server composes the canonical wire root id as `"<module>:<id>"` so
-    // distinct modules sharing one caller id get distinct roots end-to-end.
-    expect(firstMountPush.payload).toMatchObject({
-      module: "Test.Store",
-      id: "shared"
-    })
-    firstMountPush.push.resolve("ok", { root_id: "Test.Store:shared" })
-
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:shared", rootState()))
-    const first = await firstPromise
-
-    const secondPromise = connection.mountStore({
-      module: "Test.Other",
-      id: "shared"
-    })
-    await Promise.resolve()
-    const secondMountPush = lastPush(channel)
-    expect(secondMountPush.event).toBe("mount")
-    expect(secondMountPush.payload).toMatchObject({
-      module: "Test.Other",
-      id: "shared"
-    })
-    secondMountPush.push.resolve("ok", { root_id: "Test.Other:shared" })
-    await Promise.resolve()
-    channel.emit(
+    storeChannel.emit(
       "patch",
-      connectionEnvelope(
-        "Test.Other:shared",
-        0,
-        1,
-        [{ op: "replace", path: "", value: { label: "other" } }],
-        []
-      )
-    )
-    await secondPromise
-
-    channel.emit(
-      "patch",
-      connectionEnvelope(
-        "Test.Store:shared",
-        1,
-        2,
-        [{ op: "replace", path: "/counter", value: 7 }],
-        []
-      )
+      connectionEnvelope("Test.Store:shared", 1, 2, [{ op: "replace", path: "/counter", value: 7 }], [])
     )
 
-    expect(first.store.counter).toBe(7)
+    expect(store.store.counter).toBe(7)
   })
 
-  test("unmount sends the unmount push using the server-assigned root_id", async () => {
-    const { connect } = await import("../src/connect")
+  test("duplicate ids reuse the existing root without opening a second channel", async () => {
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
+    const connection = await openConnection(socket)
 
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "shared-root"
-    })
-    await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:shared-root" })
+    const { mounted: first } = await mountRoot(socket, connection, { id: "shared-root" })
+    expect(socket.channels.length).toBe(1)
 
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:shared-root", rootState()))
-    const mounted = await mountedPromise
+    // Client-side dedup: the second mount for the same (module, id) aliases the
+    // existing RootConnection synchronously — no second channel, no second join.
+    const second = await connection.mountStore({ module: "Test.Store", id: "shared-root" })
+    expect(second.store).toBe(first.store)
+    expect(socket.channels.length).toBe(1)
+  })
+
+  test("an in-window remount cancels the grace teardown and reuses the root", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted: first, channel } = await mountRoot(socket, connection, { id: "shared" })
+
+    // Last caller releases — grace timer scheduled (0ms) but not yet fired.
+    void first.unmount()
+    expect(channel.left).toBe(false)
+
+    // In-window remount: aliases the existing root, cancels the grace teardown.
+    const second = await connection.mountStore({ module: "Test.Store", id: "shared" })
+    expect(second.store).toBe(first.store)
+
+    // Let the grace timer's would-have-fired tick pass; the channel was never
+    // left because refCount went back to 1 before it ran.
+    await nextTask()
+    expect(channel.left).toBe(false)
+    expect(socket.channels.length).toBe(1)
+  })
+
+  test("the last unmount leaves the root channel and resets the runtime", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1" })
 
     const unmountPromise = mounted.unmount()
-    // Server unmount push fires after the grace timer (setTimeout 0), not
-    // synchronously. Wait one task for the timer to fire.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-    const unmountPush = lastPush(channel)
-    expect(unmountPush.event).toBe("unmount")
-    expect(unmountPush.payload).toEqual({ root_id: "Test.Store:shared-root" })
-
-    unmountPush.push.resolve("ok", {})
+    // Leaving the channel happens after the grace timer fires (next task).
+    await nextTask()
     await unmountPromise
 
+    expect(channel.left).toBe(true)
     expect(mounted.store.title).toBeUndefined()
+    await expect(mounted.store.dispatchCommand("rename", { title: "Gone" })).rejects.toThrow(
+      /Store is not connected/
+    )
   })
 
   test("snapshot returns a plain object tree", async () => {
-    const { connect } = await import("../src/connect")
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "alpha-1"
-    })
-    await Promise.resolve()
+    const connection = await openConnection(socket)
+    const { mounted } = await mountRoot(socket, connection, { id: "alpha-1" })
 
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-
-
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
-
-    const { store: proxy } = await mountedPromise
-    const snapshot = proxy.snapshot()
-
-    expect(snapshot).toEqual({
+    expect(mounted.store.snapshot()).toEqual({
       __musubi_store_id__: [],
       title: "Inbox",
       counter: 1,
@@ -748,19 +412,12 @@ describe("connect", () => {
   })
 
   test("stream markers resolve at nested paths", async () => {
-    const { connect } = await import("../src/connect")
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "alpha-1"
-    })
+    const connection = await openConnection(socket)
+    const mountedPromise = connection.mountStore({ module: "Test.Store", id: "alpha-1" })
     await Promise.resolve()
-
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
+    const channel = lastChannel(socket)
+    channel.resolveJoin({ root_id: "Test.Store:alpha-1" })
     await Promise.resolve()
     channel.emit(
       "patch",
@@ -815,216 +472,139 @@ describe("connect", () => {
     expect(proxy.metadata.messages).toBe("literal")
     expect(proxy.users).toEqual([{ id: "u1", name: "Ada" }])
     expect(proxy.snapshot()?.feed.messages).toEqual([{ body: "hello" }])
-    expect(proxy.snapshot()?.async_messages).toEqual({
-      status: "loading",
-      data: [{ id: "a1", body: "loaded" }],
-      error: null
-    })
-    expect(proxy.snapshot()?.metadata.messages).toBe("literal")
   })
 
-  test("unmount sends an unmount push and resets the root runtime", async () => {
-    const { connect } = await import("../src/connect")
+  test("disconnect leaves every root channel", async () => {
     const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "alpha-1"
-    })
-    await Promise.resolve()
-
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-
-
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
-
-    const { store: proxy, unmount } = await mountedPromise
-    const unmountPromise = unmount()
-    // Grace timer defers the server unmount push to the next task.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-    const unmountPush = lastPush(channel)
-
-    expect(unmountPush.event).toBe("unmount")
-    expect(unmountPush.payload).toEqual({ root_id: "Test.Store:alpha-1" })
-
-    unmountPush.push.resolve("ok", {})
-    await unmountPromise
-
-    expect(proxy.title).toBeUndefined()
-    await expect(proxy.dispatchCommand("rename", { title: "Gone" })).rejects.toThrow(
-      /Store is not connected/
-    )
-  })
-
-  test("disconnect leaves the connection channel", async () => {
-    const { connect } = await import("../src/connect")
-    const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
+    const connection = await openConnection(socket)
+    const { channel: alpha } = await mountRoot(socket, connection, { id: "alpha-1" })
+    const { channel: beta } = await mountRoot(socket, connection, { id: "beta-1" })
 
     await connection.disconnect()
 
+    expect(alpha.left).toBe(true)
+    expect(beta.left).toBe(true)
+  })
+
+  test("disconnect mid-join rejects mountStore promptly without an unhandled rejection", async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on("unhandledRejection", onUnhandled)
+
+    try {
+      const socket = new MockSocket()
+      const connection = await openConnection(socket)
+
+      const mountedPromise = connection.mountStore({ module: "Test.Store", id: "alpha-1" })
+      await Promise.resolve()
+      const channel = lastChannel(socket)
+      // Join not resolved yet — disconnect before the join reply lands.
+      await connection.disconnect()
+
+      await expect(mountedPromise).rejects.toThrow(/Disconnected/)
+      await nextTask()
+
+      expect(unhandled).toEqual([])
+      expect(channel.left).toBe(true)
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+    }
+  })
+
+  test("disconnect between join ok and initial patch rejects mountStore promptly", async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on("unhandledRejection", onUnhandled)
+
+    try {
+      const socket = new MockSocket()
+      const connection = await openConnection(socket)
+
+      const mountedPromise = connection.mountStore({ module: "Test.Store", id: "alpha-1" })
+      await Promise.resolve()
+      const channel = lastChannel(socket)
+      channel.resolveJoin({ root_id: "Test.Store:alpha-1" })
+      await Promise.resolve()
+
+      // Initial patch never arrives — disconnect now.
+      await connection.disconnect()
+
+      await expect(mountedPromise).rejects.toThrow(/Disconnected/)
+      await nextTask()
+
+      expect(unhandled).toEqual([])
+      expect(channel.left).toBe(true)
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+    }
+  })
+
+  test("keeps last-good on hard disconnect and recovers via the same channel's rejoin", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1", title: "Inbox" })
+
+    expect(mounted.store.snapshot()?.title).toBe("Inbox")
+    expect(socket.channels.length).toBe(1)
+
+    // Hard transport drop: channel onClose → keep last-good, version → 0.
+    channel.disconnect({ reason: "socket closed" })
+    expect(mounted.store.snapshot()?.title).toBe("Inbox")
+    expect(mounted.store.title).toBe("Inbox")
+
+    // Phoenix auto-rejoins the SAME channel object (no new channel) and re-fires
+    // the join("ok") hook; the server restarts the root and emits a fresh patch.
+    expect(socket.channels.length).toBe(1)
+    channel.resolveJoin({ root_id: "Test.Store:alpha-1" })
+    await Promise.resolve()
+    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Fresh")))
+    await Promise.resolve()
+
+    expect(mounted.store.snapshot()?.title).toBe("Fresh")
+    expect(mounted.store.title).toBe("Fresh")
+
+    // Commands work again after recovery.
+    const replyPromise = mounted.store.dispatchCommand("rename", { title: "X" })
+    const commandPush = lastPush(channel)
+    expect(commandPush.event).toBe("command")
+    commandPush.push.resolve("ok", { ok: true })
+    await expect(replyPromise).resolves.toEqual({ ok: true })
+  })
+
+  test("serves last-good snapshot through the version-mismatch recovery window", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1", title: "Inbox" })
+
+    expect(mounted.store.snapshot()?.title).toBe("Inbox")
+
+    // Version-mismatch patch → recovery leaves the diverged channel and joins a
+    // fresh one. Last-good keeps rendering through the window.
+    channel.emit(
+      "patch",
+      connectionEnvelope("Test.Store:alpha-1", 99, 100, [{ op: "replace", path: "/counter", value: 99 }], [])
+    )
+    await Promise.resolve()
+
     expect(channel.left).toBe(true)
+    expect(mounted.store.snapshot()?.title).toBe("Inbox")
+    expect(mounted.store.snapshot()?.counter).toBe(1)
+
+    const recoveryChannel = lastChannel(socket)
+    expect(recoveryChannel).not.toBe(channel)
+    recoveryChannel.resolveJoin({ root_id: "Test.Store:alpha-1" })
+    await Promise.resolve()
+    recoveryChannel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Fresh")))
+    await nextTask()
+
+    expect(mounted.store.snapshot()?.title).toBe("Fresh")
   })
 
-  test("unmount swallows server-side push failures so the consumer's release resolves", async () => {
-    // Server might return :error on the unmount push (already gone,
-    // unknown root, channel closing). Local state is already torn
-    // down by that point; surfacing the failure to the consumer's
-    // `await mounted.unmount()` is surprising and unactionable. The
-    // failure should log via `console.warn` and the consumer's
-    // promise should resolve.
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
-
-    try {
-      const { connect } = await import("../src/connect")
-      const socket = new MockSocket()
-      const connectionPromise = connect<TestStores>(socket)
-      const channel = lastChannel(socket)
-      channel.resolveJoin()
-      const connection = await connectionPromise
-
-      const mountedPromise = connection.mountStore({
-        module: "Test.Store",
-        id: "alpha-1"
-      })
-      await Promise.resolve()
-      lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-      await Promise.resolve()
-      channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
-      const mounted = await mountedPromise
-
-      const unmountPromise = mounted.unmount()
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
-      const unmountPush = lastPush(channel)
-      expect(unmountPush.event).toBe("unmount")
-
-      // Server replies :error.
-      unmountPush.push.resolve("error", { reason: "unknown root" })
-
-      // Consumer's promise still resolves cleanly.
-      await expect(unmountPromise).resolves.toBeUndefined()
-      expect(warnSpy).toHaveBeenCalledWith(
-        "[musubi] root unmount push failed:",
-        expect.any(Error)
-      )
-    } finally {
-      warnSpy.mockRestore()
-    }
-  })
-
-  test("disconnect mid-mount does not surface an unhandled rejection on the in-flight tentative", async () => {
-    // Disconnect rejects the tentative's `pendingConnect` so that if
-    // the mount push later returns `:ok`, the `:ok` branch's
-    // `await tentativeInitialPatch` immediately throws and surfaces
-    // the error to the mount caller. The
-    // `registerInitialPatchWaiter` pre-attached `.catch` shield
-    // prevents that rejection from surfacing as an unhandled
-    // `PromiseRejectionEvent` if no one is awaiting the promise yet.
-    // Node's `unhandledRejection` listener takes `(reason, promise)` —
-    // not a browser-style `PromiseRejectionEvent` — so the listener
-    // signature must match.
-    const unhandled: unknown[] = []
-    const onUnhandled = (reason: unknown): void => {
-      unhandled.push(reason)
-    }
-    process.on("unhandledRejection", onUnhandled)
-
-    try {
-      const { connect } = await import("../src/connect")
-      const socket = new MockSocket()
-      const connectionPromise = connect<TestStores>(socket)
-      const channel = lastChannel(socket)
-      channel.resolveJoin()
-      const connection = await connectionPromise
-
-      // Kick off a mount, then disconnect before the mount reply arrives.
-      const mountedPromise = connection.mountStore({
-        module: "Test.Store",
-        id: "alpha-1"
-      })
-      await Promise.resolve()
-      const mountPush = lastPush(channel)
-      expect(mountPush.event).toBe("mount")
-
-      await connection.disconnect()
-
-      // Even if a stale `:ok` reply lands after disconnect (mocked here),
-      // the mount caller must settle — not hang — because the tentative's
-      // initial-patch waiter was rejected by the disconnect handler.
-      mountPush.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-
-      await expect(mountedPromise).rejects.toThrow(/Disconnected/)
-
-      // Let any micro/macrotasks settle so an unhandled rejection would
-      // have surfaced by now.
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-      expect(unhandled).toEqual([])
-      expect(channel.left).toBe(true)
-    } finally {
-      process.off("unhandledRejection", onUnhandled)
-    }
-  })
-
-  test("disconnect between mount :ok and initial patch rejects mountStore promptly", async () => {
-    // Disconnect timing variant: server has already replied :ok and the
-    // tentative is in `connectionState.roots`, but the initial patch
-    // hasn't landed yet. Disconnect must surface to the mount caller
-    // through the `:ok` branch's `await tentativeInitialPatch`, not
-    // hang indefinitely.
-    const unhandled: unknown[] = []
-    const onUnhandled = (reason: unknown): void => {
-      unhandled.push(reason)
-    }
-    process.on("unhandledRejection", onUnhandled)
-
-    try {
-      const { connect } = await import("../src/connect")
-      const socket = new MockSocket()
-      const connectionPromise = connect<TestStores>(socket)
-      const channel = lastChannel(socket)
-      channel.resolveJoin()
-      const connection = await connectionPromise
-
-      const mountedPromise = connection.mountStore({
-        module: "Test.Store",
-        id: "alpha-1"
-      })
-      await Promise.resolve()
-
-      // Server replies :ok — `mountConnectionRoot` enters its `:ok` branch,
-      // inserts into `roots`, and starts awaiting the initial patch.
-      lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-      await Promise.resolve()
-
-      // Disconnect now — patch never arrives.
-      await connection.disconnect()
-
-      await expect(mountedPromise).rejects.toThrow(/Disconnected/)
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-      expect(unhandled).toEqual([])
-      expect(channel.left).toBe(true)
-    } finally {
-      process.off("unhandledRejection", onUnhandled)
-    }
-  })
-
-  test("recovery from version mismatch hitting :already_mounted disconnects cleanly", async () => {
-    // Pre-fix behaviour: `remountExistingConnection` threw on
-    // `:already_mounted`, which bubbled out of
-    // `recoverConnectionRootFromVersionMismatch` (invoked via
-    // `void recover...`) as an unhandled rejection AND left the
-    // connection waiting forever on `initialPatchPromise`. The fix
-    // catches the throw inside `recover`, force-disconnects, and logs.
-    // Node `unhandledRejection` listener signature is `(reason, promise)`.
+  test("version-mismatch recovery that fails to rejoin disconnects cleanly", async () => {
     const unhandled: unknown[] = []
     const onUnhandled = (reason: unknown): void => {
       unhandled.push(reason)
@@ -1033,245 +613,62 @@ describe("connect", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
 
     try {
-      const { connect } = await import("../src/connect")
       const socket = new MockSocket()
-      const connectionPromise = connect<TestStores>(socket)
-      const channel = lastChannel(socket)
-      channel.resolveJoin()
-      const connection = await connectionPromise
+      const connection = await openConnection(socket)
+      const { channel } = await mountRoot(socket, connection, { id: "alpha-1" })
 
-      const mountedPromise = connection.mountStore({
-        module: "Test.Store",
-        id: "alpha-1"
-      })
-      await Promise.resolve()
-      lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-      await Promise.resolve()
-      channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState()))
-      await mountedPromise
-
-      // Simulate a version-mismatch patch — base_version=99 != current 1.
-      // `handlePatch` schedules `recoverConnectionRootFromVersionMismatch`.
       channel.emit(
         "patch",
-        connectionEnvelope(
-          "Test.Store:alpha-1",
-          99,
-          100,
-          [{ op: "replace", path: "/counter", value: 99 }],
-          []
-        )
+        connectionEnvelope("Test.Store:alpha-1", 99, 100, [{ op: "replace", path: "/counter", value: 99 }], [])
       )
+      await Promise.resolve()
 
-      // Recovery's prologue pushes `unmount`; reply with :ok (entry was
-      // never really gone server-side — we simulate the stale case where
-      // the unmount push succeeds but the server still has the entry on
-      // the subsequent re-mount).
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
-      const unmountPush = lastPush(channel)
-      expect(unmountPush.event).toBe("unmount")
-      unmountPush.push.resolve("ok", {})
-      // Drain microtasks so recover continues into remountExistingConnection
-      // → ensureConnectionReady → pushMount (which fires the mount push).
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-      // Re-mount push arrives; reply with :already_mounted carrying the
-      // SAME root_id. This is the recovery-deadlock scenario.
-      const remountPush = lastPush(channel)
-      expect(remountPush.event).toBe("mount")
-      remountPush.push.resolve("error", {
-        reason: "already_mounted",
-        root_id: "Test.Store:alpha-1"
-      })
-
-      // Let recovery's catch run + disconnectConnectionState cascade
-      // (which leaves the channel and removes the runtime entry on top
-      // of clearing local state).
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      // The recreate join fails — recovery catches, force-disconnects, logs.
+      const recoveryChannel = lastChannel(socket)
+      expect(recoveryChannel).not.toBe(channel)
+      recoveryChannel.failJoin({ reason: "unauthorized" })
+      await nextTask()
 
       expect(unhandled).toEqual([])
-      // Connection state should be cleaned up: a follow-up command on
-      // the proxy now fails with "Store is not connected" because
-      // disconnect cleared the channel and reset state.
-      expect(errorSpy).toHaveBeenCalledWith(
-        "[musubi] root recovery failed:",
-        expect.any(Error)
-      )
-      // Channel was actually torn down (not just local state cleared).
-      expect(channel.left).toBe(true)
+      expect(errorSpy).toHaveBeenCalledWith("[musubi] root recovery failed:", expect.any(Error))
+      expect(recoveryChannel.left).toBe(true)
     } finally {
       errorSpy.mockRestore()
       process.off("unhandledRejection", onUnhandled)
     }
   })
-
-  test("serves last-good snapshot through the version-mismatch recovery window", async () => {
-    const { connect } = await import("../src/connect")
-    const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "alpha-1"
-    })
-    await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Inbox")))
-    const mounted = await mountedPromise
-
-    expect(mounted.store.snapshot()?.title).toBe("Inbox")
-
-    // Version-mismatch patch → schedules recovery (soft reset + remount).
-    channel.emit(
-      "patch",
-      connectionEnvelope(
-        "Test.Store:alpha-1",
-        99,
-        100,
-        [{ op: "replace", path: "/counter", value: 99 }],
-        []
-      )
-    )
-
-    // Recovery is parked awaiting the unmount reply. The index was NOT
-    // emptied, so the mounted proxy still serves the complete last-good
-    // snapshot rather than the bare stub that crashed consumers.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-    expect(mounted.store.snapshot()?.title).toBe("Inbox")
-    expect(mounted.store.snapshot()?.counter).toBe(1)
-
-    const unmountPush = lastPush(channel)
-    expect(unmountPush.event).toBe("unmount")
-    unmountPush.push.resolve("ok", {})
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    const remountPush = lastPush(channel)
-    expect(remountPush.event).toBe("mount")
-    remountPush.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    // Remount's initial patch atomically swaps in fresh state.
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Fresh")))
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    expect(mounted.store.snapshot()?.title).toBe("Fresh")
-  })
-
-  test("keeps last-good snapshot on hard disconnect and auto-remounts on reconnect", async () => {
-    const { connect } = await import("../src/connect")
-    const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "alpha-1"
-    })
-    await Promise.resolve()
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Inbox")))
-    const mounted = await mountedPromise
-
-    expect(mounted.store.snapshot()?.title).toBe("Inbox")
-
-    // Hard socket drop (channel onClose → handleConnectionDisconnect).
-    channel.disconnect({ reason: "socket closed" })
-
-    // A: the last-good snapshot stays complete and readable through the
-    // disconnected window instead of collapsing to a missing-snapshot stub.
-    expect(mounted.store.snapshot()?.title).toBe("Inbox")
-    expect(mounted.store.title).toBe("Inbox")
-
-    // B: socket re-opens → re-join the channel and auto-remount the live root.
-    socket.simulateReopen()
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    const reconnectChannel = lastChannel(socket)
-    expect(reconnectChannel).not.toBe(channel)
-    reconnectChannel.resolveJoin()
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    // Exactly one remount push on the fresh channel — no duplicate mount churn.
-    const mountPushes = reconnectChannel.pushes.filter((p) => p.event === "mount")
-    expect(mountPushes.length).toBe(1)
-    mountPushes[0]!.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    // The server's fresh initial patch atomically replaces the stale snapshot.
-    reconnectChannel.emit(
-      "patch",
-      initialConnectionEnvelope("Test.Store:alpha-1", rootState("Fresh"))
-    )
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    expect(mounted.store.snapshot()?.title).toBe("Fresh")
-    expect(mounted.store.title).toBe("Fresh")
-  })
-
-  test("auto-remounts live roots on reopen after a silent drop leaves a stale channel (bfcache resume)", async () => {
-    const { connect } = await import("../src/connect")
-    const socket = new MockSocket()
-    const connectionPromise = connect<TestStores>(socket)
-    const channel = lastChannel(socket)
-    channel.resolveJoin()
-    const connection = await connectionPromise
-
-    const mountedPromise = connection.mountStore({
-      module: "Test.Store",
-      id: "alpha-1"
-    })
-    await Promise.resolve()
-    expect(channel.pushes.filter((p) => p.event === "mount").length).toBe(1)
-    lastPush(channel).push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-    await Promise.resolve()
-    channel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Inbox")))
-    const mounted = await mountedPromise
-
-    expect(mounted.store.snapshot()?.title).toBe("Inbox")
-
-    // Silent drop: an iOS Safari bfcache freeze swallows a clean
-    // `socket.disconnect()` — the WS closes without delivering the channel
-    // onClose/onError that drives `handleConnectionDisconnect`, so
-    // `connectionState.channel` and the live `root.channel` stay set. We
-    // deliberately do NOT call `channel.disconnect()` here (that is the
-    // already-covered clean-drop path); only the transport reopens.
-    socket.simulateReopen()
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    // A fresh transport channel must be created and the live root re-mounted
-    // on it. Pre-fix, `handleSocketReopen` bailed on the truthy stale
-    // `connectionState.channel`, so no second channel appeared and the
-    // consumer was left with no live data.
-    const reconnectChannel = lastChannel(socket)
-    expect(reconnectChannel).not.toBe(channel)
-    reconnectChannel.resolveJoin()
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    const mountPushes = reconnectChannel.pushes.filter((p) => p.event === "mount")
-    expect(mountPushes.length).toBe(1)
-    expect(mountPushes[0]!.payload).toMatchObject({ module: "Test.Store", id: "alpha-1" })
-    mountPushes[0]!.push.resolve("ok", { root_id: "Test.Store:alpha-1" })
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    // The server's fresh initial patch lands on the new channel → live data
-    // restored, no manual reload or navigation.
-    reconnectChannel.emit(
-      "patch",
-      initialConnectionEnvelope("Test.Store:alpha-1", rootState("Fresh"))
-    )
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    expect(mounted.store.snapshot()?.title).toBe("Fresh")
-    expect(mounted.store.title).toBe("Fresh")
-  })
 })
+
+async function openConnection(socket: MockSocket): Promise<MusubiConnection<TestStores>> {
+  const { connect } = await import("../src/connect")
+  return connect<TestStores>(socket)
+}
+
+// Drive a fresh root mount to completion through its per-root channel: join
+// (which IS the mount) then the initial patch. Returns the live MountedStore and
+// the channel it joined.
+async function mountRoot(
+  socket: MockSocket,
+  connection: MusubiConnection<TestStores>,
+  opts: { module?: keyof TestStores; id: string; params?: Record<string, unknown>; title?: string }
+): Promise<{ mounted: MountedStore<keyof TestStores & string, TestStores>; channel: MockChannel; rootId: string }> {
+  const module = (opts.module ?? "Test.Store") as keyof TestStores & string
+  const mountedPromise = connection.mountStore({
+    module,
+    id: opts.id,
+    ...(opts.params !== undefined ? { params: opts.params } : {})
+  })
+  await Promise.resolve()
+  const channel = lastChannel(socket)
+  const rootId = `${module}:${opts.id}`
+  channel.resolveJoin({ root_id: rootId })
+  await Promise.resolve()
+  channel.emit("patch", initialConnectionEnvelope(rootId, rootState(opts.title ?? "Inbox")))
+  const mounted = await mountedPromise
+  return { mounted, channel, rootId }
+}
+
+const nextTask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
 
 function lastChannel(socket: MockSocket): MockChannel {
   const channel = socket.channels.at(-1)

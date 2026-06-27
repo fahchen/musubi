@@ -206,8 +206,6 @@ async function mountTestRoot(): Promise<{
 }> {
   const socket = new MockSocket()
   const { connection: connectionState, ready: connectionReady } = openConnectionState(socket)
-  const channel = lastChannel(socket)
-  channel.resolveJoin()
   await connectionReady
 
   const mountPromise = mountConnectionRoot(connectionState, {
@@ -215,13 +213,12 @@ async function mountTestRoot(): Promise<{
     id: "root"
   })
 
+  // The per-root channel is created synchronously by `mountConnectionRoot`
+  // (join IS the mount). Resolve its join, then deliver the initial patch as a
+  // separate frame — real Phoenix drains microtasks between them.
   await Promise.resolve()
-
-  const mountPush = lastPush(channel)
-  mountPush.push.resolve("ok", { root_id: "Test.Root:root" })
-  // Let the mount-reply microtask register the root in connectionState
-  // before the initial patch arrives — real Phoenix delivers these as
-  // separate frames, so the JS event loop drains microtasks between them.
+  const channel = lastChannel(socket)
+  channel.resolveJoin({ root_id: "Test.Root:root" })
   await Promise.resolve()
   channel.emit("patch", initialConnectionEnvelope("Test.Root:root", rootState()))
   const { connection } = await mountPromise
@@ -237,20 +234,6 @@ function lastChannel(socket: MockSocket): MockChannel {
   }
 
   return channel
-}
-
-function lastPush(channel: MockChannel): {
-  event: string
-  payload: unknown
-  push: MockPush
-} {
-  const push = channel.pushes.at(-1)
-
-  if (!push) {
-    throw new Error("Missing mock push")
-  }
-
-  return push
 }
 
 function initialConnectionEnvelope(
