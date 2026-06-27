@@ -11,6 +11,43 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`musubi` / `@musubi/client`** — A WebSocket reconnect no longer leaves a
+  root store permanently unrecoverable (`Command "…" failed: Store is not
+  connected` until a full page reload). The whole connection multiplexed every
+  root over one `musubi:connection` topic/channel; on a drop, Phoenix's
+  automatic rejoin of the (never-`leave()`d) channel collided on that single
+  topic with the new channel the recovery path opened, Phoenix closed the
+  duplicate join, the state machine derailed, `mount` was never re-sent, and the
+  server's `terminate/2` `stop_root` was never reversed. Each root store now
+  owns its own channel, so recovery rides Phoenix's per-channel rejoin with no
+  collision (see Changed).
+
+### Changed
+
+- **`musubi` / `@musubi/client`** — **Breaking wire protocol.** Each root store
+  now gets its own channel on topic `musubi:connection:<root_id>` instead of one
+  shared `musubi:connection` channel multiplexing all roots by `root_id`. Join
+  carries `{module, id, params}` and **is** the mount (the join reply returns the
+  canonical `root_id`); leaving the channel (client `leave()` or a transport
+  drop) **is** the unmount and stops that one root via `terminate/2`. Reconnect
+  recovery now reuses Phoenix's built-in per-channel rejoin: the
+  `join().receive("ok")` hook re-fires on every rejoin and rebuilds the root,
+  keeping the last-good snapshot until the server's fresh initial patch swaps it
+  in. The `command` / `allow_upload` / `cancel_upload` / `upload_progress` /
+  `upload_error` payloads no longer carry a `root_id` (one root per channel).
+  Client and server must be upgraded together.
+
+### Removed
+
+- **`@musubi/client`** — `SocketLike.onOpen` is gone (added in 0.11.0 to drive
+  the socket-level reopen handler). Recovery is now per-channel, so the
+  socket-level `onOpen`/`handleSocketReopen`/`reestablishConnectionRoots`
+  machinery — and the `mount` / `unmount` / `already_mounted` channel messages —
+  were removed. Custom `SocketLike` implementations need only `connect` and
+  `channel`.
+
 ## [0.11.1] — 2026-06-25
 
 ### Fixed
