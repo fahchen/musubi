@@ -1108,15 +1108,15 @@ async function recoverConnectionRootFromVersionMismatch(
     connection.initialPatchPromise = initialPatch
     await initialPatch
   } catch (error) {
+    // The recreate-join failed/timed out (server still down, transient error).
     // Recovery is fire-and-forget, so a throw here would surface as an unhandled
-    // rejection. Force a full disconnect instead — consumers see a clean
-    // tear-down and can reconnect explicitly.
+    // rejection — swallow it. Do NOT disconnect: that resets the root and blanks
+    // the consumer with an `undefined` snapshot. Keep the last-good snapshot
+    // rendering (it's still intact — version stayed 0) and rely on Phoenix to
+    // keep rejoining the channel `attachAndJoinRoot` created; its
+    // `join("ok")` handler completes recovery once the server is back.
     // eslint-disable-next-line no-console
-    console.error("[musubi] root recovery failed:", error)
-    disconnectConnectionState(connection.connection).catch((cleanupError) => {
-      // eslint-disable-next-line no-console
-      console.error("[musubi] post-recovery disconnect failed:", cleanupError)
-    })
+    console.error("[musubi] root recovery failed; keeping last-good and awaiting rejoin:", error)
   } finally {
     connection.recovering = false
   }

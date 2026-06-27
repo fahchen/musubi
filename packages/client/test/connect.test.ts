@@ -604,7 +604,7 @@ describe("connect", () => {
     expect(mounted.store.snapshot()?.title).toBe("Fresh")
   })
 
-  test("version-mismatch recovery that fails to rejoin disconnects cleanly", async () => {
+  test("version-mismatch recovery that fails to rejoin keeps last-good and recovers on a later rejoin", async () => {
     const unhandled: unknown[] = []
     const onUnhandled = (reason: unknown): void => {
       unhandled.push(reason)
@@ -615,7 +615,7 @@ describe("connect", () => {
     try {
       const socket = new MockSocket()
       const connection = await openConnection(socket)
-      const { channel } = await mountRoot(socket, connection, { id: "alpha-1" })
+      const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1", title: "Inbox" })
 
       channel.emit(
         "patch",
@@ -623,15 +623,30 @@ describe("connect", () => {
       )
       await Promise.resolve()
 
-      // The recreate join fails — recovery catches, force-disconnects, logs.
+      // The recreate join fails (server still down). Recovery must NOT disconnect:
+      // keep the last-good snapshot and await Phoenix's next rejoin.
       const recoveryChannel = lastChannel(socket)
       expect(recoveryChannel).not.toBe(channel)
-      recoveryChannel.failJoin({ reason: "unauthorized" })
+      recoveryChannel.failJoin({ reason: "server restarting" })
       await nextTask()
 
       expect(unhandled).toEqual([])
-      expect(errorSpy).toHaveBeenCalledWith("[musubi] root recovery failed:", expect.any(Error))
-      expect(recoveryChannel.left).toBe(true)
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("root recovery failed"),
+        expect.any(Error)
+      )
+      // Not torn down; last-good still served; no command rejection cascade.
+      expect(recoveryChannel.left).toBe(false)
+      expect(mounted.store.snapshot()?.title).toBe("Inbox")
+
+      // Phoenix retries the recovery channel's join → recovery completes and the
+      // fresh initial patch swaps in.
+      recoveryChannel.resolveJoin({ root_id: "Test.Store:alpha-1" })
+      await Promise.resolve()
+      recoveryChannel.emit("patch", initialConnectionEnvelope("Test.Store:alpha-1", rootState("Fresh")))
+      await nextTask()
+
+      expect(mounted.store.snapshot()?.title).toBe("Fresh")
     } finally {
       errorSpy.mockRestore()
       process.off("unhandledRejection", onUnhandled)
