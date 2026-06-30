@@ -154,7 +154,7 @@ type TestStores = {
     },
     {
       toast: { payload: { msg: string } }
-      synced: { payload: {} }
+      synced: { payload: { count: number } }
     }
   >
 
@@ -363,6 +363,41 @@ describe("connect", () => {
       events: [{ name: "toast", payload: { msg: "again" } }]
     })
     expect(toastHandler).toHaveBeenCalledTimes(1)
+  })
+
+  test("one envelope with multiple event types routes each to its own handler", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1" })
+
+    const toastHandler = vi.fn()
+    const syncedHandler = vi.fn()
+    mounted.store.handleEvent("toast", toastHandler)
+    mounted.store.handleEvent("synced", syncedHandler)
+
+    // Single envelope carrying three events: two registered (distinct payload
+    // types) and one with no handler.
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 1,
+      version: 2,
+      ops: [],
+      stream_ops: [],
+      events: [
+        { name: "toast", payload: { msg: "hi" } },
+        { name: "other", payload: { ignored: true } },
+        { name: "synced", payload: { count: 7 } }
+      ]
+    })
+
+    expect(toastHandler).toHaveBeenCalledTimes(1)
+    expect(toastHandler).toHaveBeenCalledWith({ msg: "hi" })
+    expect(syncedHandler).toHaveBeenCalledTimes(1)
+    expect(syncedHandler).toHaveBeenCalledWith({ count: 7 })
+    // No cross-talk: neither handler saw the other's event or the unhandled one.
+    expect(toastHandler).not.toHaveBeenCalledWith({ count: 7 })
+    expect(syncedHandler).not.toHaveBeenCalledWith({ msg: "hi" })
   })
 
   test("events dispatch after the envelope's state ops are applied", async () => {
