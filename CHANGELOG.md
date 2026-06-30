@@ -11,6 +11,28 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Added
+
+- **`musubi` / `@musubi/client` / `@musubi/react`** — **Push events** (BDR-0032):
+  transient, fire-and-forget server-to-client signals (a toast, "scroll to
+  bottom"), the analog of LiveView `push_event` + `handleEvent`. The server
+  queues them with the bare `push_event(socket, name, payload)` helper from any
+  store callback; they are folded into the cycle's patch envelope (a new `events`
+  field), so one push carries the diff and its events together. An events-only
+  cycle still emits an envelope and bumps `version`. Events own no ack, retry, or
+  reconnect replay — a handler only sees events fired after it registers, so data
+  that must exist at mount belongs in state. The client consumes them via
+  `store.handleEvent(name, cb)` (returns an unsubscribe thunk; registry survives
+  reconnect), and React via `useMusubiEvent(store, name, cb)`.
+- **`musubi` / `@musubi/client` / `@musubi/react`** — **Typed event
+  declarations.** Declare events in a root store with the payload-only `event`
+  DSL (`event :toast do field :msg, String.t() end`); declaring one in a child
+  store is a compile-time error (events are root-scoped). The declaration drives
+  codegen — `StoreDef` gains a 4th `Events` type param (default `{}`, so existing
+  references stay valid) — yielding typed `handleEvent` / `useMusubiEvent` whose
+  payload is inferred per event. Events are server-pushed (trusted), so there is
+  no runtime payload validation.
+
 ## [0.12.0] — 2026-06-27
 
 ### Fixed
