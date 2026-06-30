@@ -33,6 +33,9 @@ type ReactTestStores = {
     },
     {
       rename: { payload: { title: string }; reply: { ok: true } }
+    },
+    {
+      toast: { payload: { msg: string } }
     }
   >
 }

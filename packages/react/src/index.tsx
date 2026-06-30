@@ -25,7 +25,9 @@ import {
   type StoreSnapshot,
   type CommandName,
   type CommandPayload,
-  type CommandReply
+  type CommandReply,
+  type EventName,
+  type EventPayload
 } from "@musubi/client"
 
 import { shallowEqual } from "./shallow"
@@ -145,10 +147,10 @@ export interface MusubiFactory<R> {
     proxy: StoreProxy<M, R>,
     name: K
   ) => MusubiCommandResult<M, K, R>
-  useMusubiEvent: <M extends StoreModule<R>, P = unknown>(
+  useMusubiEvent: <M extends StoreModule<R>, K extends EventName<M, R>>(
     proxy: StoreProxy<M, R>,
-    name: string,
-    handler: (payload: P) => void
+    name: K,
+    handler: (payload: EventPayload<M, K, R>) => void
   ) => void
 }
 
@@ -591,10 +593,10 @@ export function createMusubi<R>(): MusubiFactory<R> {
     return { dispatch, isPending: state.isPending, error: state.error, data: state.data, reset }
   }
 
-  function useMusubiEvent<M extends StoreModule<R>, P = unknown>(
+  function useMusubiEvent<M extends StoreModule<R>, K extends EventName<M, R>>(
     proxy: StoreProxy<M, R>,
-    name: string,
-    handler: (payload: P) => void
+    name: K,
+    handler: (payload: EventPayload<M, K, R>) => void
   ): void {
     // Ref the handler so an inline closure (new identity each render) does not
     // force a re-subscribe; the effect re-runs only when proxy or name change.
@@ -602,7 +604,7 @@ export function createMusubi<R>(): MusubiFactory<R> {
     handlerRef.current = handler
 
     useEffect(() => {
-      return proxy.handleEvent(name, (payload) => handlerRef.current(payload as P))
+      return proxy.handleEvent(name, (payload) => handlerRef.current(payload))
     }, [proxy, name])
   }
 
