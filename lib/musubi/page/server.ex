@@ -31,6 +31,7 @@ defmodule Musubi.Page.Server do
 
   alias Musubi.Async
   alias Musubi.Diff
+  alias Musubi.Event
   alias Musubi.Hooks.ValidateCommandSchema
   alias Musubi.Lifecycle
   alias Musubi.Page.PatchEnvelope
@@ -289,10 +290,11 @@ defmodule Musubi.Page.Server do
     {wire_root, store_table} = root_wire(store_table, root_socket)
     {stream_ops, store_table} = flush_all_stream_ops(store_table)
     {upload_ops_raw, store_table} = flush_all_upload_ops(store_table)
+    {events, store_table} = flush_all_events(store_table)
 
     {upload_ops, upload_throttle} = throttle_progress(upload_ops_raw, %{})
 
-    envelope = PatchEnvelope.initial(wire_root, stream_ops, upload_ops)
+    envelope = PatchEnvelope.initial(wire_root, stream_ops, upload_ops, events)
 
     state =
       rebuild_async_index(%State{
@@ -722,6 +724,7 @@ defmodule Musubi.Page.Server do
     {wire_root, next_registry} = root_wire(next_registry, next_root_socket)
     {stream_ops, next_registry} = flush_all_stream_ops(next_registry)
     {upload_ops_raw, next_registry} = flush_all_upload_ops(next_registry)
+    {events, next_registry} = flush_all_events(next_registry)
 
     {upload_ops, next_throttle} =
       throttle_progress(upload_ops_raw, state.upload_progress_last_emitted)
@@ -733,7 +736,7 @@ defmodule Musubi.Page.Server do
         Diff.diff(state.previous_wire_root, wire_root)
       end
 
-    envelope = PatchEnvelope.build(state.version, diff_ops, stream_ops, upload_ops)
+    envelope = PatchEnvelope.build(state.version, diff_ops, stream_ops, upload_ops, events)
 
     next_version = if envelope, do: envelope.version, else: state.version
 
@@ -1064,6 +1067,25 @@ defmodule Musubi.Page.Server do
       nil ->
         {ops_acc, registry}
     end
+  end
+
+  # Drains push events (BDR-0032) from every store socket, flattened in
+  # store_id order (root before children). Events are root-scoped: no store_id
+  # tag is attached, unlike stream/upload ops.
+  @spec flush_all_events(StoreTable.t()) :: {[Event.event()], StoreTable.t()}
+  defp flush_all_events(%StoreTable{} = registry) do
+    sorted_keys = registry |> StoreTable.keys() |> Enum.sort_by(&length/1)
+
+    Enum.reduce(sorted_keys, {[], registry}, fn store_id, {acc, reg} ->
+      case StoreTable.get(reg, store_id) do
+        %Entry{socket: socket} = entry ->
+          {events, next_socket} = Event.flush_pending(socket)
+          {acc ++ events, StoreTable.put(reg, store_id, %{entry | socket: next_socket})}
+
+        nil ->
+          {acc, reg}
+      end
+    end)
   end
 
   @spec flush_all_upload_ops(StoreTable.t()) :: {[Upload.op()], StoreTable.t()}
