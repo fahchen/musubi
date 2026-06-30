@@ -291,6 +291,7 @@ defmodule Musubi.Page.Server do
     {stream_ops, store_table} = flush_all_stream_ops(store_table)
     {upload_ops_raw, store_table} = flush_all_upload_ops(store_table)
     {events, store_table} = flush_all_events(store_table)
+    Event.validate_events!(events, root_module)
 
     {upload_ops, upload_throttle} = throttle_progress(upload_ops_raw, %{})
 
@@ -725,6 +726,7 @@ defmodule Musubi.Page.Server do
     {stream_ops, next_registry} = flush_all_stream_ops(next_registry)
     {upload_ops_raw, next_registry} = flush_all_upload_ops(next_registry)
     {events, next_registry} = flush_all_events(next_registry)
+    Event.validate_events!(events, state.root_module)
 
     {upload_ops, next_throttle} =
       throttle_progress(upload_ops_raw, state.upload_progress_last_emitted)

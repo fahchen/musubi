@@ -14,6 +14,7 @@ defmodule Musubi.Event do
   """
 
   alias Musubi.Socket
+  alias Musubi.Type
   alias Musubi.Wire
 
   @accumulator_key :__musubi_events__
@@ -62,6 +63,72 @@ defmodule Musubi.Event do
           |> Enum.map(fn {name, payload} -> %{name: name, payload: Wire.to_wire(payload)} end)
 
         {events, Socket.put_private(socket, @accumulator_key, [])}
+    end
+  end
+
+  @doc """
+  Validates each drained event's wire payload against the root store's declared
+  `event` schema (BDR-0032 dev-correctness, mirroring
+  `Musubi.Hooks.ValidateReplySchema`). Events are declared on the root store, so
+  `root_module` is the root regardless of which socket queued the event.
+
+  Undeclared event names are skipped (a push with no matching `event` declaration
+  is not validated). A declared event whose payload is missing a field or has a
+  type mismatch raises `ArgumentError` (BDR-0003 let-it-crash) — there is no
+  *security* validation here (events are server-pushed, trusted); this only
+  catches developer mistakes. Returns `events` unchanged.
+  """
+  @spec validate_events!([event()], module()) :: [event()]
+  def validate_events!(events, root_module) when is_list(events) and is_atom(root_module) do
+    declared = declared_event_index(root_module)
+
+    Enum.each(events, fn %{name: name, payload: payload} ->
+      case Map.fetch(declared, name) do
+        {:ok, fields} -> validate_fields!(root_module, name, fields, payload)
+        :error -> :ok
+      end
+    end)
+
+    events
+  end
+
+  @spec declared_event_index(module()) :: %{String.t() => [map()]}
+  defp declared_event_index(root_module) do
+    if function_exported?(root_module, :__musubi__, 1) do
+      events = List.wrap(root_module.__musubi__(:events))
+      Map.new(events, fn %{name: name, payload_fields: fields} -> {to_string(name), fields} end)
+    else
+      %{}
+    end
+  end
+
+  @spec validate_fields!(module(), String.t(), [map()], map()) :: :ok
+  defp validate_fields!(module, name, fields, payload) do
+    errors = Enum.reduce(fields, [], &collect_field_error(&1, payload, module, &2))
+
+    case errors do
+      [] ->
+        :ok
+
+      list ->
+        details = list |> Enum.reverse() |> Enum.map_join("; ", fn {f, m} -> "#{f}: #{m}" end)
+
+        raise ArgumentError,
+              "push event validation failed for #{inspect(module)} event #{inspect(name)}: #{details}"
+    end
+  end
+
+  @spec collect_field_error(map(), map(), module(), [{atom(), String.t()}]) ::
+          [{atom(), String.t()}]
+  defp collect_field_error(%{name: fname, type: type_ast}, payload, module, acc) do
+    case Map.fetch(payload, to_string(fname)) do
+      {:ok, value} ->
+        if Type.valid?(value, type_ast, module),
+          do: acc,
+          else: [{fname, "expected #{Macro.to_string(type_ast)}, got: #{inspect(value)}"} | acc]
+
+      :error ->
+        [{fname, "missing required field"} | acc]
     end
   end
 end

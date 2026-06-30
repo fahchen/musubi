@@ -70,10 +70,20 @@ error) because events are root-scoped on the wire. It drives codegen — `StoreD
 gains a 4th type param `Events` (default `{}`, so existing 3-arg references stay
 valid), yielding TS `EventName<M,R>` / `EventPayload<M,K,R>` that type
 `handleEvent` / `useMusubiEvent`. On a child proxy `EventName` is `never`, so
-events are subscribed off the root proxy. There is **no runtime payload
-validation**: events are server-pushed (trusted), unlike commands (untrusted
-client input validated by a hook), so the declaration exists purely for
-compile-time typing and codegen.
+events are subscribed off the root proxy.
+
+**Runtime validation (dev-correctness only).** The declared payload schema is
+validated at drain (`Musubi.Event.validate_events!/2`), mirroring
+`Musubi.Hooks.ValidateReplySchema`: a command *reply* is server-generated yet
+still validated against its declared `reply_fields` to catch handler mistakes,
+and a push event is the same kind of trusted-but-fallible server output, so it
+gets the same treatment. A declared event whose `push_event` payload is missing
+a field or has a type mismatch raises `ArgumentError` (BDR-0003 let-it-crash);
+an *undeclared* event name is skipped (not validated). This is **not** a
+security boundary — events are server-pushed, so there is no untrusted input to
+guard, unlike commands (`ValidateCommandSchema` on client input). Validation
+runs in the same render cycle as the queuing handler, so a bad `push_event` in a
+command handler surfaces synchronously from `dispatch_command`.
 
 **Wire shape.** `PatchEnvelope` gains an `events` field. One event is
 `%{"name" => string, "payload" => wire}`. The envelope keeps `type: "patch"` —

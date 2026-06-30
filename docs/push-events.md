@@ -34,9 +34,13 @@ end
 
 The declaration drives the generated TypeScript types: `EventName` and
 `EventPayload` per store, so `handleEvent` / `useMusubiEvent` know each event's
-payload shape at compile time. Events are server-pushed (trusted), so there is
-**no runtime payload validation** — the declaration exists for typing, not
-enforcement.
+payload shape at compile time.
+
+It is also validated at runtime for **dev-correctness** (not security): a
+`push_event` for a declared event whose payload is missing a field or has a type
+mismatch raises `ArgumentError`, the same treatment a command reply gets from its
+declared schema. An undeclared event name is not validated. A bad `push_event` in
+a command handler surfaces synchronously from the dispatch.
 
 ## Server
 

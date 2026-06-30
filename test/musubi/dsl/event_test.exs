@@ -45,6 +45,39 @@ defmodule Musubi.DSL.EventTest do
     assert :error = RootWithEvents.__musubi__(:event, :nope)
   end
 
+  describe "validate_events!/2 (dev-correctness)" do
+    test "passes a declared event with a valid wire payload" do
+      events = [%{name: "toast", payload: %{"msg" => "hi", "level" => "info"}}]
+      assert ^events = Musubi.Event.validate_events!(events, RootWithEvents)
+    end
+
+    test "passes a no-field event regardless of payload" do
+      events = [%{name: "ping", payload: %{"extra" => 1}}]
+      assert ^events = Musubi.Event.validate_events!(events, RootWithEvents)
+    end
+
+    test "skips an undeclared event name" do
+      events = [%{name: "not_declared", payload: %{"anything" => true}}]
+      assert ^events = Musubi.Event.validate_events!(events, RootWithEvents)
+    end
+
+    test "raises on a type mismatch" do
+      events = [%{name: "toast", payload: %{"msg" => 123, "level" => "info"}}]
+
+      assert_raise ArgumentError, ~r/push event validation failed.*msg: expected/, fn ->
+        Musubi.Event.validate_events!(events, RootWithEvents)
+      end
+    end
+
+    test "raises on a missing required field" do
+      events = [%{name: "toast", payload: %{"level" => "info"}}]
+
+      assert_raise ArgumentError, ~r/msg: missing required field/, fn ->
+        Musubi.Event.validate_events!(events, RootWithEvents)
+      end
+    end
+  end
+
   test "declaring an event in a non-root store raises at compile time" do
     assert_raise CompileError,
                  ~r/event :toast not allowed: events may only be declared in a root store/,
