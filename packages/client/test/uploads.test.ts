@@ -83,7 +83,7 @@ function fakeConnection(options: {
     pendingConnect: null,
     connectPromise: null,
     recovering: false
-  } as RootConnection
+  } as unknown as RootConnection
 }
 
 function externalPreflightReply(entryRef: string) {

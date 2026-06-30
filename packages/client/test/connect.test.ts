@@ -197,10 +197,10 @@ type _SyncedPayload = Assert<
 >
 
 type PlainObjectSnapshot = Assert<
-  Equal<SnapshotValue<{ title: string }>, { title: string }>
+  Equal<SnapshotValue<{ title: string }, TestStores>, { title: string }>
 >
 
-type EmptyObjectSnapshot = Assert<Equal<SnapshotValue<{}>, {}>>
+type EmptyObjectSnapshot = Assert<Equal<SnapshotValue<{}, TestStores>, {}>>
 
 describe("connect", () => {
   beforeEach(() => {
