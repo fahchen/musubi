@@ -13,8 +13,8 @@ defmodule Musubi.Event do
   still emits an envelope and bumps `version`.
   """
 
+  alias Musubi.Schema
   alias Musubi.Socket
-  alias Musubi.Type
   alias Musubi.Wire
 
   @accumulator_key :__musubi_events__
@@ -80,26 +80,19 @@ defmodule Musubi.Event do
   """
   @spec validate_events!([event()], module()) :: [event()]
   def validate_events!(events, root_module) when is_list(events) and is_atom(root_module) do
-    declared = declared_event_index(root_module)
+    declared =
+      if function_exported?(root_module, :__musubi__, 1),
+        do: List.wrap(root_module.__musubi__(:events)),
+        else: []
 
     Enum.each(events, fn %{name: name, payload: payload} ->
-      case Map.fetch(declared, name) do
-        {:ok, fields} -> validate_fields!(root_module, name, fields, payload)
-        :error -> :ok
+      case Enum.find(declared, &(to_string(&1.name) == name)) do
+        %{payload_fields: fields} -> validate_fields!(root_module, name, fields, payload)
+        nil -> :ok
       end
     end)
 
     events
-  end
-
-  @spec declared_event_index(module()) :: %{String.t() => [map()]}
-  defp declared_event_index(root_module) do
-    if function_exported?(root_module, :__musubi__, 1) do
-      events = List.wrap(root_module.__musubi__(:events))
-      Map.new(events, fn %{name: name, payload_fields: fields} -> {to_string(name), fields} end)
-    else
-      %{}
-    end
   end
 
   @spec validate_fields!(module(), String.t(), [map()], term()) :: :ok
@@ -112,31 +105,15 @@ defmodule Musubi.Event do
   end
 
   defp validate_fields!(module, name, fields, payload) do
-    errors = Enum.reduce(fields, [], &collect_field_error(&1, payload, module, &2))
-
-    case errors do
+    case Schema.collect_field_errors(fields, payload, module) do
       [] ->
         :ok
 
-      list ->
-        details = list |> Enum.reverse() |> Enum.map_join("; ", fn {f, m} -> "#{f}: #{m}" end)
+      errors ->
+        details = Enum.map_join(errors, "; ", fn {f, m} -> "#{f}: #{m}" end)
 
         raise ArgumentError,
               "push event validation failed for #{inspect(module)} event #{inspect(name)}: #{details}"
-    end
-  end
-
-  @spec collect_field_error(map(), map(), module(), [{atom(), String.t()}]) ::
-          [{atom(), String.t()}]
-  defp collect_field_error(%{name: fname, type: type_ast}, payload, module, acc) do
-    case Map.fetch(payload, to_string(fname)) do
-      {:ok, value} ->
-        if Type.valid?(value, type_ast, module),
-          do: acc,
-          else: [{fname, "expected #{Macro.to_string(type_ast)}, got: #{inspect(value)}"} | acc]
-
-      :error ->
-        [{fname, "missing required field"} | acc]
     end
   end
 end

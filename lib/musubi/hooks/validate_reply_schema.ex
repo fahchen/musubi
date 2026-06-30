@@ -27,8 +27,8 @@ defmodule Musubi.Hooks.ValidateReplySchema do
   """
 
   alias Musubi.Hooks.ValidateCommandSchema
+  alias Musubi.Schema
   alias Musubi.Socket
-  alias Musubi.Type
   alias Musubi.Wire
 
   @typedoc "Field-level validation error: `{field_name, message}`."
@@ -74,38 +74,10 @@ defmodule Musubi.Hooks.ValidateReplySchema do
 
   @spec validate_fields!(module(), atom(), [map()], map()) :: :ok
   defp validate_fields!(module, command_name, fields, reply) do
-    errors = Enum.reduce(fields, [], &collect_field_error(&1, reply, module, &2))
-
-    case errors do
-      [] ->
-        :ok
-
-      errors ->
-        raise ArgumentError, format_errors(module, command_name, Enum.reverse(errors))
+    case Schema.collect_field_errors(fields, reply, module) do
+      [] -> :ok
+      errors -> raise ArgumentError, format_errors(module, command_name, errors)
     end
-  end
-
-  @spec collect_field_error(map(), map(), module(), [validation_error()]) ::
-          [validation_error()]
-  defp collect_field_error(%{name: name, type: type_ast}, reply, module, acc) do
-    case fetch_field(reply, name) do
-      {:ok, value} ->
-        if Type.valid?(value, type_ast, module) do
-          acc
-        else
-          [{name, "expected #{Macro.to_string(type_ast)}, got: #{inspect(value)}"} | acc]
-        end
-
-      :error ->
-        [{name, "missing required field"} | acc]
-    end
-  end
-
-  # `reply` is the wire-form map (string keys); declared field names are
-  # atoms, so fetch by the field's wire-form string key.
-  @spec fetch_field(map(), atom()) :: {:ok, term()} | :error
-  defp fetch_field(reply, name) when is_atom(name) do
-    Map.fetch(reply, Atom.to_string(name))
   end
 
   @spec format_errors(module(), atom(), [validation_error()]) :: String.t()
