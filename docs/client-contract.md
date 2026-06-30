@@ -490,7 +490,10 @@ interface StoreRuntime<M extends StoreModule<R>, R> {
     payload: CommandPayload<M, K, R>
   ): Promise<CommandReply<M, K, R>>
   subscribe(listener: () => void): () => void
-  handleEvent(name: string, handler: (payload: unknown) => void): () => void
+  handleEvent<K extends EventName<M, R>>(
+    name: K,
+    handler: (payload: EventPayload<M, K, R>) => void
+  ): () => void
   snapshot(): StoreSnapshot<M, R>
 }
 
@@ -516,11 +519,21 @@ in the page runtime. Wrap scalars/lists in a map (e.g.
 `{:reply, %{items: list}, socket}`), which the client receives as an
 object.
 
+`handleEvent` subscribes to a transient push event (BDR-0032). `EventName<M, R>`
+and `EventPayload<M, K, R>` mirror `CommandName` / `CommandPayload`, derived from
+the store's declared `events` (the `StoreDef` `Events` slot). When `name` is a
+literal the payload narrows to that event's exact declared shape — not a union
+and not `unknown`. Events are root-scoped, so `EventName` is `never` on a child
+proxy (subscribe off the root proxy). The handler is invoked once per matching
+event, after that envelope's state ops are applied; the registry lives on the
+root connection and survives reconnect.
+
 Reserved runtime member names on every store proxy:
 
 - `__musubi_store_id__`
 - `dispatchCommand`
 - `subscribe`
+- `handleEvent`
 - `snapshot`
 
 ## Runtime Materialization

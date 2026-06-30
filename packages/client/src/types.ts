@@ -94,7 +94,7 @@ export type EventPayload<
   M extends StoreModule<R>,
   K extends EventName<M, R>,
   R
-> = EventsOf<M, R>[K] extends { payload: infer Payload } ? Payload : unknown
+> = EventsOf<M, R>[K] extends { payload: infer Payload } ? Payload : never
 
 // ---------------------------------------------------------------------------
 // Snapshot and proxy projection (symbol-branded generated marker matching)
