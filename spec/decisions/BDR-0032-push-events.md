@@ -60,7 +60,8 @@ Adopt Option B.
 store callbacks via `Musubi.Store` (defdelegate to `Musubi.Event`). `name` is a
 string or atom (stringified); `payload` is any wire-encodable term. Returns the
 socket for pipe-chaining (LV-aligned). Callable from any store callback (mount,
-command, `handle_info`, `handle_async`) on the root or any child socket.
+command, `handle_info`, `handle_async`) on the root or any child socket — the
+runtime does not special-case the calling phase.
 
 **Wire shape.** `PatchEnvelope` gains an `events` field. One event is
 `%{"name" => string, "payload" => wire}`. The envelope keeps `type: "patch"` —
@@ -94,6 +95,17 @@ semantics:
   version gap and triggers recovery, that envelope's events are discarded with
   it. The client dispatches events only inside `acceptEnvelope`, after a clean
   apply.
+- **No special-casing of the mount phase.** Events queued during `mount` are
+  drained the same way as any other cycle and ride the *initial* envelope, so
+  `PatchEnvelope.initial` carries an `events` field too. Codex review noted the
+  cold-client limitation: a `mountStore` caller cannot register a handler until
+  the initial patch resolves, so mount-time events can be missed (and mount
+  re-runs on reconnect, re-firing them). We accept this rather than add a
+  deferral/buffer mechanism — buffering a transient, dispatch-once signal
+  contradicts its semantics, and a one-cycle deferral still loses React's
+  effect-timed registration. The documented guidance is to use **state**
+  (replayed per BDR-0015) for data that must exist at mount, and `push_event`
+  for transient signals the client is already listening for.
 
 **Client consumption.** The client owns the consumption logic. `acceptEnvelope`
 dispatches `envelope.events` to a per-`RootConnection` handler registry after

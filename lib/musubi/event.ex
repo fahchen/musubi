@@ -49,12 +49,19 @@ defmodule Musubi.Event do
   """
   @spec flush_pending(Socket.t()) :: {[event()], Socket.t()}
   def flush_pending(%Socket{} = socket) do
-    events =
-      socket
-      |> Socket.get_private(@accumulator_key, [])
-      |> Enum.reverse()
-      |> Enum.map(fn {name, payload} -> %{name: name, payload: Wire.to_wire(payload)} end)
+    case Socket.get_private(socket, @accumulator_key, []) do
+      # Leave the socket untouched when nothing was queued, so a flush does not
+      # churn private on every event-free render cycle.
+      [] ->
+        {[], socket}
 
-    {events, Socket.put_private(socket, @accumulator_key, [])}
+      pending ->
+        events =
+          pending
+          |> Enum.reverse()
+          |> Enum.map(fn {name, payload} -> %{name: name, payload: Wire.to_wire(payload)} end)
+
+        {events, Socket.put_private(socket, @accumulator_key, [])}
+    end
   end
 end

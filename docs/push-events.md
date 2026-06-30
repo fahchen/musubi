@@ -74,3 +74,9 @@ useMusubiEvent(store, "toast", (payload: { msg: string }) => {
 - **Event-only cycles still emit.** A cycle that only pushes events (no state
   change) still ships an envelope and bumps `version` — events are not subject
   to the idle-cycle skip that empty diffs are.
+- **A handler only sees events fired after it registers.** Events are dispatched
+  once on receipt; there is no buffer. A cold client that pushes events during
+  `mount` may not have a handler registered yet when the initial envelope
+  arrives, so those events can be missed — use **state** (replayed on reconnect)
+  for data that must be present at mount, and `push_event` for transient signals
+  the client is already listening for.
