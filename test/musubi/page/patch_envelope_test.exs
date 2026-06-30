@@ -179,4 +179,42 @@ defmodule Musubi.Page.PatchEnvelopeTest do
       refute_receive {:patch, _}, 100
     end
   end
+
+  describe "Rule: push events ride the patch envelope" do
+    test "build emits when only events are present and bumps version" do
+      envelope = PatchEnvelope.build(4, [], [], [], [%{name: "toast", payload: %{"msg" => "hi"}}])
+
+      assert %PatchEnvelope{
+               base_version: 4,
+               version: 5,
+               ops: [],
+               stream_ops: [],
+               upload_ops: [],
+               events: [%{name: "toast", payload: %{"msg" => "hi"}}]
+             } = envelope
+    end
+
+    test "build returns nil only when ops, stream_ops, upload_ops, and events are all empty" do
+      assert PatchEnvelope.build(3, [], [], [], []) == nil
+      refute PatchEnvelope.build(3, [], [], [], [%{name: "e", payload: %{}}]) == nil
+    end
+
+    test "to_wire carries events" do
+      wire =
+        PatchEnvelope.to_wire(%PatchEnvelope{
+          base_version: 0,
+          version: 1,
+          events: [%{name: "ping", payload: 1}]
+        })
+
+      assert wire["events"] == [%{name: "ping", payload: 1}]
+    end
+
+    test "initial carries mount-time events" do
+      envelope =
+        PatchEnvelope.initial(%{"title" => "Inbox"}, [], [], [%{name: "boot", payload: %{}}])
+
+      assert envelope.events == [%{name: "boot", payload: %{}}]
+    end
+  end
 end

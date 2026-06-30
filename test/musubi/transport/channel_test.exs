@@ -290,7 +290,8 @@ defmodule Musubi.Transport.ChannelTest do
              "version" => 5,
              "ops" => [%{op: "remove", path: "/x"}],
              "stream_ops" => [],
-             "upload_ops" => []
+             "upload_ops" => [],
+             "events" => []
            }
   end
 end
