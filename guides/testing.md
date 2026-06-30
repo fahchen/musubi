@@ -214,6 +214,28 @@ operation was emitted), assert on the mailbox:
 assert_receive {:patch, %Musubi.Page.PatchEnvelope{ops: ops}}
 ```
 
+## Push events
+
+For transient push events (`push_event/3`, BDR-0032), use
+`assert_push_event/3` / `refute_push_event/2` instead of unpacking the
+envelope by hand:
+
+```elixir
+page = Musubi.Testing.mount(InboxStore)
+Musubi.Testing.dispatch_command(page, :save, %{})
+
+# Matches by name; payload is compared in wire shape (atoms → strings).
+Musubi.Testing.assert_push_event(:toast, %{msg: "Saved", level: :info})
+
+# And the negative case:
+Musubi.Testing.dispatch_command(page, :noop, %{})
+Musubi.Testing.refute_push_event(:toast)
+```
+
+Events ride the patch envelope, so these helpers **consume** the
+`{:patch, _}` messages they scan past. Assert any state patches you care
+about *before* asserting events, or assert the event first.
+
 ## Teardown
 
 `mount/3` uses `ExUnit.Callbacks.start_supervised!/1`, so the page

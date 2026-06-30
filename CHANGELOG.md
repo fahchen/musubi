@@ -23,7 +23,9 @@ not in lockstep yet; entries note which surface they affect.
   reconnect replay — a handler only sees events fired after it registers, so data
   that must exist at mount belongs in state. The client consumes them via
   `store.handleEvent(name, cb)` (returns an unsubscribe thunk; registry survives
-  reconnect), and React via `useMusubiEvent(store, name, cb)`.
+  reconnect), and React via `useMusubiEvent(store, name, cb)`. Backend tests
+  assert delivery with `Musubi.Testing.assert_push_event/3` /
+  `refute_push_event/2`.
 - **`musubi` / `@musubi/client` / `@musubi/react`** — **Typed event
   declarations.** Declare events in a root store with the payload-only `event`
   DSL (`event :toast do field :msg, String.t() end`); declaring one in a child

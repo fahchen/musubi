@@ -31,6 +31,13 @@ defmodule Musubi.TestingTest do
 
     command :pick
 
+    command :flash
+
+    event :toast do
+      field :msg, String.t()
+      field :level, atom()
+    end
+
     @impl Musubi.Store
     def mount(_params, socket) do
       socket =
@@ -61,6 +68,10 @@ defmodule Musubi.TestingTest do
 
     def handle_command(:pick, _payload, socket) do
       {:reply, %{status: :ok, winner: :p1}, socket}
+    end
+
+    def handle_command(:flash, _payload, socket) do
+      {:reply, %{"ok" => true}, push_event(socket, :toast, %{msg: "Saved", level: :info})}
     end
   end
 
@@ -134,6 +145,52 @@ defmodule Musubi.TestingTest do
       {:ok, _reply} = Musubi.Testing.dispatch_command(page, :declare, %{winner: :p1})
 
       assert Musubi.Testing.render(page) == %{count: 3, winner: :p1}
+    end
+  end
+
+  describe "assert_push_event/3" do
+    test "matches a pushed event by name with wire-encoded payload" do
+      page = Musubi.Testing.mount(SimpleStore)
+      {:ok, _reply} = Musubi.Testing.dispatch_command(page, :flash, %{})
+
+      payload = Musubi.Testing.assert_push_event(:toast, %{msg: "Saved", level: :info})
+      assert payload == %{"msg" => "Saved", "level" => "info"}
+    end
+
+    test "flunks on a payload mismatch" do
+      page = Musubi.Testing.mount(SimpleStore)
+      {:ok, _reply} = Musubi.Testing.dispatch_command(page, :flash, %{})
+
+      assert_raise ExUnit.AssertionError, ~r/payload mismatch/, fn ->
+        Musubi.Testing.assert_push_event(:toast, %{msg: "Wrong"})
+      end
+    end
+
+    test "flunks when no matching event arrives" do
+      page = Musubi.Testing.mount(SimpleStore)
+      {:ok, _reply} = Musubi.Testing.dispatch_command(page, :pick, %{})
+
+      assert_raise ExUnit.AssertionError, ~r/expected a push event named "toast"/, fn ->
+        Musubi.Testing.assert_push_event(:toast, %{msg: "x"}, 20)
+      end
+    end
+  end
+
+  describe "refute_push_event/2" do
+    test "passes when no matching event is delivered" do
+      page = Musubi.Testing.mount(SimpleStore)
+      {:ok, _reply} = Musubi.Testing.dispatch_command(page, :pick, %{})
+
+      assert :ok = Musubi.Testing.refute_push_event(:toast, 20)
+    end
+
+    test "flunks when the event is delivered" do
+      page = Musubi.Testing.mount(SimpleStore)
+      {:ok, _reply} = Musubi.Testing.dispatch_command(page, :flash, %{})
+
+      assert_raise ExUnit.AssertionError, ~r/unexpected push event "toast"/, fn ->
+        Musubi.Testing.refute_push_event(:toast)
+      end
     end
   end
 
