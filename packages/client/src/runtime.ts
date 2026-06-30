@@ -1212,6 +1212,10 @@ function resetConnectionState(connection: RootConnection): void {
   connection.streams = new Map()
   connection.proxyCache = new Map()
   connection.snapshotCache = new Map()
+  // Only the teardown/disconnect paths call this (the Phoenix per-channel rejoin
+  // that persists handlers does not), so dropping push-event handlers here is
+  // safe and keeps a discarded RootConnection from holding stale listeners.
+  connection.eventListeners = new Map()
 }
 
 function invalidateSnapshotsForOps(

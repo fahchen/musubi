@@ -76,6 +76,19 @@ defmodule Musubi.DSL.EventTest do
         Musubi.Event.validate_events!(events, RootWithEvents)
       end
     end
+
+    test "raises a clean error when a field-bearing event gets a non-map payload" do
+      events = [%{name: "toast", payload: "oops"}]
+
+      assert_raise ArgumentError, ~r/payload must be a map, got: "oops"/, fn ->
+        Musubi.Event.validate_events!(events, RootWithEvents)
+      end
+    end
+
+    test "a no-field event accepts a non-map payload" do
+      events = [%{name: "ping", payload: "anything"}]
+      assert ^events = Musubi.Event.validate_events!(events, RootWithEvents)
+    end
   end
 
   test "declaring an event in a non-root store raises at compile time" do

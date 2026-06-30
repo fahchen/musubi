@@ -102,7 +102,15 @@ defmodule Musubi.Event do
     end
   end
 
-  @spec validate_fields!(module(), String.t(), [map()], map()) :: :ok
+  @spec validate_fields!(module(), String.t(), [map()], term()) :: :ok
+  defp validate_fields!(_module, _name, [], _payload), do: :ok
+
+  defp validate_fields!(module, name, _fields, payload) when not is_map(payload) do
+    raise ArgumentError,
+          "push event validation failed for #{inspect(module)} event #{inspect(name)}: " <>
+            "payload must be a map, got: #{inspect(payload)}"
+  end
+
   defp validate_fields!(module, name, fields, payload) do
     errors = Enum.reduce(fields, [], &collect_field_error(&1, payload, module, &2))
 

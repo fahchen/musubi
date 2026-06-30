@@ -599,7 +599,8 @@ export function createMusubi<R>(): MusubiFactory<R> {
     handler: (payload: EventPayload<M, K, R>) => void
   ): void {
     // Ref the handler so an inline closure (new identity each render) does not
-    // force a re-subscribe; the effect re-runs only when proxy or name change.
+    // force a re-subscribe; the proxy object is cached per store, so the effect
+    // re-runs only when `name` changes or the store mounts a fresh root.
     const handlerRef = useRef(handler)
     handlerRef.current = handler
 

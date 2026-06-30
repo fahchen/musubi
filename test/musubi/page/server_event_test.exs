@@ -88,8 +88,60 @@ defmodule Musubi.Page.ServerEventTest do
     end
   end
 
+  defmodule HaltEventStore do
+    @moduledoc false
+    use Musubi.Store
+
+    alias Musubi.Lifecycle
+
+    state do
+      field :title, String.t()
+    end
+
+    command :gated
+    command :rename
+
+    @impl Musubi.Store
+    def mount(socket) do
+      socket =
+        Lifecycle.attach_hook(socket, :leak_then_halt, :before_command, fn name, _payload, sock ->
+          if name == :gated do
+            {:halt, Musubi.Event.push_event(sock, "leaked", %{n: 1})}
+          else
+            {:cont, sock}
+          end
+        end)
+
+      {:ok, assign(socket, :title, "Page")}
+    end
+
+    @impl Musubi.Store
+    def render(socket), do: %{title: socket.assigns.title}
+
+    @impl Musubi.Store
+    def handle_command(:rename, _payload, socket),
+      do: {:noreply, assign(socket, :title, "Renamed")}
+
+    def handle_command(:gated, _payload, socket), do: {:noreply, socket}
+  end
+
   defp start!(assigns \\ %{}) do
     start_supervised!({Server, {RootStore, assigns, %{transport_pid: self()}}})
+  end
+
+  test "events queued in a halting before_command hook are discarded, not leaked" do
+    pid = start_supervised!({Server, {HaltEventStore, %{}, %{transport_pid: self()}}})
+    assert_receive {:patch, %PatchEnvelope{version: 1}}
+
+    # Halted command: the hook queues an event then halts. No envelope ships.
+    _reply = Server.command(pid, [], :gated, %{})
+    refute_receive {:patch, _}, 50
+
+    # The next real command's envelope must NOT carry the discarded event.
+    {:ok, _reply} = Server.command(pid, [], :rename, %{})
+    assert_receive {:patch, env}
+    assert env.events == []
+    assert env.ops != []
   end
 
   test "event-only command emits envelope with ops: [] and bumps version" do

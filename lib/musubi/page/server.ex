@@ -713,7 +713,11 @@ defmodule Musubi.Page.Server do
         {:ok, reply, next_state, envelope}
 
       :halted ->
-        {:halted, reply, state, nil}
+        # A halted command emits no envelope, so drain and discard any events a
+        # before_command hook queued before halting — otherwise they would leak
+        # into the next render cycle and fire out of context (BDR-0032).
+        {_discarded, store_table} = flush_all_events(state.store_table)
+        {:halted, reply, %{state | store_table: store_table}, nil}
     end
   end
 
