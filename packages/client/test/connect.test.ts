@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
-import type { PatchEnvelope, ConnectionPatchEnvelope, SnapshotValue } from "../src/types"
+import type {
+  PatchEnvelope,
+  ConnectionPatchEnvelope,
+  SnapshotValue,
+  EventName,
+  EventPayload
+} from "../src/types"
 import type { MountedStore, MusubiConnection } from "../src/connect"
 
 type PushStatus = "ok" | "error" | "timeout"
@@ -181,6 +187,14 @@ type Equal<Left, Right> =
   : false
 
 type Assert<T extends true> = T
+
+// Event typing: names form a union, but each call's payload is the *specific*
+// event's payload (not a union of all payloads).
+type _EventNames = Assert<Equal<EventName<"Test.Store", TestStores>, "toast" | "synced">>
+type _ToastPayload = Assert<Equal<EventPayload<"Test.Store", "toast", TestStores>, { msg: string }>>
+type _SyncedPayload = Assert<
+  Equal<EventPayload<"Test.Store", "synced", TestStores>, { count: number }>
+>
 
 type PlainObjectSnapshot = Assert<
   Equal<SnapshotValue<{ title: string }>, { title: string }>
@@ -773,12 +787,12 @@ async function openConnection(socket: MockSocket): Promise<MusubiConnection<Test
 // Drive a fresh root mount to completion through its per-root channel: join
 // (which IS the mount) then the initial patch. Returns the live MountedStore and
 // the channel it joined.
-async function mountRoot(
+async function mountRoot<M extends keyof TestStores & string = "Test.Store">(
   socket: MockSocket,
   connection: MusubiConnection<TestStores>,
-  opts: { module?: keyof TestStores; id: string; params?: Record<string, unknown>; title?: string }
-): Promise<{ mounted: MountedStore<keyof TestStores & string, TestStores>; channel: MockChannel; rootId: string }> {
-  const module = (opts.module ?? "Test.Store") as keyof TestStores & string
+  opts: { module?: M; id: string; params?: Record<string, unknown>; title?: string }
+): Promise<{ mounted: MountedStore<M, TestStores>; channel: MockChannel; rootId: string }> {
+  const module = (opts.module ?? "Test.Store") as M
   const mountedPromise = connection.mountStore({
     module,
     id: opts.id,
