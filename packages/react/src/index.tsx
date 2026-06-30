@@ -145,6 +145,11 @@ export interface MusubiFactory<R> {
     proxy: StoreProxy<M, R>,
     name: K
   ) => MusubiCommandResult<M, K, R>
+  useMusubiEvent: <M extends StoreModule<R>, P = unknown>(
+    proxy: StoreProxy<M, R>,
+    name: string,
+    handler: (payload: P) => void
+  ) => void
 }
 
 export interface MusubiCommandResult<
@@ -174,7 +179,8 @@ export interface MusubiCommandResult<
  *       useMusubiRoot,
  *       useMusubiRootSuspense,
  *       useMusubiSnapshot,
- *       useMusubiCommand
+ *       useMusubiCommand,
+ *       useMusubiEvent
  *     } = createMusubi<Musubi.Stores>()
  */
 export function createMusubi<R>(): MusubiFactory<R> {
@@ -585,6 +591,21 @@ export function createMusubi<R>(): MusubiFactory<R> {
     return { dispatch, isPending: state.isPending, error: state.error, data: state.data, reset }
   }
 
+  function useMusubiEvent<M extends StoreModule<R>, P = unknown>(
+    proxy: StoreProxy<M, R>,
+    name: string,
+    handler: (payload: P) => void
+  ): void {
+    // Ref the handler so an inline closure (new identity each render) does not
+    // force a re-subscribe; the effect re-runs only when proxy or name change.
+    const handlerRef = useRef(handler)
+    handlerRef.current = handler
+
+    useEffect(() => {
+      return proxy.handleEvent(name, (payload) => handlerRef.current(payload as P))
+    }, [proxy, name])
+  }
+
   return {
     connect,
     MusubiProvider,
@@ -593,7 +614,8 @@ export function createMusubi<R>(): MusubiFactory<R> {
     useMusubiRoot,
     useMusubiRootSuspense,
     useMusubiSnapshot,
-    useMusubiCommand
+    useMusubiCommand,
+    useMusubiEvent
   }
 }
 

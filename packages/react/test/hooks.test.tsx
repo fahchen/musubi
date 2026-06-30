@@ -44,6 +44,7 @@ const {
   useMusubiCommand,
   useMusubiConnection,
   useMusubiConnectionStatus,
+  useMusubiEvent,
   useMusubiRoot,
   useMusubiRootSuspense,
   useMusubiSnapshot
@@ -457,6 +458,51 @@ describe("useMusubiCommand", () => {
       kind: "failed", command: "rename", storeId: [], reply: { code: "x" }
     })
     expect(MusubiCommandError.is(other)).toBe(true)
+  })
+})
+
+describe("useMusubiEvent", () => {
+  test("subscribes to push events and unsubscribes on unmount", () => {
+    const fake = buildProxy()
+    const handler = vi.fn()
+
+    function Listener() {
+      useMusubiEvent(fake.asProxy(), "toast", handler)
+      return null
+    }
+
+    const view = render(<Listener />)
+
+    act(() => fake.emitEvent("toast", { msg: "hi" }))
+    expect(handler).toHaveBeenCalledTimes(1)
+    expect(handler).toHaveBeenCalledWith({ msg: "hi" })
+
+    view.unmount()
+    act(() => fake.emitEvent("toast", { msg: "again" }))
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
+
+  test("does not resubscribe when the handler identity changes, and calls the latest", () => {
+    const fake = buildProxy()
+    const subscribeSpy = vi.spyOn(fake, "handleEvent")
+
+    function Listener({ onEvent }: { onEvent: (payload: unknown) => void }) {
+      useMusubiEvent(fake.asProxy(), "toast", onEvent)
+      return null
+    }
+
+    const first = vi.fn()
+    const view = render(<Listener onEvent={first} />)
+    expect(subscribeSpy).toHaveBeenCalledTimes(1)
+
+    const second = vi.fn()
+    view.rerender(<Listener onEvent={second} />)
+    // New handler closure must NOT trigger a re-subscribe.
+    expect(subscribeSpy).toHaveBeenCalledTimes(1)
+
+    act(() => fake.emitEvent("toast", { msg: "latest" }))
+    expect(first).not.toHaveBeenCalled()
+    expect(second).toHaveBeenCalledWith({ msg: "latest" })
   })
 })
 
