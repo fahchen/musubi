@@ -165,6 +165,11 @@ export interface StoreRuntime<M extends StoreModule<R>, R> {
     payload: CommandPayload<M, K, R>
   ): Promise<CommandReply<M, K, R>>
   subscribe(listener: () => void): () => void
+  // Registers a handler for a transient push event (BDR-0032). Root-scoped:
+  // events carry no store_id, so the same registry is shared across this root's
+  // store proxies. Returns an unsubscribe thunk. The handler is invoked once per
+  // matching event, after that envelope's state ops are applied.
+  handleEvent(name: string, handler: (payload: unknown) => void): () => void
   // `undefined` while the store node is absent from the index (not yet
   // mounted, or mid-reconnect after a state reset). Callers must guard.
   snapshot(): StoreSnapshot<M, R> | undefined
@@ -338,6 +343,13 @@ export type StreamOp =
       item_key: string
     }
 
+// Transient push event (BDR-0032) folded into the patch envelope. Dispatched
+// once on receipt, owns no version/recovery semantics.
+export type PushEvent = {
+  name: string
+  payload: unknown
+}
+
 export type PatchEnvelope = {
   type: "patch"
   base_version: number
@@ -345,6 +357,7 @@ export type PatchEnvelope = {
   ops: JsonPatchOp[]
   stream_ops: StreamOp[]
   upload_ops: UploadOp[]
+  events: PushEvent[]
 }
 
 export type ConnectionPatchEnvelope = PatchEnvelope & {

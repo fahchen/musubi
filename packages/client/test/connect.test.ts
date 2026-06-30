@@ -313,6 +313,78 @@ describe("connect", () => {
     expect(betaListener).toHaveBeenCalledTimes(1)
   })
 
+  test("handleEvent receives push events folded into the patch envelope", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1" })
+
+    const toastHandler = vi.fn()
+    const off = mounted.store.handleEvent("toast", toastHandler)
+
+    // Event-only envelope: empty ops, version still bumps (BDR-0032).
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 1,
+      version: 2,
+      ops: [],
+      stream_ops: [],
+      events: [{ name: "toast", payload: { msg: "saved" } }]
+    })
+
+    expect(toastHandler).toHaveBeenCalledTimes(1)
+    expect(toastHandler).toHaveBeenCalledWith({ msg: "saved" })
+
+    // Unknown event name is dropped (no registered handler).
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 2,
+      version: 3,
+      ops: [],
+      stream_ops: [],
+      events: [{ name: "other", payload: {} }]
+    })
+    expect(toastHandler).toHaveBeenCalledTimes(1)
+
+    // Unsubscribe stops delivery.
+    off()
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 3,
+      version: 4,
+      ops: [],
+      stream_ops: [],
+      events: [{ name: "toast", payload: { msg: "again" } }]
+    })
+    expect(toastHandler).toHaveBeenCalledTimes(1)
+  })
+
+  test("events dispatch after the envelope's state ops are applied", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1" })
+
+    let counterAtDispatch: number | undefined
+    mounted.store.handleEvent("synced", () => {
+      counterAtDispatch = mounted.store.counter
+    })
+
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 1,
+      version: 2,
+      ops: [{ op: "replace", path: "/counter", value: 42 }],
+      stream_ops: [],
+      events: [{ name: "synced", payload: {} }]
+    })
+
+    expect(counterAtDispatch).toBe(42)
+    expect(mounted.store.counter).toBe(42)
+  })
+
   test("distinct modules sharing one caller id get distinct channels and roots", async () => {
     const socket = new MockSocket()
     const connection = await openConnection(socket)
@@ -729,7 +801,9 @@ function connectionEnvelope(
     base_version: baseVersion,
     version,
     ops,
-    stream_ops: streamOps
+    stream_ops: streamOps,
+    upload_ops: [],
+    events: []
   }
 }
 
