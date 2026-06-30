@@ -151,6 +151,10 @@ type TestStores = {
         payload: { title: string }
         reply: { ok: true }
       }
+    },
+    {
+      toast: { payload: { msg: string } }
+      synced: { payload: {} }
     }
   >
 

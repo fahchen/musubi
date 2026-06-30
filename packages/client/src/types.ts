@@ -40,7 +40,12 @@ type SymbolMarker<T> = T extends object
 
 type StoreDefMarker<T> = Extract<
   SymbolMarker<T>,
-  { readonly module: string; readonly shape: unknown; readonly commands: unknown }
+  {
+    readonly module: string
+    readonly shape: unknown
+    readonly commands: unknown
+    readonly events: unknown
+  }
 >
 
 type FieldMarker<T> = Extract<
@@ -75,6 +80,21 @@ export type CommandReply<
   K extends CommandName<M, R>,
   R
 > = CommandsOf<M, R>[K] extends { reply: infer Reply } ? Reply : unknown
+
+export type EventsOf<M extends StoreModule<R>, R> =
+  [StoreDefMarker<DefOf<M, R>>] extends [never]
+    ? never
+    : StoreDefMarker<DefOf<M, R>> extends { readonly events: infer Events }
+      ? Events
+      : never
+
+export type EventName<M extends StoreModule<R>, R> = keyof EventsOf<M, R> & string
+
+export type EventPayload<
+  M extends StoreModule<R>,
+  K extends EventName<M, R>,
+  R
+> = EventsOf<M, R>[K] extends { payload: infer Payload } ? Payload : unknown
 
 // ---------------------------------------------------------------------------
 // Snapshot and proxy projection (symbol-branded generated marker matching)
@@ -165,11 +185,15 @@ export interface StoreRuntime<M extends StoreModule<R>, R> {
     payload: CommandPayload<M, K, R>
   ): Promise<CommandReply<M, K, R>>
   subscribe(listener: () => void): () => void
-  // Registers a handler for a transient push event (BDR-0032). Root-scoped:
-  // events carry no store_id, so the same registry is shared across this root's
-  // store proxies. Returns an unsubscribe thunk. The handler is invoked once per
-  // matching event, after that envelope's state ops are applied.
-  handleEvent(name: string, handler: (payload: unknown) => void): () => void
+  // Registers a handler for a transient push event (BDR-0032). Events are
+  // declared on the root store (`event :name do ... end`) and are root-scoped on
+  // the wire, so only the root proxy carries event names — `EventName` is `never`
+  // on child proxies. Returns an unsubscribe thunk. The handler is invoked once
+  // per matching event, after that envelope's state ops are applied.
+  handleEvent<K extends EventName<M, R>>(
+    name: K,
+    handler: (payload: EventPayload<M, K, R>) => void
+  ): () => void
   // `undefined` while the store node is absent from the index (not yet
   // mounted, or mid-reconnect after a state reset). Callers must guard.
   snapshot(): StoreSnapshot<M, R> | undefined
