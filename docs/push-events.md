@@ -1,0 +1,76 @@
+# Push Events
+
+Push events are transient, fire-and-forget signals from the server to one
+connected client — a toast, a "scroll to bottom", a "playSound". They are the
+analog of `Phoenix.LiveView.push_event/3` + client `handleEvent`. Unlike state
+patches and streams, an event carries **no server state**: the client consumes
+it once and the server keeps no record of it.
+
+See BDR-0032 for the design rationale and BDR-0005 for why server-side pub/sub
+stays application-owned.
+
+## Server
+
+Queue an event from any store callback (`mount`, a command handler,
+`handle_info`, `handle_async`) on the root or any child store:
+
+```elixir
+def handle_command(:save, _payload, socket) do
+  socket
+  |> assign(:saved_at, DateTime.utc_now())
+  |> push_event("toast", %{msg: "Saved", level: :info})
+  |> then(&{:reply, %{ok: true}, &1})
+end
+```
+
+`push_event(socket, name, payload)` returns the socket for pipe-chaining.
+`name` is an atom or string; `payload` is any wire-encodable term (serialized
+via `Musubi.Wire`). Events queued during one render cycle are drained and folded
+into that cycle's patch envelope, so **one push** carries the diff and its
+events together.
+
+## Client
+
+The client owns the consumption logic. Register a handler on a mounted store
+proxy:
+
+```ts
+const off = store.handleEvent("toast", (payload) => {
+  showToast(payload.msg)
+})
+
+// later
+off() // unsubscribe
+```
+
+`handleEvent(name, handler)` returns an unsubscribe thunk. Multiple handlers per
+name are allowed; an event with no registered handler is dropped. Handlers run
+once per matching event, **after** that envelope's state ops are applied (so the
+store reflects the new state when the handler reads it). Registrations live on
+the root connection and survive reconnect.
+
+### React
+
+`useMusubiEvent` wraps `handleEvent` in an effect and refs the handler, so an
+inline closure does not re-subscribe on every render:
+
+```tsx
+useMusubiEvent(store, "toast", (payload: { msg: string }) => {
+  showToast(payload.msg)
+})
+```
+
+## Semantics
+
+- **No ack, no retry.** Delivered once with the patch envelope; the application
+  never acks.
+- **No replay on reconnect.** Reconnect re-mounts the root and replays *state*
+  via the initial patch; past events are gone. If no client is connected when
+  `push_event` runs, the event is dropped.
+- **Dropped on version mismatch.** If the envelope is rejected for a version gap
+  and recovery kicks in, that envelope's events are discarded with it.
+- **Root-scoped.** Events carry no `store_id`; they are dispatched by `name`
+  alone, regardless of which store queued them.
+- **Event-only cycles still emit.** A cycle that only pushes events (no state
+  change) still ships an envelope and bumps `version` — events are not subject
+  to the idle-cycle skip that empty diffs are.
