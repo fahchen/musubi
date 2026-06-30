@@ -63,6 +63,18 @@ socket for pipe-chaining (LV-aligned). Callable from any store callback (mount,
 command, `handle_info`, `handle_async`) on the root or any child socket — the
 runtime does not special-case the calling phase.
 
+**Typed declaration.** Events are declared in the **root store** with an `event`
+DSL (payload-only, mirroring `command`): `event :toast do field :msg, String.t()
+end`. The declaration is root-only (a child-store `event` is a compile-time
+error) because events are root-scoped on the wire. It drives codegen — `StoreDef`
+gains a 4th type param `Events` (default `{}`, so existing 3-arg references stay
+valid), yielding TS `EventName<M,R>` / `EventPayload<M,K,R>` that type
+`handleEvent` / `useMusubiEvent`. On a child proxy `EventName` is `never`, so
+events are subscribed off the root proxy. There is **no runtime payload
+validation**: events are server-pushed (trusted), unlike commands (untrusted
+client input validated by a hook), so the declaration exists purely for
+compile-time typing and codegen.
+
 **Wire shape.** `PatchEnvelope` gains an `events` field. One event is
 `%{"name" => string, "payload" => wire}`. The envelope keeps `type: "patch"` —
 events are a field on the existing message, not a new frame:

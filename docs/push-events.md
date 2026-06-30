@@ -9,16 +9,47 @@ it once and the server keeps no record of it.
 See BDR-0032 for the design rationale and BDR-0005 for why server-side pub/sub
 stays application-owned.
 
+## Declaration
+
+Declare events in the **root store** with the `event` DSL — like `command`, but
+payload-only. Events are root-scoped (no `store_id` on the wire), so declaring
+one in a child store is a compile-time error.
+
+```elixir
+defmodule MyApp.Inbox do
+  use Musubi.Store, root: true
+
+  state do
+    field :title, String.t()
+  end
+
+  event :ping
+
+  event :toast do
+    field :msg, String.t()
+    field :level, atom()
+  end
+end
+```
+
+The declaration drives the generated TypeScript types: `EventName` and
+`EventPayload` per store, so `handleEvent` / `useMusubiEvent` know each event's
+payload shape at compile time. Events are server-pushed (trusted), so there is
+**no runtime payload validation** — the declaration exists for typing, not
+enforcement.
+
 ## Server
 
-Queue an event from any store callback (`mount`, a command handler,
-`handle_info`, `handle_async`) on the root or any child store:
+Queue an event from any store callback (a command handler, `handle_info`,
+`handle_async`) with `push_event`. Although events are *declared* on the root,
+`push_event` may be *called* from any store socket — the events flatten into the
+one root envelope.
 
 ```elixir
 def handle_command(:save, _payload, socket) do
   socket
   |> assign(:saved_at, DateTime.utc_now())
-  |> push_event("toast", %{msg: "Saved", level: :info})
+  |> push_event(:toast, %{msg: "Saved", level: :info})
   |> then(&{:reply, %{ok: true}, &1})
 end
 ```
