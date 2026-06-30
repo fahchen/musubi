@@ -210,6 +210,13 @@ defmodule Musubi.Store do
   defdelegate stream_delete_by_item_key(socket, name, item_key), to: Stream
 
   # ---------------------------------------------------------------------------
+  # Push-event helper (defdelegate -> Musubi.Event)
+  # ---------------------------------------------------------------------------
+
+  @doc "See `Musubi.Event.push_event/3`."
+  defdelegate push_event(socket, name, payload), to: Musubi.Event
+
+  # ---------------------------------------------------------------------------
   # Upload helpers (defdelegate -> Musubi.Upload)
   # ---------------------------------------------------------------------------
 
