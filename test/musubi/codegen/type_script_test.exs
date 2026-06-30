@@ -9,7 +9,7 @@ defmodule Musubi.Codegen.TypeScriptTest do
 
   defp entry(module) do
     data = Manifest.collect(module.__env__())
-    {data.module, Map.take(data, [:kind, :fields, :commands, :uploads])}
+    {data.module, Map.take(data, [:kind, :fields, :commands, :events, :uploads])}
   end
 
   # Strip leading whitespace from every line so assertions exercise the line
@@ -37,11 +37,12 @@ defmodule Musubi.Codegen.TypeScriptTest do
 
     const Type: unique symbol
 
-    interface StoreDef<Module extends string, Shape, Commands> {
+    interface StoreDef<Module extends string, Shape, Commands, Events = {}> {
       readonly [Type]: {
         module: Module
         shape: Shape
         commands: Commands
+        events: Events
       }
     }
 
@@ -138,6 +139,7 @@ defmodule Musubi.Codegen.TypeScriptTest do
                 {
                   amount: number
                 },
+                {},
                 {}
               >
             }
@@ -168,13 +170,45 @@ defmodule Musubi.Codegen.TypeScriptTest do
                     payload: {}
                     reply: never
                   }
-                }
+                },
+                {}
               >
             }
           }
           """
 
       assert normalize(TypeScript.render([entry(TypespecProbeWithCommand)])) ==
+               normalize(expected)
+    end
+
+    test "root store with events emits the event payload schema in the 4th slot" do
+      expected =
+        @preamble <>
+          """
+            interface Stores {
+              "Musubi.TestSupport.TypespecProbeWithEvents": StoreDef<
+                "Musubi.TestSupport.TypespecProbeWithEvents",
+                {
+                  title: string
+                },
+                {},
+                {
+                  ping: {
+                    payload: {}
+                  }
+                  toast: {
+                    payload: {
+                      msg: string
+                      level: string
+                    }
+                  }
+                }
+              >
+            }
+          }
+          """
+
+      assert normalize(TypeScript.render([entry(Musubi.TestSupport.TypespecProbeWithEvents)])) ==
                normalize(expected)
     end
   end

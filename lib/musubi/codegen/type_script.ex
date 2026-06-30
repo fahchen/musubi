@@ -157,11 +157,12 @@ defmodule Musubi.Codegen.TypeScript do
 
       const Type: unique symbol
 
-      interface StoreDef<Module extends string, Shape, Commands> {
+      interface StoreDef<Module extends string, Shape, Commands, Events = {}> {
         readonly [Type]: {
           module: Module
           shape: Shape
           commands: Commands
+          events: Events
         }
       }
 
@@ -252,6 +253,7 @@ defmodule Musubi.Codegen.TypeScript do
   defp render_store_def({module, data}, indent, root) do
     fields = Map.fetch!(data, :fields)
     commands = Map.fetch!(data, :commands)
+    events = Map.get(data, :events, [])
     uploads = Map.get(data, :uploads, [])
 
     ensure_no_state_upload_collision!(module, fields, uploads)
@@ -277,10 +279,35 @@ defmodule Musubi.Codegen.TypeScript do
       shape_indent,
       "},\n",
       render_commands_block(commands, shape_indent, root),
+      ",\n",
+      render_events_block(events, shape_indent, root),
       "\n",
       indent,
       ">"
     ]
+  end
+
+  defp render_events_block([], indent, _root), do: [indent, "{}"]
+
+  defp render_events_block(events, indent, root) do
+    inner_indent = indent <> "  "
+
+    body =
+      Enum.map_join(events, "\n", fn %{name: name, payload_fields: payload_fields} ->
+        entry_indent = inner_indent <> "  "
+
+        IO.iodata_to_binary([
+          inner_indent,
+          Atom.to_string(name),
+          ": {\n",
+          render_command_fields_block("payload", payload_fields, entry_indent, root),
+          "\n",
+          inner_indent,
+          "}"
+        ])
+      end)
+
+    [indent, "{\n", body, "\n", indent, "}"]
   end
 
   defp render_upload_fields([], _indent), do: []

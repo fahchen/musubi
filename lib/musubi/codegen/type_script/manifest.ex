@@ -49,6 +49,7 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
             kind: :state | :store,
             fields: list(),
             commands: list(),
+            events: list(),
             uploads: list()
           }
   def collect(%Macro.Env{module: module} = env) do
@@ -57,6 +58,7 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
       kind: env_kind(env) || module_kind(module),
       fields: expand_field_aliases(List.wrap(module.__musubi__(:fields)), env),
       commands: expand_command_aliases(List.wrap(module.__musubi__(:commands)), env),
+      events: expand_event_aliases(List.wrap(module.__musubi__(:events)), env),
       uploads: read_uploads(module)
     }
   end
@@ -141,6 +143,12 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
       command
       |> Map.put(:payload_fields, payload_fields)
       |> Map.put(:reply_fields, reply_fields)
+    end)
+  end
+
+  defp expand_event_aliases(events, env) do
+    Enum.map(events, fn event ->
+      Map.put(event, :payload_fields, expand_field_list(event, :payload_fields, env))
     end)
   end
 
