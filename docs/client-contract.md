@@ -233,12 +233,18 @@ type StreamOp =
       item_key: string
     }
 
+type PushEvent = {
+  name: string
+  payload: unknown
+}
+
 type PatchEnvelope = {
   type: "patch"
   base_version: number
   version: number
   ops: JsonPatchOp[]
   stream_ops: StreamOp[]
+  events: PushEvent[]
 }
 
 type WireStreamMarker = {
@@ -260,9 +266,13 @@ Envelope rules:
   (matching that channel's root) for envelope symmetry
 - stream placement paths contain `WireStreamMarker` objects in `ops`
 - stream contents move through `stream_ops`
+- `events` carries transient push events (BDR-0032), dispatched once on receipt
+  via `store.handleEvent(name, cb)`; they own no version/recovery state and are
+  not replayed on reconnect. A cycle with only events still emits an envelope and
+  bumps `version`
 
 See `Musubi.Stream` for declaration, render placement, and validation
-rules.
+rules, and `docs/push-events.md` for push events.
 
 ## Async Values
 
@@ -480,6 +490,7 @@ interface StoreRuntime<M extends StoreModule<R>, R> {
     payload: CommandPayload<M, K, R>
   ): Promise<CommandReply<M, K, R>>
   subscribe(listener: () => void): () => void
+  handleEvent(name: string, handler: (payload: unknown) => void): () => void
   snapshot(): StoreSnapshot<M, R>
 }
 

@@ -22,8 +22,8 @@ Musubi is pre-1.0. The public model is intentionally narrow:
 - socket modules declare mountable roots with `use Musubi.Socket, roots: [...]`
 - clients call `connect(socket)` once, then mount root stores by `{module, id}`
 - child stores are created by server render output and are not mounted directly
-- commands, streams, async values, uploads, and patch application are handled
-  by the runtime packages
+- commands, streams, async values, uploads, push events, and patch application
+  are handled by the runtime packages
 
 Breaking changes are still possible before 1.0.
 
