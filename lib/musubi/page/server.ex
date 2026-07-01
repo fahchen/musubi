@@ -20,9 +20,11 @@ defmodule Musubi.Page.Server do
   initial envelope replaces the entire root path (`""`) with the freshly
   rendered wire root and starts the version counter at 1.
 
-  Idle render cycles (no diff ops, no stream ops) emit nothing per BDR-0018.
-  Halted commands (a `:before_command` hook returned `{:halt, ...}`) skip the
-  render cycle entirely — there is no state mutation to diff.
+  Idle render cycles (no diff ops, no stream ops, no events) emit nothing per
+  BDR-0018. A halted command (a `:before_command` hook returned `{:halt, ...}`)
+  renders the same way — the push is content-driven, not halt-driven (BDR-0008):
+  if the halting hook mutated state or queued stream/event ops those ship in one
+  envelope; a pure denial that changed nothing emits nothing.
   """
 
   use GenServer
