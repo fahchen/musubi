@@ -417,7 +417,7 @@ A handler raise in `handle_command/3` or `render/1` terminates the page runtime 
 
 ### Authorization
 
-Authorization is a `:before_command` hook that returns `{:halt, %{ok: false, reason: "unauthorized", ...}, socket}` to deny a command. The transport reply has channel status `:ok` and the payload carries the explicit denial flag (BDR-0008). There is no silent-ok downgrade and no wire-level error category — denials are graceful business outcomes, while malformed commands let the runtime crash.
+Authorization is a `:before_command` hook that returns `{:halt, %{ok: false, reason: "unauthorized", ...}, socket}` to deny a command. The transport reply has channel status `:ok` and the payload carries the explicit denial flag (BDR-0008). There is no silent-ok downgrade and no wire-level error category — denials are graceful business outcomes, while malformed commands let the runtime crash. The `:halt` path renders uniformly with `:cont`, so a patch push is content-driven, not halt-driven: a well-behaved deny hook mutates nothing and no patch follows, but a hook that changes rendered state (or queues stream/push-event ops) before halting ships that in one envelope.
 
 ### System commands
 
