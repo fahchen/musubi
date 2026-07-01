@@ -488,7 +488,7 @@ defmodule Musubi.Page.Server do
     Telemetry.emit([:musubi, :command, :start], %{system_time: System.system_time()}, base_meta)
 
     try do
-      {pipeline_status, reply, next_state, envelope} =
+      {_pipeline_status, reply, next_state, envelope} =
         run_command_with_render(store_id, command_name, payload, state)
 
       Telemetry.emit(
@@ -497,7 +497,7 @@ defmodule Musubi.Page.Server do
         Map.put(base_meta, :status, :ok)
       )
 
-      if pipeline_status == :ok do
+      if envelope do
         Telemetry.emit(
           [:musubi, :patch, :stop],
           %{
@@ -707,18 +707,12 @@ defmodule Musubi.Page.Server do
     {pipeline_status, reply, state} =
       run_command_pipeline(store_id, command_name, payload, state)
 
-    case pipeline_status do
-      :ok ->
-        {next_state, envelope} = render_and_envelope(state)
-        {:ok, reply, next_state, envelope}
-
-      :halted ->
-        # A halted command emits no envelope, so drain and discard any events a
-        # before_command hook queued before halting — otherwise they would leak
-        # into the next render cycle and fire out of context (BDR-0032).
-        {_discarded, store_table} = flush_all_events(state.store_table)
-        {:halted, reply, %{state | store_table: store_table}, nil}
-    end
+    # Render in both the :ok and :halted paths: a halting before_command hook may
+    # have mutated state or queued stream/push-event ops on the socket, and those
+    # ship in one envelope just like a handler's changes. A pure denial (no state
+    # change) renders to no envelope, so nothing is pushed.
+    {next_state, envelope} = render_and_envelope(state)
+    {pipeline_status, reply, next_state, envelope}
   end
 
   @spec render_and_envelope(State.t()) :: {State.t(), PatchEnvelope.t() | nil}
