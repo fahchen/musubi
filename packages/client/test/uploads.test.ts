@@ -6,7 +6,8 @@ import {
   pruneUploads,
   UploadHandleImpl
 } from "../src/uploads"
-import type { ChannelLike, PushLike, RootConnection } from "../src/runtime"
+import { openConnectionState } from "../src/runtime"
+import type { ChannelLike, PushLike, RootConnection, SocketLike } from "../src/runtime"
 import type { ExternalUploader } from "../src/types"
 
 interface CapturedPush {
@@ -51,26 +52,25 @@ function fakeConnection(options: {
   channel?: ChannelLike
   uploaders?: Record<string, ExternalUploader>
 } = {}): RootConnection {
+  const socket: SocketLike = {
+    connect: () => undefined,
+    channel: () => options.channel ?? ({} as never)
+  }
+  const connection = openConnectionState(socket, { uploaders: options.uploaders ?? {} }).connection
+
   return {
     module: "X",
+    callerId: "r1",
     id: "r1",
-    connection: {
-      socket: {
-        connect: () => undefined,
-        channel: () => options.channel ?? ({} as never)
-      },
-      topic: "musubi:t",
-      roots: new Map(),
-      uploaders: options.uploaders ?? {},
-      channel: options.channel,
-      channelGeneration: 0,
-      connectPromise: null,
-      suppressDisconnectEvent: false
-    },
+    connection,
     mountParams: {},
+    topic: "musubi:t",
     refCount: 1,
+    graceTimer: null,
+    initialPatchPromise: null,
     channel: options.channel,
     channelGeneration: 0,
+    suppressClose: false,
     root: undefined,
     version: 0,
     storeIndex: new Map(),
@@ -79,11 +79,13 @@ function fakeConnection(options: {
     proxyCache: new Map(),
     snapshotCache: new Map(),
     storeListeners: new Map(),
+    eventListeners: new Map(),
     pendingCommandRejectors: new Set(),
     pendingConnect: null,
-    connectPromise: null,
-    recovering: false
-  } as unknown as RootConnection
+    recovering: false,
+    pendingUnmountResolver: null,
+    cacheKey: null
+  }
 }
 
 function externalPreflightReply(entryRef: string) {
