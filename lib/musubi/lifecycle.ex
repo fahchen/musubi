@@ -12,11 +12,21 @@ defmodule Musubi.Lifecycle do
   | `:handle_info`     | 2     | `(message, socket)`                     |
   | `:after_render`   | 2     | `(resolved_elixir_term, socket)`        |
   | `:after_serialize` | 2     | `(wire_term, socket)`                   |
+  | `:before_events`   | 2     | `(events, socket)`                      |
 
   `:after_render` runs after `Musubi.Resolver` substitutes child placeholders;
   it sees the Elixir-form output (atom keys, structs, atom values).
   `:after_serialize` runs after `Musubi.Wire.to_wire/1` converts the resolved
   output to wire form (string keys, plain maps, atoms-as-strings).
+
+  `:before_events` is the one *outbound* stage: it runs on the root socket once
+  per render cycle, after the page server has drained and flattened the cycle's
+  push events (`Musubi.Event`, BDR-0032) from every store socket and before they
+  are folded into the patch envelope. Unlike the other stages it is a
+  *transform* stage — run it with `run_event_hooks/2`, and each hook returns
+  `{:cont | :halt, events, socket}` so a hook may rewrite, drop, or enrich the
+  outgoing event list (audit, redaction, telemetry). Default push-event payload
+  validation is attached here.
   """
 
   alias Musubi.Socket
@@ -28,6 +38,7 @@ defmodule Musubi.Lifecycle do
           | :handle_info
           | :after_render
           | :after_serialize
+          | :before_events
 
   @type hook_id() :: term()
   @type hook_result() :: {:cont, Socket.t()} | {:halt, Socket.t()} | {:halt, term(), Socket.t()}
@@ -41,7 +52,8 @@ defmodule Musubi.Lifecycle do
     :handle_async,
     :handle_info,
     :after_render,
-    :after_serialize
+    :after_serialize,
+    :before_events
   ]
   @stage_arity %{
     before_command: 3,
@@ -49,7 +61,8 @@ defmodule Musubi.Lifecycle do
     handle_async: 3,
     handle_info: 2,
     after_render: 2,
-    after_serialize: 2
+    after_serialize: 2,
+    before_events: 2
   }
 
   @doc """
@@ -155,12 +168,51 @@ defmodule Musubi.Lifecycle do
   end
 
   @doc """
+  Runs the `:before_events` transform stage over a cycle's drained push events.
+
+  Unlike `run_hooks/4` (which only threads the socket), this folds the event
+  list through each hook: a hook receives `(events, socket)` and returns
+  `{:cont, events, socket}` to continue with a possibly-rewritten list, or
+  `{:halt, events, socket}` to stop the chain early. Returns the final
+  `{events, socket}`. With no hooks attached it returns them unchanged.
+
+  ## Examples
+
+      iex> socket =
+      ...>   Musubi.Lifecycle.attach_hook(%Musubi.Socket{}, :drop_pings, :before_events, fn events, socket ->
+      ...>     {:cont, Enum.reject(events, &(&1.name == "ping")), socket}
+      ...>   end)
+      iex> {events, _socket} =
+      ...>   Musubi.Lifecycle.run_event_hooks(socket, [%{name: "ping", payload: %{}}, %{name: "toast", payload: %{}}])
+      iex> Enum.map(events, & &1.name)
+      ["toast"]
+  """
+  @spec run_event_hooks(Socket.t(), [map()]) :: {[map()], Socket.t()}
+  def run_event_hooks(%Socket{} = socket, events) when is_list(events) do
+    socket
+    |> hooks()
+    |> Map.get(:before_events, [])
+    |> Enum.reduce_while({events, socket}, fn %{fun: fun}, {current_events, current_socket} ->
+      case fun.(current_events, current_socket) do
+        {:cont, next_events, %Socket{} = next_socket} when is_list(next_events) ->
+          {:cont, {next_events, next_socket}}
+
+        {:halt, next_events, %Socket{} = next_socket} when is_list(next_events) ->
+          {:halt, {next_events, next_socket}}
+
+        other ->
+          raise ArgumentError, "invalid :before_events hook result: #{inspect(other)}"
+      end
+    end)
+  end
+
+  @doc """
   Returns the supported lifecycle stages in execution order.
 
   ## Examples
 
       iex> Musubi.Lifecycle.stages()
-      [:before_command, :after_command, :handle_async, :handle_info, :after_render, :after_serialize]
+      [:before_command, :after_command, :handle_async, :handle_info, :after_render, :after_serialize, :before_events]
   """
   @spec stages() :: [stage()]
   def stages, do: @stages
@@ -176,6 +228,7 @@ defmodule Musubi.Lifecycle do
   | `:handle_info`     | 2     | `(message, socket)`                     |
   | `:after_render`   | 2     | `(resolved_elixir_term, socket)`        |
   | `:after_serialize` | 2     | `(wire_term, socket)`                   |
+  | `:before_events`   | 2     | `(events, socket)`                      |
 
   ## Examples
 

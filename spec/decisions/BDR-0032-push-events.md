@@ -85,6 +85,24 @@ guard, unlike commands (`ValidateCommandSchema` on client input). Validation
 runs in the same render cycle as the queuing handler, so a bad `push_event` in a
 command handler surfaces synchronously from `dispatch_command`.
 
+Because it is dev-correctness rather than a wire invariant, it is a **default
+lifecycle hook**, not hard-wired: `Musubi.Hooks.ValidateEvents` is attached at
+the outbound `:before_events` stage via `config :musubi, :default_hooks`, exactly
+like `ValidateRender` at `:after_serialize` — present in `:dev`/`:test`, absent
+in `:prod`. This keeps it consistent with the other dev-correctness validators —
+all detachable/replaceable, none raising in production — and means a released app
+never crashes a page over a malformed event.
+
+`:before_events` is added as the one *outbound* lifecycle stage (all others act
+on inbound commands or the render pipeline). It runs on the root socket, once per
+render cycle, over the flattened event list the page server drained from every
+store socket, immediately before the events fold into the envelope. Unlike the
+socket-only stages it is a **transform** stage — run via
+`Lifecycle.run_event_hooks/2`, each hook returns `{:cont | :halt, events, socket}`
+— so applications get a first-class extension point to audit, redact, enrich, or
+drop outgoing events (something LiveView's `push_event/3` has no equivalent for).
+Default payload validation is simply the first hook installed there.
+
 **Wire shape.** `PatchEnvelope` gains an `events` field. One event is
 `%{"name" => string, "payload" => wire}`. The envelope keeps `type: "patch"` —
 events are a field on the existing message, not a new frame:

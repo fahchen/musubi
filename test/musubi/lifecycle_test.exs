@@ -157,6 +157,51 @@ defmodule Musubi.LifecycleTest do
     assert Lifecycle.stage_arity(:handle_info) == 2
     assert Lifecycle.stage_arity(:after_render) == 2
     assert Lifecycle.stage_arity(:after_serialize) == 2
+    assert Lifecycle.stage_arity(:before_events) == 2
+  end
+
+  describe "run_event_hooks/2" do
+    setup do
+      socket = %Socket{id: "", parent_path: [], module: RootStore, assigns: %{}, private: %{}}
+      %{socket: socket, events: [%{name: "a", payload: %{}}, %{name: "b", payload: %{}}]}
+    end
+
+    test "returns events unchanged with no hooks", %{socket: socket, events: events} do
+      assert {^events, ^socket} = Lifecycle.run_event_hooks(socket, events)
+    end
+
+    test "threads a rewritten event list through the chain", %{socket: socket, events: events} do
+      socket =
+        socket
+        |> Lifecycle.attach_hook(:drop_a, :before_events, fn evs, s ->
+          {:cont, Enum.reject(evs, &(&1.name == "a")), s}
+        end)
+        |> Lifecycle.attach_hook(:tag, :before_events, fn evs, s ->
+          {:cont, Enum.map(evs, &Map.put(&1, :tagged, true)), s}
+        end)
+
+      assert {[%{name: "b", tagged: true}], ^socket} = Lifecycle.run_event_hooks(socket, events)
+    end
+
+    test "halt stops the chain, keeping that hook's events", %{socket: socket, events: events} do
+      socket =
+        socket
+        |> Lifecycle.attach_hook(:halt_empty, :before_events, fn _evs, s -> {:halt, [], s} end)
+        |> Lifecycle.attach_hook(:never, :before_events, fn _evs, _s ->
+          raise "should not run"
+        end)
+
+      assert {[], ^socket} = Lifecycle.run_event_hooks(socket, events)
+    end
+
+    test "raises on an invalid hook result", %{socket: socket, events: events} do
+      socket =
+        Lifecycle.attach_hook(socket, :bad, :before_events, fn _evs, s -> {:cont, s} end)
+
+      assert_raise ArgumentError, ~r/invalid :before_events hook result/, fn ->
+        Lifecycle.run_event_hooks(socket, events)
+      end
+    end
   end
 
   defp hook_fun_for(:before_command) do
@@ -181,5 +226,9 @@ defmodule Musubi.LifecycleTest do
 
   defp hook_fun_for(:after_serialize) do
     fn _wire_output, current_socket -> {:cont, current_socket} end
+  end
+
+  defp hook_fun_for(:before_events) do
+    fn events, current_socket -> {:cont, events, current_socket} end
   end
 end

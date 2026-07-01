@@ -119,6 +119,47 @@ defmodule Musubi.Page.ServerEventTest do
     def handle_command(:gated, _payload, socket), do: {:noreply, socket}
   end
 
+  defmodule TransformEventStore do
+    @moduledoc false
+    use Musubi.Store
+
+    alias Musubi.Lifecycle
+
+    state do
+      field :title, String.t()
+    end
+
+    command :emit
+
+    @impl Musubi.Store
+    def mount(socket) do
+      socket =
+        Lifecycle.attach_hook(socket, :redact, :before_events, fn events, sock ->
+          kept =
+            events
+            |> Enum.reject(&(&1.name == "secret"))
+            |> Enum.map(&Map.update!(&1, :payload, fn p -> Map.put(p, "seen", true) end))
+
+          {:cont, kept, sock}
+        end)
+
+      {:ok, assign(socket, :title, "Page")}
+    end
+
+    @impl Musubi.Store
+    def render(socket), do: %{title: socket.assigns.title}
+
+    @impl Musubi.Store
+    def handle_command(:emit, _payload, socket) do
+      socket =
+        socket
+        |> push_event("secret", %{n: 1})
+        |> push_event("public", %{n: 2})
+
+      {:noreply, socket}
+    end
+  end
+
   defp start!(assigns \\ %{}) do
     start_supervised!({Server, {RootStore, assigns, %{transport_pid: self()}}})
   end
@@ -201,5 +242,18 @@ defmodule Musubi.Page.ServerEventTest do
     assert_receive {:patch, env}
 
     assert %PatchEnvelope{events: [%{name: "from_child", payload: %{"ok" => true}}]} = env
+  end
+
+  test "a :before_events hook rewrites the outbound event list before egress" do
+    pid = start_supervised!({Server, {TransformEventStore, %{}, %{transport_pid: self()}}})
+    assert_receive {:patch, %PatchEnvelope{version: 1}}
+
+    # mount attaches a :before_events hook dropping "secret" and tagging the rest.
+    {:ok, %{}} = Server.command(pid, [], :emit, %{})
+    assert_receive {:patch, env}
+
+    assert %PatchEnvelope{
+             events: [%{name: "public", payload: %{"n" => 2, "seen" => true}}]
+           } = env
   end
 end

@@ -292,8 +292,7 @@ defmodule Musubi.Page.Server do
     {wire_root, store_table} = root_wire(store_table, root_socket)
     {stream_ops, store_table} = flush_all_stream_ops(store_table)
     {upload_ops_raw, store_table} = flush_all_upload_ops(store_table)
-    {events, store_table} = flush_all_events(store_table)
-    Event.validate_events!(events, root_module)
+    {events, store_table} = drain_events(store_table, root_socket)
 
     {upload_ops, upload_throttle} = throttle_progress(upload_ops_raw, %{})
 
@@ -725,8 +724,7 @@ defmodule Musubi.Page.Server do
     {wire_root, next_registry} = root_wire(next_registry, next_root_socket)
     {stream_ops, next_registry} = flush_all_stream_ops(next_registry)
     {upload_ops_raw, next_registry} = flush_all_upload_ops(next_registry)
-    {events, next_registry} = flush_all_events(next_registry)
-    Event.validate_events!(events, state.root_module)
+    {events, next_registry} = drain_events(next_registry, next_root_socket)
 
     {upload_ops, next_throttle} =
       throttle_progress(upload_ops_raw, state.upload_progress_last_emitted)
@@ -1074,6 +1072,26 @@ defmodule Musubi.Page.Server do
   # Drains push events (BDR-0032) from every store socket, flattened in
   # store_id order (root before children). Events are root-scoped: no store_id
   # tag is attached, unlike stream/upload ops.
+  # Drains a cycle's push events from every store socket, then runs the outbound
+  # `:before_events` transform stage on the root socket (BDR-0032): default
+  # payload validation plus any app-attached audit/redaction hook may rewrite or
+  # drop events before they fold into the envelope. The hooked root socket is
+  # written back so hook-side socket mutations persist.
+  @spec drain_events(StoreTable.t(), Socket.t()) :: {[Event.event()], StoreTable.t()}
+  defp drain_events(%StoreTable{} = registry, %Socket{} = fallback) do
+    {events, registry} = flush_all_events(registry)
+    {events, root} = Lifecycle.run_event_hooks(root_socket(registry, fallback), events)
+    {events, put_root_socket(registry, root)}
+  end
+
+  @spec put_root_socket(StoreTable.t(), Socket.t()) :: StoreTable.t()
+  defp put_root_socket(%StoreTable{} = registry, %Socket{} = socket) do
+    case StoreTable.get(registry, []) do
+      %Entry{} = entry -> StoreTable.put(registry, [], %{entry | socket: socket})
+      nil -> registry
+    end
+  end
+
   @spec flush_all_events(StoreTable.t()) :: {[Event.event()], StoreTable.t()}
   defp flush_all_events(%StoreTable{} = registry) do
     sorted_keys = registry |> StoreTable.keys() |> Enum.sort_by(&length/1)

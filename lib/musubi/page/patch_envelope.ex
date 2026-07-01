@@ -8,8 +8,9 @@ defmodule Musubi.Page.PatchEnvelope do
     * `ops` are the post-filtered Musubi JSON Patch ops (`add`/`remove`/`replace` only).
     * `stream_ops` carry stream-typed content (the wire tree carries stable
       `%{"__musubi_stream__" => name}` markers at stream placement paths).
-    * The page runtime emits an envelope when `ops` *or* `stream_ops` is
-      non-empty; an idle render cycle produces no envelope.
+    * The page runtime emits an envelope when `ops`, `stream_ops`, `upload_ops`,
+      or `events` is non-empty; an idle render cycle produces no envelope. The
+      skip is content-driven: `build/5` returns `nil` when all four are empty.
 
   ## Cross-track contract
 

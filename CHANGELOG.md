@@ -32,8 +32,15 @@ not in lockstep yet; entries note which surface they affect.
   store is a compile-time error (events are root-scoped). The declaration drives
   codegen — `StoreDef` gains a 4th `Events` type param (default `{}`, so existing
   references stay valid) — yielding typed `handleEvent` / `useMusubiEvent` whose
-  payload is inferred per event. Events are server-pushed (trusted), so there is
-  no runtime payload validation.
+  payload is inferred per event.
+- **`musubi`** — **`:before_events` lifecycle hook.** A new outbound lifecycle
+  stage runs on the root socket over a cycle's flattened push-event list before
+  it folds into the envelope. It is a transform stage (`run_event_hooks/2`; hooks
+  return `{:cont | :halt, events, socket}`), so apps can audit, redact, enrich, or
+  drop outgoing events. Declared-event payload validation ships as a default hook
+  here (`Musubi.Hooks.ValidateEvents`), attached in dev/test and detachable via
+  `:default_hooks` — dev-correctness, not a security boundary, and never raises in
+  prod.
 
 ## [0.12.0] — 2026-06-27
 

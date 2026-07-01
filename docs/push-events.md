@@ -42,6 +42,32 @@ mismatch raises `ArgumentError`, the same treatment a command reply gets from it
 declared schema. An undeclared event name is not validated. A bad `push_event` in
 a command handler surfaces synchronously from the dispatch.
 
+This validation is a **default `:before_events` hook** (`Musubi.Hooks.ValidateEvents`),
+attached exactly like render validation — on in `:dev`/`:test`, absent in `:prod` —
+through `config :musubi, :default_hooks`. Detach or replace it there so production
+never raises on a malformed event.
+
+## Extending: the `:before_events` hook
+
+`:before_events` is an outbound lifecycle stage (`Musubi.Lifecycle`) that runs on
+the root socket once per render cycle, over the cycle's flattened event list,
+just before it folds into the envelope. It is a *transform* stage: attach a hook
+returning `{:cont, events, socket}` (or `{:halt, events, socket}` to stop the
+chain) to audit, redact, enrich, or drop outgoing events.
+
+```elixir
+def mount(socket) do
+  socket =
+    Musubi.Lifecycle.attach_hook(socket, :redact, :before_events, fn events, socket ->
+      {:cont, Enum.reject(events, &(&1.name == "internal")), socket}
+    end)
+
+  {:ok, socket}
+end
+```
+
+Default payload validation is just the first hook attached at this stage.
+
 ## Server
 
 Queue an event from any store callback (a command handler, `handle_info`,

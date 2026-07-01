@@ -27,11 +27,17 @@ reply_schema_hook =
 # Hooks are user-removable; pending stream ops MUST flush every cycle, so the
 # prune step lives in the runtime.
 
+# Dev/test-only validation hooks. `ValidateRender` checks render output at
+# `:after_serialize`; `ValidateEvents` checks push-event payloads at the
+# outbound `:before_events` stage (BDR-0032). Both raise in dev/test and are
+# absent in prod — detach or replace via an app's own `:default_hooks`.
 state_validation_hooks =
   if config_env() in [:dev, :test] do
     [
       {Musubi.Hooks.ValidateRender, :after_serialize,
-       &Musubi.Hooks.ValidateRender.after_serialize(:raise, &1, &2)}
+       &Musubi.Hooks.ValidateRender.after_serialize(:raise, &1, &2)},
+      {Musubi.Hooks.ValidateEvents, :before_events,
+       &Musubi.Hooks.ValidateEvents.before_events/2}
     ]
   else
     []
