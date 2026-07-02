@@ -103,6 +103,7 @@ defmodule Musubi.MixProject do
         "guides/testing.md",
         "docs/client-contract.md",
         "docs/streams.md",
+        {"docs/uploads.md", filename: "uploads-reference", title: "Uploads reference"},
         "docs/push-events.md",
         "docs/persistence-pattern.md"
       ],
@@ -117,6 +118,7 @@ defmodule Musubi.MixProject do
         Reference: [
           "docs/client-contract.md",
           "docs/streams.md",
+          "docs/uploads.md",
           "docs/push-events.md",
           "docs/persistence-pattern.md"
         ]
@@ -196,6 +198,7 @@ defmodule Musubi.MixProject do
       "Musubi.State.__using__/1",
       "Musubi.Store.__using__/1",
       "Musubi.Stream.Slot",
+      "Musubi.Transport.UploadChannel",
       "Musubi.Type",
       "Musubi.Wire",
       "Resolver",
