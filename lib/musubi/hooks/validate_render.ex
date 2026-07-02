@@ -47,7 +47,11 @@ defmodule Musubi.Hooks.ValidateRender do
 
   @spec validate_root_frame(validation_mode(), Frame.t(), Socket.t()) ::
           {:cont, Frame.t(), Socket.t()}
-  defp validate_root_frame(mode, %Frame{render: wire_term} = frame, %Socket{module: store_module} = socket)
+  defp validate_root_frame(
+         mode,
+         %Frame{render: wire_term} = frame,
+         %Socket{module: store_module} = socket
+       )
        when is_atom(store_module) do
     case validate(wire_term, store_module) do
       :ok ->

@@ -1078,7 +1078,10 @@ defmodule Musubi.Page.Server do
     |> Enum.reduce({nil, [], registry}, &serialize_entry/2)
   end
 
-  @spec serialize_entry(store_id(), {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}) ::
+  @spec serialize_entry(
+          store_id(),
+          {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}
+        ) ::
           {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}
   defp serialize_entry(store_id, {wire_root, events_acc, reg}) do
     case StoreTable.get(reg, store_id) do

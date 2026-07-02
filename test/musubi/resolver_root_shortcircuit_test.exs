@@ -80,7 +80,7 @@ defmodule Musubi.ResolverRootShortCircuitTest do
 
     socket =
       Lifecycle.attach_hook(root_socket, :root_after_render, :after_render, fn frame,
-                                                                              current_socket ->
+                                                                               current_socket ->
         send(test_pid, :root_after_render_called)
         {:cont, frame, current_socket}
       end)
@@ -115,7 +115,7 @@ defmodule Musubi.ResolverRootShortCircuitTest do
 
     socket =
       Lifecycle.attach_hook(root_socket, :root_after_render, :after_render, fn frame,
-                                                                              current_socket ->
+                                                                               current_socket ->
         send(test_pid, :root_after_render_called)
         {:cont, frame, current_socket}
       end)

@@ -186,7 +186,9 @@ defmodule Musubi.LifecycleTest do
     test "halt stops the chain, keeping that hook's datum", %{socket: socket, frame: frame} do
       socket =
         socket
-        |> Lifecycle.attach_hook(:halt, :after_serialize, fn f, s -> {:halt, Map.put(f, :h, 1), s} end)
+        |> Lifecycle.attach_hook(:halt, :after_serialize, fn f, s ->
+          {:halt, Map.put(f, :h, 1), s}
+        end)
         |> Lifecycle.attach_hook(:never, :after_serialize, fn _f, _s -> raise "should not run" end)
 
       assert {%{h: 1}, ^socket} = Lifecycle.run_transform_hooks(socket, :after_serialize, frame)
