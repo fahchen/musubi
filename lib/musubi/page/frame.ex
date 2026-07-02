@@ -12,13 +12,20 @@ defmodule Musubi.Page.Frame do
   rewrite `render` or `events`.
   """
 
+  use TypedStructor
+
   alias Musubi.Event
   alias Musubi.Page.StoreTable.Entry
 
-  @type t() :: %__MODULE__{
-          render: Entry.resolved_state() | Entry.wire_state() | nil,
-          events: [Event.event()]
-        }
+  typed_structor do
+    field :render, Entry.resolved_state() | Entry.wire_state() | nil,
+      default: nil,
+      doc:
+        "This socket's render output — Elixir form at `:after_render`, wire form at `:after_serialize`."
 
-  defstruct render: nil, events: []
+    field :events, [Event.event()],
+      default: [],
+      doc:
+        "Push events this socket queued (BDR-0032). Empty at `:after_render`; drained/wire-encoded at `:after_serialize`."
+  end
 end

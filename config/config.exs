@@ -27,38 +27,37 @@ reply_schema_hook =
 # Hooks are user-removable; pending stream ops MUST flush every cycle, so the
 # prune step lives in the runtime.
 
-# Dev/test-only render validation hook (`:after_serialize`, over `frame.render`).
-# Root-only: the root's frame carries the whole stitched wire tree, and its
-# validator recurses into child slots — validating a child's frame standalone
-# would reject legitimately-transient async/loading render. Raises in dev/test,
-# absent in prod — detach/replace via an app's own `:default_hooks`.
+# Dev/test-only validation hooks (both `:after_serialize`, over the per-socket
+# frame), absent in prod. Detach/replace via the app's own `:default_hooks` /
+# `:store_hooks`.
+#
+#   * render validation is root-only (`:default_hooks`): the root frame carries
+#     the whole stitched wire tree and its validator recurses into child slots —
+#     validating a child frame standalone would reject legitimately-transient
+#     async/loading render.
+#   * event validation is per-store (`:store_hooks`): each store validates its
+#     own `frame.events` (BDR-0032).
+dev_test? = config_env() in [:dev, :test]
+
 render_validation_hooks =
-  if config_env() in [:dev, :test] do
-    [
+  if dev_test?,
+    do: [
       {Musubi.Hooks.ValidateRender, :after_serialize,
        &Musubi.Hooks.ValidateRender.after_serialize(:raise, &1, &2)}
-    ]
-  else
-    []
-  end
+    ],
+    else: []
 
-config :musubi,
-       :default_hooks,
-       [command_schema_hook, reply_schema_hook | render_validation_hooks]
+event_validation_hooks =
+  if dev_test?,
+    do: [
+      {Musubi.Hooks.ValidateEvents, :after_serialize,
+       &Musubi.Hooks.ValidateEvents.after_serialize/2}
+    ],
+    else: []
 
-# Per-store hooks attached to every store socket (root + children), so each store
-# validates its own concerns. `ValidateEvents` (`:after_serialize`, over
-# `frame.events`, BDR-0032) checks a store's push-event payloads against its
-# declared `event` schema. Dev/test only, detach/replace via `:store_hooks`.
-config :musubi,
-       :store_hooks,
-       if(config_env() in [:dev, :test],
-         do: [
-           {Musubi.Hooks.ValidateEvents, :after_serialize,
-            &Musubi.Hooks.ValidateEvents.after_serialize/2}
-         ],
-         else: []
-       )
+# `:default_hooks` — root socket. `:store_hooks` — every store socket.
+config :musubi, :default_hooks, [command_schema_hook, reply_schema_hook | render_validation_hooks]
+config :musubi, :store_hooks, event_validation_hooks
 
 if File.exists?(Path.join(__DIR__, "#{config_env()}.exs")) do
   import_config "#{config_env()}.exs"
