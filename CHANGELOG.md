@@ -11,6 +11,8 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-07-02
+
 ### Added
 
 - **`musubi` / `@musubi/client` / `@musubi/react`** — **Push events** (BDR-0032):
@@ -34,10 +36,12 @@ not in lockstep yet; entries note which surface they affect.
   stores never collides. The declaration drives codegen — `StoreDef` gains a 4th
   `Events` type param (default `{}`, so existing references stay valid) — yielding
   typed `handleEvent` / `useMusubiEvent` per store.
-- **`musubi`** — **`:after_render` / `:after_serialize` are transform stages.**
-  Both carry a per-socket `Musubi.Page.Frame` (`%{render, events}`) and return
-  `{:cont | :halt, frame, socket}` (`Lifecycle.run_transform_hooks/3`), so apps
-  can rewrite outbound render/events (audit, redact, enrich, drop). `:after_serialize`
+- **`musubi`** — **Breaking: `:after_render` / `:after_serialize` are transform
+  stages.** Both now carry a per-socket `Musubi.Page.Frame` (`%{render, events}`)
+  and return `{:cont | :halt, frame, socket}` (`Lifecycle.run_transform_hooks/3`)
+  instead of the bare term + socket — existing hooks on these stages must be
+  updated. Apps can now rewrite outbound render/events (audit, redact, enrich,
+  drop). `:after_serialize`
   runs at the page server's aggregation phase, iterating the registry so events
   on memoized sockets still flush. Declared-event payload validation ships as a
   default `:after_serialize` hook (`Musubi.Hooks.ValidateEvents`) in
@@ -463,7 +467,8 @@ Initial public release of the Musubi runtime (then `Arbor`):
 - TypeScript client and React adapter that materialize the diff stream
   into immutable snapshots.
 
-[Unreleased]: https://github.com/fahchen/musubi/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/fahchen/musubi/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/fahchen/musubi/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/fahchen/musubi/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/fahchen/musubi/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/fahchen/musubi/compare/v0.10.0...v0.11.0
