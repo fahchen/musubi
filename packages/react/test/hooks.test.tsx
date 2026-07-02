@@ -33,6 +33,9 @@ type ReactTestStores = {
     },
     {
       rename: { payload: { title: string }; reply: { ok: true } }
+    },
+    {
+      toast: { payload: { msg: string } }
     }
   >
 }
@@ -44,6 +47,7 @@ const {
   useMusubiCommand,
   useMusubiConnection,
   useMusubiConnectionStatus,
+  useMusubiEvent,
   useMusubiRoot,
   useMusubiRootSuspense,
   useMusubiSnapshot
@@ -129,7 +133,7 @@ describe("MusubiProvider + useMusubiRoot", () => {
         return <span>{root.status}</span>
       }
 
-      return <span>{root.store.snapshot().title}</span>
+      return <span>{root.store.snapshot()!.title}</span>
     }
 
     const result = render(
@@ -169,7 +173,7 @@ describe("MusubiProvider + useMusubiRoot", () => {
         return <span>{root.status}</span>
       }
 
-      return <span>{root.store.snapshot().title}</span>
+      return <span>{root.store.snapshot()!.title}</span>
     }
 
     const result = render(
@@ -240,7 +244,7 @@ describe("useMusubiSnapshot", () => {
     function Reader() {
       renders += 1
       const snapshot = useMusubiSnapshot(fake.asProxy())
-      return <span>{snapshot.counter}</span>
+      return <span>{snapshot!.counter}</span>
     }
 
     render(<Reader />)
@@ -261,7 +265,7 @@ describe("useMusubiSnapshot", () => {
 
     function Reader() {
       renders += 1
-      const title = useMusubiSnapshot(fake.asProxy(), (s) => s.title)
+      const title = useMusubiSnapshot(fake.asProxy(), (s) => s!.title)
       return <span>{title}</span>
     }
 
@@ -460,6 +464,51 @@ describe("useMusubiCommand", () => {
   })
 })
 
+describe("useMusubiEvent", () => {
+  test("subscribes to push events and unsubscribes on unmount", () => {
+    const fake = buildProxy()
+    const handler = vi.fn()
+
+    function Listener() {
+      useMusubiEvent(fake.asProxy(), "toast", handler)
+      return null
+    }
+
+    const view = render(<Listener />)
+
+    act(() => fake.emitEvent("toast", { msg: "hi" }))
+    expect(handler).toHaveBeenCalledTimes(1)
+    expect(handler).toHaveBeenCalledWith({ msg: "hi" })
+
+    view.unmount()
+    act(() => fake.emitEvent("toast", { msg: "again" }))
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
+
+  test("does not resubscribe when the handler identity changes, and calls the latest", () => {
+    const fake = buildProxy()
+    const subscribeSpy = vi.spyOn(fake, "handleEvent")
+
+    function Listener({ onEvent }: { onEvent: (payload: unknown) => void }) {
+      useMusubiEvent(fake.asProxy(), "toast", onEvent)
+      return null
+    }
+
+    const first = vi.fn()
+    const view = render(<Listener onEvent={first} />)
+    expect(subscribeSpy).toHaveBeenCalledTimes(1)
+
+    const second = vi.fn()
+    view.rerender(<Listener onEvent={second} />)
+    // New handler closure must NOT trigger a re-subscribe.
+    expect(subscribeSpy).toHaveBeenCalledTimes(1)
+
+    act(() => fake.emitEvent("toast", { msg: "latest" }))
+    expect(first).not.toHaveBeenCalled()
+    expect(second).toHaveBeenCalledWith({ msg: "latest" })
+  })
+})
+
 describe("useMusubiRoot stale-while-revalidate", () => {
   function SwrReader({ id, keepPreviousData }: { id: string; keepPreviousData?: boolean }) {
     const root = useMusubiRoot({
@@ -472,7 +521,7 @@ describe("useMusubiRoot stale-while-revalidate", () => {
       return <span>{root.status}</span>
     }
     const error = root.revalidationError ? root.revalidationError.message : "none"
-    return <span>{`${root.store.snapshot().title}:${String(root.isFetching)}:${error}`}</span>
+    return <span>{`${root.store.snapshot()!.title}:${String(root.isFetching)}:${error}`}</span>
   }
 
   test("a cache-seeded mount is ready with isFetching until revalidation settles", async () => {
@@ -675,7 +724,7 @@ describe("useMusubiRootSuspense", () => {
 
     function Reader() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "sus-1" })
-      return <span>{store.snapshot().title}</span>
+      return <span>{store.snapshot()!.title}</span>
     }
 
     render(
@@ -703,7 +752,7 @@ describe("useMusubiRootSuspense", () => {
 
     function Reader() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "sus-fail" })
-      return <span>{store.snapshot().title}</span>
+      return <span>{store.snapshot()!.title}</span>
     }
 
     const originalError = console.error
@@ -736,7 +785,7 @@ describe("useMusubiRootSuspense", () => {
 
     function SuspenseReader() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "shared-1" })
-      return <span>suspense:{store.snapshot().title}</span>
+      return <span>suspense:{store.snapshot()!.title}</span>
     }
 
     const result = render(
@@ -766,7 +815,7 @@ describe("useMusubiRootSuspense", () => {
 
     function Reader() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "orphan-1" })
-      return <span>{store.snapshot().title}</span>
+      return <span>{store.snapshot()!.title}</span>
     }
 
     const result = render(
@@ -819,7 +868,7 @@ describe("useMusubiRootSuspense", () => {
 
     function Reader() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "lease-1" })
-      return <span>{store.snapshot().title}</span>
+      return <span>{store.snapshot()!.title}</span>
     }
 
     const result = render(
@@ -882,7 +931,7 @@ describe("useMusubiRootSuspense", () => {
 
     function Reader() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "stale-1" })
-      return <span>stale:{store.snapshot().title}</span>
+      return <span>stale:{store.snapshot()!.title}</span>
     }
 
     const result = render(
@@ -957,7 +1006,7 @@ describe("useMusubiRootSuspense", () => {
 
     function Reader() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "sibling-1" })
-      return <span>strict:{store.snapshot().title}</span>
+      return <span>strict:{store.snapshot()!.title}</span>
     }
 
     const result = render(
@@ -996,7 +1045,7 @@ describe("useMusubiRootSuspense", () => {
 
     function Reader() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "committed-1" })
-      return <span>commit:{store.snapshot().title}</span>
+      return <span>commit:{store.snapshot()!.title}</span>
     }
 
     const result = render(
@@ -1040,7 +1089,7 @@ describe("useMusubiRootSuspense", () => {
     function Reader() {
       const root = useMusubiRoot({ module: "React.Test.Root", id: "retry-1" })
       if (root.status === "error") return <span>err:{root.error.message}</span>
-      if (root.status === "ready") return <span>ok:{root.store.snapshot().title}</span>
+      if (root.status === "ready") return <span>ok:{root.store.snapshot()!.title}</span>
       return <span>load</span>
     }
 
@@ -1097,11 +1146,11 @@ describe("useMusubiRootSuspense", () => {
 
     function ListRoot() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "list-1" })
-      return <span>list:{store.snapshot().title}</span>
+      return <span>list:{store.snapshot()!.title}</span>
     }
     function DetailRoot() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "detail-1" })
-      return <span>detail:{store.snapshot().title}</span>
+      return <span>detail:{store.snapshot()!.title}</span>
     }
 
     // Each route has its own Suspense boundary, mirroring the dashboard
@@ -1224,7 +1273,7 @@ describe("useMusubiRootSuspense", () => {
         module: "React.Test.Root",
         id: "race-1"
       })
-      return <span>ready:{store.snapshot().title}</span>
+      return <span>ready:{store.snapshot()!.title}</span>
     }
 
     render(
@@ -1319,11 +1368,11 @@ describe("useMusubiRootSuspense", () => {
 
     function ListRoot() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "list-2" })
-      return <span>list:{store.snapshot().title}</span>
+      return <span>list:{store.snapshot()!.title}</span>
     }
     function DetailRoot() {
       const store = useMusubiRootSuspense({ module: "React.Test.Root", id: "detail-2" })
-      return <span>detail:{store.snapshot().title}</span>
+      return <span>detail:{store.snapshot()!.title}</span>
     }
 
     let setRoute: (next: "list" | "detail") => void = () => {}
@@ -1441,7 +1490,7 @@ describe("MusubiProvider socket form", () => {
     function Inner() {
       const root = useMusubiRoot({ module: "React.Test.Root", id: "from-socket" })
       if (root.status !== "ready") return <span>root:{root.status}</span>
-      return <span>title:{root.store.snapshot().title}</span>
+      return <span>title:{root.store.snapshot()!.title}</span>
     }
 
     try {
@@ -1575,8 +1624,8 @@ describe("useMusubiSnapshot default shallowEqual", () => {
       // Selector returns a fresh tuple every call; default shallowEqual
       // should treat (0, "Inbox") === (0, "Inbox") as equal.
       const view = useMusubiSnapshot(fake.asProxy(), (s) => ({
-        counter: s.counter,
-        title: s.title
+        counter: s!.counter,
+        title: s!.title
       }))
       return <span>{view.title}:{view.counter}</span>
     }

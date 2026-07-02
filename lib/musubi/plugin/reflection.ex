@@ -29,6 +29,9 @@ defmodule Musubi.Plugin.Reflection do
     commands =
       module |> Module.get_attribute(:__musubi_commands__) |> List.wrap() |> Enum.reverse()
 
+    events =
+      module |> Module.get_attribute(:__musubi_events__) |> List.wrap() |> Enum.reverse()
+
     attrs = module |> Module.get_attribute(:__musubi_attrs__) |> List.wrap() |> Enum.reverse()
 
     uploads =
@@ -41,6 +44,7 @@ defmodule Musubi.Plugin.Reflection do
       fields: fields,
       streams: streams,
       commands: commands,
+      events: events,
       attrs: attrs,
       uploads: uploads,
       root?: root?
@@ -52,6 +56,7 @@ defmodule Musubi.Plugin.Reflection do
       fields: fields,
       streams: streams,
       commands: commands,
+      events: events,
       attrs: attrs,
       uploads: uploads,
       root?: root?
@@ -60,6 +65,7 @@ defmodule Musubi.Plugin.Reflection do
     [
       quote(do: def(__musubi__(:fields), do: unquote(Macro.escape(fields)))),
       quote(do: def(__musubi__(:commands), do: unquote(Macro.escape(commands)))),
+      quote(do: def(__musubi__(:events), do: unquote(Macro.escape(events)))),
       quote(do: def(__musubi__(:streams), do: unquote(Macro.escape(streams)))),
       quote(do: def(__musubi__(:attrs), do: unquote(Macro.escape(attrs)))),
       quote(do: def(__musubi__(:uploads), do: unquote(Macro.escape(uploads)))),
@@ -78,12 +84,14 @@ defmodule Musubi.Plugin.Reflection do
   defp build_all_singular_clauses(sections) do
     build_singular_clauses(:field, sections.fields, & &1.name) ++
       build_singular_clauses(:command, sections.commands, & &1.name) ++
+      build_singular_clauses(:event, sections.events, & &1.name) ++
       build_singular_clauses(:stream, sections.streams, & &1.name) ++
       build_singular_clauses(:attr, sections.attrs, & &1.name) ++
       build_singular_clauses(:upload, sections.uploads, & &1.name) ++
       [
         quote(do: def(__musubi__(:field, _name), do: :error)),
         quote(do: def(__musubi__(:command, _name), do: :error)),
+        quote(do: def(__musubi__(:event, _name), do: :error)),
         quote(do: def(__musubi__(:stream, _name), do: :error)),
         quote(do: def(__musubi__(:attr, _name), do: :error)),
         quote(do: def(__musubi__(:upload, _name), do: :error))

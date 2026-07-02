@@ -60,7 +60,7 @@ defmodule Mix.Tasks.Compile.MusubiTsTest do
       refute contents =~ "export {}"
       refute contents =~ ~s|import "@musubi/client"|
       assert contents =~ "type AsyncResult<T>"
-      assert contents =~ "interface StoreDef<Module extends string, Shape, Commands>"
+      assert contents =~ "interface StoreDef<Module extends string, Shape, Commands, Events = {}>"
       assert contents =~ ~s|"Musubi.TestSupport.TypespecProbe": StoreDef<|
       assert contents =~ ~s|"Musubi.TestSupport.TypespecProbeChild": StoreDef<|
       assert contents =~ "Musubi.StreamField<"

@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
-import type { PatchEnvelope, ConnectionPatchEnvelope, SnapshotValue } from "../src/types"
+import type {
+  PatchEnvelope,
+  ConnectionPatchEnvelope,
+  SnapshotValue,
+  EventName,
+  EventPayload
+} from "../src/types"
 import type { MountedStore, MusubiConnection } from "../src/connect"
 
 type PushStatus = "ok" | "error" | "timeout"
@@ -151,6 +157,10 @@ type TestStores = {
         payload: { title: string }
         reply: { ok: true }
       }
+    },
+    {
+      toast: { payload: { msg: string } }
+      synced: { payload: { count: number } }
     }
   >
 
@@ -178,11 +188,19 @@ type Equal<Left, Right> =
 
 type Assert<T extends true> = T
 
-type PlainObjectSnapshot = Assert<
-  Equal<SnapshotValue<{ title: string }>, { title: string }>
+// Event typing: names form a union, but each call's payload is the *specific*
+// event's payload (not a union of all payloads).
+type _EventNames = Assert<Equal<EventName<"Test.Store", TestStores>, "toast" | "synced">>
+type _ToastPayload = Assert<Equal<EventPayload<"Test.Store", "toast", TestStores>, { msg: string }>>
+type _SyncedPayload = Assert<
+  Equal<EventPayload<"Test.Store", "synced", TestStores>, { count: number }>
 >
 
-type EmptyObjectSnapshot = Assert<Equal<SnapshotValue<{}>, {}>>
+type PlainObjectSnapshot = Assert<
+  Equal<SnapshotValue<{ title: string }, TestStores>, { title: string }>
+>
+
+type EmptyObjectSnapshot = Assert<Equal<SnapshotValue<{}, TestStores>, {}>>
 
 describe("connect", () => {
   beforeEach(() => {
@@ -311,6 +329,113 @@ describe("connect", () => {
     expect(beta.store.counter).toBe(9)
     expect(alphaListener).not.toHaveBeenCalled()
     expect(betaListener).toHaveBeenCalledTimes(1)
+  })
+
+  test("handleEvent receives push events folded into the patch envelope", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1" })
+
+    const toastHandler = vi.fn()
+    const off = mounted.store.handleEvent("toast", toastHandler)
+
+    // Event-only envelope: empty ops, version still bumps (BDR-0032).
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 1,
+      version: 2,
+      ops: [],
+      stream_ops: [],
+      events: [{ store_id: [], name: "toast", payload: { msg: "saved" } }]
+    })
+
+    expect(toastHandler).toHaveBeenCalledTimes(1)
+    expect(toastHandler).toHaveBeenCalledWith({ msg: "saved" })
+
+    // Unknown event name is dropped (no registered handler).
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 2,
+      version: 3,
+      ops: [],
+      stream_ops: [],
+      events: [{ store_id: [], name: "other", payload: {} }]
+    })
+    expect(toastHandler).toHaveBeenCalledTimes(1)
+
+    // Unsubscribe stops delivery.
+    off()
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 3,
+      version: 4,
+      ops: [],
+      stream_ops: [],
+      events: [{ store_id: [], name: "toast", payload: { msg: "again" } }]
+    })
+    expect(toastHandler).toHaveBeenCalledTimes(1)
+  })
+
+  test("one envelope with multiple event types routes each to its own handler", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1" })
+
+    const toastHandler = vi.fn()
+    const syncedHandler = vi.fn()
+    mounted.store.handleEvent("toast", toastHandler)
+    mounted.store.handleEvent("synced", syncedHandler)
+
+    // Single envelope carrying three events: two registered (distinct payload
+    // types) and one with no handler.
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 1,
+      version: 2,
+      ops: [],
+      stream_ops: [],
+      events: [
+        { store_id: [], name: "toast", payload: { msg: "hi" } },
+        { store_id: [], name: "other", payload: { ignored: true } },
+        { store_id: [], name: "synced", payload: { count: 7 } }
+      ]
+    })
+
+    expect(toastHandler).toHaveBeenCalledTimes(1)
+    expect(toastHandler).toHaveBeenCalledWith({ msg: "hi" })
+    expect(syncedHandler).toHaveBeenCalledTimes(1)
+    expect(syncedHandler).toHaveBeenCalledWith({ count: 7 })
+    // No cross-talk: neither handler saw the other's event or the unhandled one.
+    expect(toastHandler).not.toHaveBeenCalledWith({ count: 7 })
+    expect(syncedHandler).not.toHaveBeenCalledWith({ msg: "hi" })
+  })
+
+  test("events dispatch after the envelope's state ops are applied", async () => {
+    const socket = new MockSocket()
+    const connection = await openConnection(socket)
+    const { mounted, channel } = await mountRoot(socket, connection, { id: "alpha-1" })
+
+    let counterAtDispatch: number | undefined
+    mounted.store.handleEvent("synced", () => {
+      counterAtDispatch = mounted.store.counter
+    })
+
+    channel.emit("patch", {
+      type: "patch",
+      root_id: "Test.Store:alpha-1",
+      base_version: 1,
+      version: 2,
+      ops: [{ op: "replace", path: "/counter", value: 42 }],
+      stream_ops: [],
+      events: [{ store_id: [], name: "synced", payload: {} }]
+    })
+
+    expect(counterAtDispatch).toBe(42)
+    expect(mounted.store.counter).toBe(42)
   })
 
   test("distinct modules sharing one caller id get distinct channels and roots", async () => {
@@ -662,12 +787,12 @@ async function openConnection(socket: MockSocket): Promise<MusubiConnection<Test
 // Drive a fresh root mount to completion through its per-root channel: join
 // (which IS the mount) then the initial patch. Returns the live MountedStore and
 // the channel it joined.
-async function mountRoot(
+async function mountRoot<M extends keyof TestStores & string = "Test.Store">(
   socket: MockSocket,
   connection: MusubiConnection<TestStores>,
-  opts: { module?: keyof TestStores; id: string; params?: Record<string, unknown>; title?: string }
-): Promise<{ mounted: MountedStore<keyof TestStores & string, TestStores>; channel: MockChannel; rootId: string }> {
-  const module = (opts.module ?? "Test.Store") as keyof TestStores & string
+  opts: { module?: M; id: string; params?: Record<string, unknown>; title?: string }
+): Promise<{ mounted: MountedStore<M, TestStores>; channel: MockChannel; rootId: string }> {
+  const module = (opts.module ?? "Test.Store") as M
   const mountedPromise = connection.mountStore({
     module,
     id: opts.id,
@@ -729,7 +854,9 @@ function connectionEnvelope(
     base_version: baseVersion,
     version,
     ops,
-    stream_ops: streamOps
+    stream_ops: streamOps,
+    upload_ops: [],
+    events: []
   }
 }
 

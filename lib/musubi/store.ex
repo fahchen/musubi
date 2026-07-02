@@ -210,6 +210,13 @@ defmodule Musubi.Store do
   defdelegate stream_delete_by_item_key(socket, name, item_key), to: Stream
 
   # ---------------------------------------------------------------------------
+  # Push-event helper (defdelegate -> Musubi.Event)
+  # ---------------------------------------------------------------------------
+
+  @doc "See `Musubi.Event.push_event/3`."
+  defdelegate push_event(socket, name, payload), to: Musubi.Event
+
+  # ---------------------------------------------------------------------------
   # Upload helpers (defdelegate -> Musubi.Upload)
   # ---------------------------------------------------------------------------
 
@@ -363,6 +370,7 @@ defmodule Musubi.Store do
       # are only valid in specific syntactic positions.
       import Musubi.Store
       import Musubi.DSL.Command, only: [command: 1, command: 2]
+      import Musubi.DSL.Event, only: [event: 1, event: 2]
       import Musubi.DSL.State, only: [state: 1]
       import Musubi.DSL.Attr, only: [attr: 2, attr: 3]
       import Musubi.DSL.Upload, only: [upload: 2]
@@ -372,6 +380,8 @@ defmodule Musubi.Store do
       Module.register_attribute(__MODULE__, :__musubi_command_payload_fields__, accumulate: true)
       Module.register_attribute(__MODULE__, :__musubi_command_reply_fields__, accumulate: true)
       Module.register_attribute(__MODULE__, :__musubi_command_field_target__, accumulate: false)
+      Module.register_attribute(__MODULE__, :__musubi_events__, accumulate: true)
+      Module.register_attribute(__MODULE__, :__musubi_event_payload_fields__, accumulate: true)
       Module.register_attribute(__MODULE__, :__musubi_attrs__, accumulate: true)
       Module.register_attribute(__MODULE__, :__musubi_uploads__, accumulate: false)
       Module.put_attribute(__MODULE__, :__musubi_kind__, :store)

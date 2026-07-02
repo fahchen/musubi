@@ -2,7 +2,7 @@ defmodule Musubi.Diff do
   @moduledoc """
   Computes the JSON Patch (RFC 6902) diff between two wire-form terms.
 
-  Wraps `Jsonpatch.diff/2` and post-filters the result to honor BDR-0014:
+  Wraps `Jsonpatch.diff/2` and post-filters the result:
   Musubi only emits `add`, `remove`, and `replace` ops. `move`, `copy`, and
   `test` are filtered out unconditionally. There is no op-count threshold or
   byte threshold and no subtree-replace fallback — the structural minimal diff

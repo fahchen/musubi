@@ -115,3 +115,31 @@ defmodule Musubi.TestSupport.TypespecProbeWithCommand do
   @doc false
   def __env__, do: @captured_env
 end
+
+defmodule Musubi.TestSupport.TypespecProbeWithEvents do
+  @moduledoc false
+
+  use Musubi.Store, root: true
+
+  state do
+    field :title, String.t()
+  end
+
+  event(:ping)
+
+  event :toast do
+    field :msg, String.t()
+    field :level, atom()
+  end
+
+  @impl Musubi.Store
+  def mount(socket), do: {:ok, socket}
+  @impl Musubi.Store
+  def render(socket), do: %{title: Map.get(socket.assigns, :title, "")}
+  @impl Musubi.Store
+  def handle_command(_name, _payload, socket), do: {:noreply, socket}
+
+  @captured_env __ENV__
+  @doc false
+  def __env__, do: @captured_env
+end

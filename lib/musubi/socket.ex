@@ -52,7 +52,7 @@ defmodule Musubi.Socket do
     field :transport_pid, pid() | nil,
       default: nil,
       doc:
-        "Pid of the Phoenix Channel process bound 1:1 to this page runtime (BDR-0003). Termination of the transport pid terminates the page server."
+        "Pid of the Phoenix Channel process bound 1:1 to this page runtime. Termination of the transport pid terminates the page server."
 
     field :private, map(),
       default: %{},

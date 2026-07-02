@@ -27,12 +27,13 @@ import type {
   ExternalUploader,
   JsonPatchOp,
   PatchEnvelope,
+  PushEvent,
   StoreId,
   StreamEntry,
   StreamOp,
   UploadOp
 } from "./types"
-import { STORE_ID_KEY, storeIdKey } from "./types"
+import { STORE_ID_KEY, storeIdKey, storeScopedKey } from "./types"
 
 type PushStatus = "ok" | "error" | "timeout"
 
@@ -119,6 +120,10 @@ export interface RootConnection {
   proxyCache: Map<string, unknown>
   snapshotCache: Map<string, unknown>
   storeListeners: Map<string, Set<() => void>>
+  // Transient push-event handlers keyed by event name (BDR-0032). Root-scoped
+  // and lives on the RootConnection (not the channel) so registrations survive
+  // reconnect.
+  eventListeners: Map<string, Set<(payload: unknown) => void>>
   pendingCommandRejectors: Set<(reason: Error) => void>
   pendingConnect: PendingConnect | null
   recovering: boolean
@@ -355,6 +360,7 @@ function newRootConnection(
     proxyCache: new Map(),
     snapshotCache: new Map(),
     storeListeners: new Map(),
+    eventListeners: new Map(),
     pendingCommandRejectors: new Set(),
     pendingConnect: null,
     recovering: false,
@@ -930,9 +936,53 @@ function acceptEnvelope(
 
   notifySubscribers(connection, previousStoreIndex, previousStreams, streamTouched, uploadTouched)
 
+  // Transient push events (BDR-0032): dispatched once, after state is applied
+  // and subscribers notified. Owns no version/recovery semantics.
+  dispatchEvents(connection, envelope.events ?? [])
+
   if (isInitial) {
     connection.pendingConnect?.resolve()
     connection.pendingConnect = null
+  }
+}
+
+// Events are keyed by (store_id, name): a handler on a store proxy only receives
+// that store's events (BDR-0032). Shared key format with stream/upload ops.
+function eventKey(storeId: StoreId, name: string): string {
+  return storeScopedKey(storeId, name)
+}
+
+function dispatchEvents(connection: RootConnection, events: readonly PushEvent[]): void {
+  for (const event of events) {
+    const handlers = connection.eventListeners.get(eventKey(event.store_id, event.name))
+    if (!handlers) {
+      continue
+    }
+    // Snapshot before iterating: a handler may unsubscribe mid-dispatch.
+    for (const handler of Array.from(handlers)) {
+      handler(event.payload)
+    }
+  }
+}
+
+export function subscribeConnectionEvent(
+  connection: RootConnection,
+  storeId: StoreId,
+  name: string,
+  handler: (payload: unknown) => void
+): () => void {
+  const key = eventKey(storeId, name)
+  const handlers = connection.eventListeners.get(key) ?? new Set<(payload: unknown) => void>()
+
+  handlers.add(handler)
+  connection.eventListeners.set(key, handlers)
+
+  return () => {
+    handlers.delete(handler)
+
+    if (handlers.size === 0) {
+      connection.eventListeners.delete(key)
+    }
   }
 }
 
@@ -1170,6 +1220,10 @@ function resetConnectionState(connection: RootConnection): void {
   connection.streams = new Map()
   connection.proxyCache = new Map()
   connection.snapshotCache = new Map()
+  // Only the teardown/disconnect paths call this (the Phoenix per-channel rejoin
+  // that persists handlers does not), so dropping push-event handlers here is
+  // safe and keeps a discarded RootConnection from holding stale listeners.
+  connection.eventListeners = new Map()
 }
 
 function invalidateSnapshotsForOps(

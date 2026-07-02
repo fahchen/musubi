@@ -80,6 +80,7 @@ export const {
   useMusubiRootSuspense,
   useMusubiSnapshot,
   useMusubiCommand,
+  useMusubiEvent,
 } = createMusubi<Musubi.Stores>()
 ```
 
@@ -399,6 +400,35 @@ async function onSubmit() {
   }
 }
 ```
+
+## Push Events
+
+The server can push transient, fire-and-forget events to the client (a toast, a
+"scroll to bottom") with `push_event(socket, name, payload)` from a store
+callback. Unlike state, an event carries no server memory and is dispatched once
+on receipt — see `docs/push-events.md`.
+
+Plain TypeScript — register a handler on a mounted store proxy:
+
+```ts
+const off = dashboard.handleEvent("toast", (payload) => {
+  showToast(payload.msg)
+})
+
+off() // unsubscribe
+```
+
+React — `useMusubiEvent` wraps `handleEvent` in an effect and refs the handler,
+so an inline closure does not re-subscribe each render:
+
+```tsx
+useMusubiEvent(store, "toast", (payload: { msg: string }) => {
+  showToast(payload.msg)
+})
+```
+
+A handler only receives events fired after it registers; for data that must be
+present at mount, use state, not an event.
 
 ## Target Child Stores
 

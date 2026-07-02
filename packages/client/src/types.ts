@@ -40,7 +40,12 @@ type SymbolMarker<T> = T extends object
 
 type StoreDefMarker<T> = Extract<
   SymbolMarker<T>,
-  { readonly module: string; readonly shape: unknown; readonly commands: unknown }
+  {
+    readonly module: string
+    readonly shape: unknown
+    readonly commands: unknown
+    readonly events: unknown
+  }
 >
 
 type FieldMarker<T> = Extract<
@@ -75,6 +80,21 @@ export type CommandReply<
   K extends CommandName<M, R>,
   R
 > = CommandsOf<M, R>[K] extends { reply: infer Reply } ? Reply : unknown
+
+export type EventsOf<M extends StoreModule<R>, R> =
+  [StoreDefMarker<DefOf<M, R>>] extends [never]
+    ? never
+    : StoreDefMarker<DefOf<M, R>> extends { readonly events: infer Events }
+      ? Events
+      : never
+
+export type EventName<M extends StoreModule<R>, R> = keyof EventsOf<M, R> & string
+
+export type EventPayload<
+  M extends StoreModule<R>,
+  K extends EventName<M, R>,
+  R
+> = EventsOf<M, R>[K] extends { payload: infer Payload } ? Payload : never
 
 // ---------------------------------------------------------------------------
 // Snapshot and proxy projection (symbol-branded generated marker matching)
@@ -165,6 +185,16 @@ export interface StoreRuntime<M extends StoreModule<R>, R> {
     payload: CommandPayload<M, K, R>
   ): Promise<CommandReply<M, K, R>>
   subscribe(listener: () => void): () => void
+  // Registers a handler for a transient push event (BDR-0032). Events are
+  // declared per store (`event :name do ... end`) and tagged on the wire with
+  // the emitting store's store_id, so `handleEvent` on a store proxy subscribes
+  // to that store's events (dispatch keyed by `(store_id, name)`); a child proxy
+  // exposes its own declared events. Returns an unsubscribe thunk. The handler
+  // is invoked once per matching event, after that envelope's state ops apply.
+  handleEvent<K extends EventName<M, R>>(
+    name: K,
+    handler: (payload: EventPayload<M, K, R>) => void
+  ): () => void
   // `undefined` while the store node is absent from the index (not yet
   // mounted, or mid-reconnect after a state reset). Callers must guard.
   snapshot(): StoreSnapshot<M, R> | undefined
@@ -338,6 +368,15 @@ export type StreamOp =
       item_key: string
     }
 
+// Transient push event (BDR-0032) folded into the patch envelope. Dispatched
+// once on receipt, owns no version/recovery semantics. `store_id` tags the
+// emitting store; the client dispatches per `(store_id, name)`.
+export type PushEvent = {
+  store_id: StoreId
+  name: string
+  payload: unknown
+}
+
 export type PatchEnvelope = {
   type: "patch"
   base_version: number
@@ -345,6 +384,7 @@ export type PatchEnvelope = {
   ops: JsonPatchOp[]
   stream_ops: StreamOp[]
   upload_ops: UploadOp[]
+  events: PushEvent[]
 }
 
 export type ConnectionPatchEnvelope = PatchEnvelope & {
@@ -368,32 +408,37 @@ export const STORE_ID_KEY = "__musubi_store_id__" as const
 export const STREAM_MARKER_KEY = "__musubi_stream__" as const
 export const UPLOAD_MARKER_KEY = "__musubi_upload__" as const
 
-const UPLOAD_KEY_SEP = "\0"
-
-export function uploadStoreKey(storeId: StoreId, uploadName: string): string {
-  return `${storeIdKey(storeId)}${UPLOAD_KEY_SEP}${uploadName}`
-}
-
 export function storeIdKey(storeId: StoreId): string {
   return JSON.stringify(storeId)
 }
 
-const STREAM_KEY_SEP = "\0"
+// One separator + one builder for every `(store_id, name)` composite key —
+// streams, uploads, and push events. `storeIdKey` is JSON, so it never contains
+// an unescaped NUL; the NUL byte cleanly delimits it from the trailing name.
+const STORE_KEY_SEP = "\0"
+
+export function storeScopedKey(storeId: StoreId, name: string): string {
+  return `${storeIdKey(storeId)}${STORE_KEY_SEP}${name}`
+}
+
+export function uploadStoreKey(storeId: StoreId, uploadName: string): string {
+  return storeScopedKey(storeId, uploadName)
+}
 
 export function streamStoreKey(storeId: StoreId, streamName: string): string {
-  return `${storeIdKey(storeId)}${STREAM_KEY_SEP}${streamName}`
+  return storeScopedKey(storeId, streamName)
 }
 
 export function streamStoreKeyPrefix(storeId: StoreId): string {
-  return `${storeIdKey(storeId)}${STREAM_KEY_SEP}`
+  return `${storeIdKey(storeId)}${STORE_KEY_SEP}`
 }
 
 export function streamFieldNameFromKey(key: string): string {
-  const parts = key.split(STREAM_KEY_SEP)
+  const parts = key.split(STORE_KEY_SEP)
   return parts[1] ?? ""
 }
 
 export function storeKeyFromStreamStoreKey(key: string): string {
-  const parts = key.split(STREAM_KEY_SEP)
+  const parts = key.split(STORE_KEY_SEP)
   return parts[0] ?? key
 }

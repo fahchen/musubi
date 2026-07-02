@@ -10,13 +10,21 @@ defmodule Musubi.Lifecycle do
   | `:after_command`   | 4     | `(command_name, payload, reply, socket)`|
   | `:handle_async`    | 3     | `(name, async_result, socket)`          |
   | `:handle_info`     | 2     | `(message, socket)`                     |
-  | `:after_render`   | 2     | `(resolved_elixir_term, socket)`        |
-  | `:after_serialize` | 2     | `(wire_term, socket)`                   |
+  | `:after_render`   | 2     | `(frame, socket)`                       |
+  | `:after_serialize` | 2     | `(frame, socket)`                       |
 
-  `:after_render` runs after `Musubi.Resolver` substitutes child placeholders;
-  it sees the Elixir-form output (atom keys, structs, atom values).
-  `:after_serialize` runs after `Musubi.Wire.to_wire/1` converts the resolved
-  output to wire form (string keys, plain maps, atoms-as-strings).
+  `:after_render` and `:after_serialize` are the two *outbound* stages: they run
+  per store socket each render cycle over that socket's `Musubi.Page.Frame` — its
+  render output plus the push events (`Musubi.Event`) it queued.
+  `:after_render` sees the Elixir-form frame (atom keys, structs, atom values,
+  native event payloads); `:after_serialize` sees the wire-form frame after
+  `Musubi.Wire.to_wire/1` (string keys, plain maps, atoms-as-strings).
+
+  Both are *transform* stages — run them with `run_transform_hooks/3`, and each
+  hook returns `{:cont | :halt, frame, socket}` so it may rewrite, drop, or enrich
+  the outbound frame (render redaction, event audit/validation, telemetry).
+  Default render and push-event payload validation are attached at
+  `:after_serialize`.
   """
 
   alias Musubi.Socket
@@ -51,6 +59,11 @@ defmodule Musubi.Lifecycle do
     after_render: 2,
     after_serialize: 2
   }
+
+  # Outbound stages that thread their data payload through the chain (via
+  # `run_transform_hooks/3`) instead of only the socket. Each hook returns
+  # `{:cont | :halt, datum, socket}` so it can rewrite the outbound frame.
+  @transform_stages [:after_render, :after_serialize]
 
   @doc """
   Attaches a lifecycle hook for the given stage.
@@ -113,15 +126,17 @@ defmodule Musubi.Lifecycle do
   end
 
   @doc """
-  Runs every hook registered for a stage until one halts or all continue.
+  Runs every socket-only hook registered for a stage until one halts or all
+  continue. For the transform stages (`:after_render`, `:after_serialize`) use
+  `run_transform_hooks/3` instead — they thread a data frame, not just the socket.
 
   ## Examples
 
       iex> socket =
-      ...>   Musubi.Lifecycle.attach_hook(%Musubi.Socket{}, :mark, :after_render, fn _output, socket ->
+      ...>   Musubi.Lifecycle.attach_hook(%Musubi.Socket{}, :mark, :handle_info, fn _msg, socket ->
       ...>     {:cont, Musubi.Socket.assign(socket, :seen?, true)}
       ...>   end)
-      iex> {:cont, socket} = Musubi.Lifecycle.run_hooks(socket, :after_render, [%{title: "Inbox"}], false)
+      iex> {:cont, socket} = Musubi.Lifecycle.run_hooks(socket, :handle_info, [:ping], false)
       iex> socket.assigns.seen?
       true
   """
@@ -155,6 +170,61 @@ defmodule Musubi.Lifecycle do
   end
 
   @doc """
+  Runs a transform stage (`:after_render` / `:after_serialize`) over an outbound
+  `datum` (a `Musubi.Page.Frame`).
+
+  Unlike `run_hooks/4` (which only threads the socket), this folds the datum
+  through each hook: a hook receives `(datum, socket)` and returns
+  `{:cont, datum, socket}` to continue with a possibly-rewritten datum, or
+  `{:halt, datum, socket}` to stop the chain early. Returns the final
+  `{datum, socket}`. With no hooks attached it returns the datum unchanged.
+
+  ## Examples
+
+      iex> socket =
+      ...>   Musubi.Lifecycle.attach_hook(%Musubi.Socket{}, :bump, :after_render, fn frame, socket ->
+      ...>     {:cont, Map.put(frame, :seen, true), socket}
+      ...>   end)
+      iex> {frame, _socket} = Musubi.Lifecycle.run_transform_hooks(socket, :after_render, %{render: %{}})
+      iex> frame.seen
+      true
+  """
+  @spec run_transform_hooks(Socket.t(), stage(), term()) :: {term(), Socket.t()}
+  def run_transform_hooks(%Socket{} = socket, stage, datum) when stage in @transform_stages do
+    socket
+    |> hooks()
+    |> Map.get(stage, [])
+    |> Enum.reduce_while({datum, socket}, fn %{fun: fun}, {current_datum, current_socket} ->
+      case fun.(current_datum, current_socket) do
+        {:cont, next_datum, %Socket{} = next_socket} ->
+          {:cont, {next_datum, next_socket}}
+
+        {:halt, next_datum, %Socket{} = next_socket} ->
+          {:halt, {next_datum, next_socket}}
+
+        other ->
+          raise ArgumentError, "invalid #{inspect(stage)} hook result: #{inspect(other)}"
+      end
+    end)
+  end
+
+  @doc """
+  Attaches the application's configured default hooks
+  (`config :musubi, :default_hooks`, `{id, stage, fun}` entries) to a socket.
+
+  Applied to the root socket at mount and to every child socket at creation, so
+  each store runs the validators. Hooks self-scope: command/reply/event
+  validators skip what the store does not declare, and `ValidateRender` skips
+  non-root sockets.
+  """
+  @spec attach_default_hooks(Socket.t()) :: Socket.t()
+  def attach_default_hooks(%Socket{} = socket) do
+    :musubi
+    |> Application.get_env(:default_hooks, [])
+    |> Enum.reduce(socket, fn {id, stage, fun}, acc -> attach_hook(acc, id, stage, fun) end)
+  end
+
+  @doc """
   Returns the supported lifecycle stages in execution order.
 
   ## Examples
@@ -174,8 +244,8 @@ defmodule Musubi.Lifecycle do
   | `:after_command`   | 4     | `(command_name, payload, reply, socket)`|
   | `:handle_async`    | 3     | `(name, async_result, socket)`          |
   | `:handle_info`     | 2     | `(message, socket)`                     |
-  | `:after_render`   | 2     | `(resolved_elixir_term, socket)`        |
-  | `:after_serialize` | 2     | `(wire_term, socket)`                   |
+  | `:after_render`   | 2     | `(frame, socket)`                       |
+  | `:after_serialize` | 2     | `(frame, socket)`                       |
 
   ## Examples
 

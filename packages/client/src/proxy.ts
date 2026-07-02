@@ -1,5 +1,6 @@
 import {
   dispatchConnectionCommand,
+  subscribeConnectionEvent,
   subscribeStore,
   type RootConnection
 } from "./runtime"
@@ -18,7 +19,13 @@ import type {
 import { STORE_ID_KEY, STREAM_MARKER_KEY, UPLOAD_MARKER_KEY, storeIdKey } from "./types"
 
 const ROOT_STORE_ID: StoreId = []
-const RESERVED = new Set(["__musubi_store_id__", "dispatchCommand", "subscribe", "snapshot"])
+const RESERVED = new Set([
+  "__musubi_store_id__",
+  "dispatchCommand",
+  "subscribe",
+  "handleEvent",
+  "snapshot"
+])
 
 export function getRootProxy<M extends StoreModule<R>, R = unknown>(
   connection: RootConnection
@@ -63,6 +70,11 @@ function buildProxy(connection: RootConnection, storeId: StoreId): object {
 
       if (prop === "subscribe") {
         return (listener: () => void) => subscribeStore(connection, storeId, listener)
+      }
+
+      if (prop === "handleEvent") {
+        return (name: string, handler: (payload: unknown) => void) =>
+          subscribeConnectionEvent(connection, storeId, name, handler)
       }
 
       if (prop === "snapshot") {

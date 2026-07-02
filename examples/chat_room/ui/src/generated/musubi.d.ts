@@ -14,11 +14,12 @@ declare namespace Musubi {
 
   const Type: unique symbol
 
-  interface StoreDef<Module extends string, Shape, Commands> {
+  interface StoreDef<Module extends string, Shape, Commands, Events = {}> {
     readonly [Type]: {
       module: Module
       shape: Shape
       commands: Commands
+      events: Events
     }
   }
 
@@ -32,6 +33,61 @@ declare namespace Musubi {
 
   type AsyncField<Value> = {
     readonly [Type]: { kind: "async"; value: Value }
+  }
+
+  type UploadConfig = {
+    readonly accept: readonly string[] | "any"
+    readonly maxEntries: number
+    readonly maxFileSize: number
+    readonly chunkSize: number
+  }
+
+  type UploadEntryStatus =
+    | "pending"
+    | "uploading"
+    | "success"
+    | "error"
+    | "cancelled"
+
+  type UploadStatus =
+    | "idle"
+    | "selecting"
+    | "uploading"
+    | "success"
+    | "error"
+    | "cancelled"
+
+  type UploadError = { readonly code: string; readonly message: string }
+
+  type UploadEntry = {
+    readonly ref: string
+    readonly clientName: string
+    readonly clientSize: number
+    readonly clientType: string
+    readonly progress: number
+    readonly status: UploadEntryStatus
+    readonly errors: readonly UploadError[]
+  }
+
+  type UploadHandle = {
+    readonly config: UploadConfig
+    readonly status: UploadStatus
+    readonly entries: readonly UploadEntry[]
+    readonly errors: readonly UploadError[]
+    readonly progress: number
+    readonly isIdle: boolean
+    readonly isSelecting: boolean
+    readonly isUploading: boolean
+    readonly isSuccess: boolean
+    readonly isError: boolean
+    select(files: FileList | File[]): Promise<readonly UploadEntry[]>
+    start(): Promise<void>
+    cancel(entryRef?: string): Promise<void>
+    reset(): Promise<void>
+  }
+
+  type UploadField = {
+    readonly [Type]: { kind: "upload" }
   }
 
   interface Stores {
@@ -61,7 +117,8 @@ declare namespace Musubi {
             queued: boolean
           }
         }
-      }
+      },
+      {}
     >
   }
 }

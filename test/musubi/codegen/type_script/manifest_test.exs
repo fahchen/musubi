@@ -56,6 +56,15 @@ defmodule Musubi.Codegen.TypeScript.ManifestTest do
       assert is_list(first_data.commands)
     end
 
+    test "carries declared events through the stamp/read round-trip", %{target: target} do
+      Manifest.stamp(Musubi.TestSupport.TypespecProbeWithEvents, "lib/e.ex", target)
+
+      assert [{Musubi.TestSupport.TypespecProbeWithEvents, data}] = Manifest.list(target)
+
+      assert [%{name: :ping}, %{name: :toast, payload_fields: payload_fields}] = data.events
+      assert [%{name: :msg}, %{name: :level}] = payload_fields
+    end
+
     test "returns [] for missing target dir", %{target: target} do
       File.rm_rf!(target)
       assert Manifest.list(target) == []

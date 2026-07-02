@@ -5,8 +5,7 @@
     "jsx": "react-jsx",
     "lib": ["ES2022", "DOM"],
     "noEmit": true,
-    "rootDir": "./src",
     "types": ["node"]
   },
-  "include": ["src"]
+  "include": ["src", "test"]
 }

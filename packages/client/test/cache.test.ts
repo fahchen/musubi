@@ -135,7 +135,16 @@ function envelope(
   version: number,
   ops: PatchEnvelope["ops"]
 ): ConnectionPatchEnvelope {
-  return { type: "patch", root_id: rootId, base_version: baseVersion, version, ops, stream_ops: [] }
+  return {
+    type: "patch",
+    root_id: rootId,
+    base_version: baseVersion,
+    version,
+    ops,
+    stream_ops: [],
+    upload_ops: [],
+    events: []
+  }
 }
 
 // Persister whose stored entries can be inspected/preset by the test.

@@ -27,6 +27,7 @@ Musubi lets developers model page state as a hierarchical tree of stateful store
 | Addressable mutations | Commands route by `store_id` plus command name; the client echoes the server-rendered `__musubi_store_id__` and never constructs ids itself. Outcome via Phoenix Channel ref reply (BDR-0001). |
 | Efficient replication | RFC 6902 JSON Patch, structural minimal diff with no threshold (BDR-0014). |
 | Stream support | LiveView-parity stream API; server forgets values, client owns materialization. |
+| Push events | Transient server-to-client events via `push_event/3`, folded into the patch envelope; fire-and-forget, no ack/retry/replay, consumed by `handleEvent` (BDR-0032). |
 | Async tasks | LiveView-parity `assign_async`/`start_async`/`cancel_async`/`handle_async` with `Musubi.AsyncResult`, plus a Musubi `:timeout` extension that kills overdue tasks. |
 | Recoverability | Reconnect path: 1:1 transport binding, fresh mount on disconnect, first patch envelope carries full root (BDR-0003). |
 | Type safety | Generated Elixir typespecs and TypeScript types from one source of truth (`state do` and `command do`). |
@@ -97,7 +98,7 @@ Musubi's `socket` mirrors [`Phoenix.Socket`](https://hexdocs.pm/phoenix/1.8.7/Ph
 | `endpoint`, `topic`, `transport_pid` | Phoenix Channel scaffolding | Provided so hooks and helpers can broadcast or push outside the standard envelope flow when needed. Read-only. |
 | `private` | `map()` | Reserved for runtime bookkeeping (hook table, async ref tracking, pending stream ops). Do not read or write directly; use the corresponding helpers. |
 
-Helpers like `assign/2,3`, `update/3`, `attach_hook/4`, `stream/4`, `assign_async/3,4`, `start_async/3,4`, `cancel_async/2,3`, and `stream_async/4` all take a socket as the first argument and return a new socket — chainable with `|>`.
+Helpers like `assign/2,3`, `update/3`, `attach_hook/4`, `stream/4`, `assign_async/3,4`, `start_async/3,4`, `cancel_async/2,3`, `stream_async/4`, and `push_event/3` all take a socket as the first argument and return a new socket — chainable with `|>`.
 
 ### `attr` — compile-time annotation
 
@@ -416,7 +417,7 @@ A handler raise in `handle_command/3` or `render/1` terminates the page runtime 
 
 ### Authorization
 
-Authorization is a `:before_command` hook that returns `{:halt, %{ok: false, reason: "unauthorized", ...}, socket}` to deny a command. The transport reply has channel status `:ok` and the payload carries the explicit denial flag (BDR-0008). There is no silent-ok downgrade and no wire-level error category — denials are graceful business outcomes, while malformed commands let the runtime crash.
+Authorization is a `:before_command` hook that returns `{:halt, %{ok: false, reason: "unauthorized", ...}, socket}` to deny a command. The transport reply has channel status `:ok` and the payload carries the explicit denial flag (BDR-0008). There is no silent-ok downgrade and no wire-level error category — denials are graceful business outcomes, while malformed commands let the runtime crash. The `:halt` path renders uniformly with `:cont`, so a patch push is content-driven, not halt-driven: a well-behaved deny hook mutates nothing and no patch follows, but a hook that changes rendered state (or queues stream/push-event ops) before halting ships that in one envelope.
 
 ### System commands
 

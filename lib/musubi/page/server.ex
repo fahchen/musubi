@@ -2,8 +2,7 @@ defmodule Musubi.Page.Server do
   @moduledoc """
   Page-scoped Musubi runtime GenServer. Hosts the store tree for one connected
   client session and runs the command pipeline (routing → `:before_command`
-  hooks → `handle_command/3` → `:after_command` hooks → reply) per
-  BDR-0007/0009.
+  hooks → `handle_command/3` → `:after_command` hooks → reply).
 
   ## Cross-track contract (M3 → M4 → M5)
 
@@ -14,15 +13,17 @@ defmodule Musubi.Page.Server do
   wire root, accumulates stream ops queued during the handler, builds an
   `Musubi.Page.PatchEnvelope`, and pushes it to the bound transport pid via a
   `{:patch, envelope}` message on `handle_continue/2` (so the reply lands
-  first per BDR-0009).
+  first).
 
   At mount, the same flow runs once with `previous_wire_root: nil` — the
   initial envelope replaces the entire root path (`""`) with the freshly
   rendered wire root and starts the version counter at 1.
 
-  Idle render cycles (no diff ops, no stream ops) emit nothing per BDR-0018.
-  Halted commands (a `:before_command` hook returned `{:halt, ...}`) skip the
-  render cycle entirely — there is no state mutation to diff.
+  Idle render cycles (no diff ops, no stream ops, no events) emit nothing. A
+  halted command (a `:before_command` hook returned `{:halt, ...}`)
+  renders the same way — the push is content-driven, not halt-driven:
+  if the halting hook mutated state or queued stream/event ops those ship in one
+  envelope; a pure denial that changed nothing emits nothing.
   """
 
   use GenServer
@@ -31,8 +32,10 @@ defmodule Musubi.Page.Server do
 
   alias Musubi.Async
   alias Musubi.Diff
+  alias Musubi.Event
   alias Musubi.Hooks.ValidateCommandSchema
   alias Musubi.Lifecycle
+  alias Musubi.Page.Frame
   alias Musubi.Page.PatchEnvelope
   alias Musubi.Page.Server.State
   alias Musubi.Page.StoreTable
@@ -85,7 +88,7 @@ defmodule Musubi.Page.Server do
     5. Return `{:ok, reply_payload}`.
     6. Render → diff → push patch envelope (after the reply lands).
 
-  store_id or command-name resolution failures `raise` (BDR-0003 let-it-crash);
+  store_id or command-name resolution failures `raise` (let-it-crash);
   the GenServer crashes and the supervisor/transport observe the exit.
 
   ## Examples
@@ -273,7 +276,7 @@ defmodule Musubi.Page.Server do
     root_socket =
       %{root_socket | id: "", parent_path: [], module: root_module, transport_pid: transport_pid}
       |> Socket.put_root_params(params)
-      |> attach_default_hooks()
+      |> Lifecycle.attach_default_hooks()
       |> mount_root_store(params)
       |> normalize_root_assigns()
       |> Reconciler.init_store()
@@ -286,13 +289,13 @@ defmodule Musubi.Page.Server do
 
     {root_socket, store_table} = run_render_cycle(root_socket, store_table)
 
-    {wire_root, store_table} = root_wire(store_table, root_socket)
+    {wire_root, events, store_table} = serialize_frames(store_table)
     {stream_ops, store_table} = flush_all_stream_ops(store_table)
     {upload_ops_raw, store_table} = flush_all_upload_ops(store_table)
 
     {upload_ops, upload_throttle} = throttle_progress(upload_ops_raw, %{})
 
-    envelope = PatchEnvelope.initial(wire_root, stream_ops, upload_ops)
+    envelope = PatchEnvelope.initial(wire_root, stream_ops, upload_ops, events)
 
     state =
       rebuild_async_index(%State{
@@ -485,7 +488,7 @@ defmodule Musubi.Page.Server do
     Telemetry.emit([:musubi, :command, :start], %{system_time: System.system_time()}, base_meta)
 
     try do
-      {pipeline_status, reply, next_state, envelope} =
+      {_pipeline_status, reply, next_state, envelope} =
         run_command_with_render(store_id, command_name, payload, state)
 
       Telemetry.emit(
@@ -494,7 +497,7 @@ defmodule Musubi.Page.Server do
         Map.put(base_meta, :status, :ok)
       )
 
-      if pipeline_status == :ok do
+      if envelope do
         Telemetry.emit(
           [:musubi, :patch, :stop],
           %{
@@ -704,14 +707,12 @@ defmodule Musubi.Page.Server do
     {pipeline_status, reply, state} =
       run_command_pipeline(store_id, command_name, payload, state)
 
-    case pipeline_status do
-      :ok ->
-        {next_state, envelope} = render_and_envelope(state)
-        {:ok, reply, next_state, envelope}
-
-      :halted ->
-        {:halted, reply, state, nil}
-    end
+    # Render in both the :ok and :halted paths: a halting before_command hook may
+    # have mutated state or queued stream/push-event ops on the socket, and those
+    # ship in one envelope just like a handler's changes. A pure denial (no state
+    # change) renders to no envelope, so nothing is pushed.
+    {next_state, envelope} = render_and_envelope(state)
+    {pipeline_status, reply, next_state, envelope}
   end
 
   @spec render_and_envelope(State.t()) :: {State.t(), PatchEnvelope.t() | nil}
@@ -719,7 +720,7 @@ defmodule Musubi.Page.Server do
     {next_root_socket, next_registry} =
       run_render_cycle(state.root_socket, state.store_table)
 
-    {wire_root, next_registry} = root_wire(next_registry, next_root_socket)
+    {wire_root, events, next_registry} = serialize_frames(next_registry)
     {stream_ops, next_registry} = flush_all_stream_ops(next_registry)
     {upload_ops_raw, next_registry} = flush_all_upload_ops(next_registry)
 
@@ -733,7 +734,7 @@ defmodule Musubi.Page.Server do
         Diff.diff(state.previous_wire_root, wire_root)
       end
 
-    envelope = PatchEnvelope.build(state.version, diff_ops, stream_ops, upload_ops)
+    envelope = PatchEnvelope.build(state.version, diff_ops, stream_ops, upload_ops, events)
 
     next_version = if envelope, do: envelope.version, else: state.version
 
@@ -1016,14 +1017,6 @@ defmodule Musubi.Page.Server do
     {next_root_socket, next_registry}
   end
 
-  @spec root_wire(StoreTable.t(), Socket.t()) :: {term(), StoreTable.t()}
-  defp root_wire(%StoreTable{} = registry, %Socket{}) do
-    case StoreTable.get(registry, []) do
-      %Entry{wire_state: wire_state} -> {wire_state, registry}
-      nil -> {nil, registry}
-    end
-  end
-
   @spec root_socket(StoreTable.t(), Socket.t()) :: Socket.t()
   defp root_socket(%StoreTable{} = registry, %Socket{} = fallback) do
     case StoreTable.get(registry, []) do
@@ -1063,6 +1056,50 @@ defmodule Musubi.Page.Server do
 
       nil ->
         {ops_acc, registry}
+    end
+  end
+
+  # Per-entry outbound aggregation (root before children). For each store socket:
+  # drains + wire-encodes its push events (BDR-0032), builds a `Frame` from the
+  # entry's wire render + those events, runs the `:after_serialize` transform
+  # stage (default `ValidateRender`/`ValidateEvents` hooks, plus app
+  # audit/redaction), then stamps each event with the socket's store_id
+  # (symmetric with stream/upload ops). Iterating the registry — not the render
+  # path — keeps events from memoized sockets flushing. Returns the (possibly
+  # hook-rewritten) root wire render, the flattened events, and the registry with
+  # hooked sockets + wire_state written back.
+  @spec serialize_frames(StoreTable.t()) ::
+          {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}
+  defp serialize_frames(%StoreTable{} = registry) do
+    registry
+    |> StoreTable.keys()
+    |> Enum.sort_by(&length/1)
+    |> Enum.reduce({nil, [], registry}, &serialize_entry/2)
+  end
+
+  @spec serialize_entry(
+          store_id(),
+          {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}
+        ) ::
+          {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}
+  defp serialize_entry(store_id, {wire_root, events_acc, reg}) do
+    case StoreTable.get(reg, store_id) do
+      %Entry{socket: socket, wire_state: wire_state} = entry ->
+        {wire_events, socket} = Event.flush_pending(socket)
+
+        {%Frame{render: render, events: events}, socket} =
+          Lifecycle.run_transform_hooks(
+            socket,
+            :after_serialize,
+            %Frame{render: wire_state, events: wire_events}
+          )
+
+        stamped = Enum.map(events, &Map.put(&1, :store_id, store_id))
+        reg = StoreTable.put(reg, store_id, %{entry | socket: socket, wire_state: render})
+        {if(store_id == [], do: render, else: wire_root), events_acc ++ stamped, reg}
+
+      nil ->
+        {wire_root, events_acc, reg}
     end
   end
 
@@ -1334,15 +1371,6 @@ defmodule Musubi.Page.Server do
 
   defp append_error(existing, error) when is_list(existing) do
     List.insert_at(existing, -1, error)
-  end
-
-  @spec attach_default_hooks(Socket.t()) :: Socket.t()
-  defp attach_default_hooks(%Socket{} = socket) do
-    :musubi
-    |> Application.get_env(:default_hooks, [])
-    |> Enum.reduce(socket, fn {id, stage, fun}, acc ->
-      Lifecycle.attach_hook(acc, id, stage, fun)
-    end)
   end
 
   @spec page_id(State.t()) :: term()

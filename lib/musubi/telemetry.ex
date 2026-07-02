@@ -42,16 +42,15 @@ defmodule Musubi.Telemetry do
     {[:musubi, :async, :start],
      "Async task started via `assign_async`/`start_async`/`stream_async`."},
     {[:musubi, :async, :stop], "Async task completed (`:ok` or `:failed`)."},
-    {[:musubi, :async, :exception], "Async task crashed or `handle_async/3` raised (BDR-0020)."},
+    {[:musubi, :async, :exception], "Async task crashed or `handle_async/3` raised."},
     {[:musubi, :async, :cancel], "`cancel_async/2,3` invoked for a tracked task."},
-    {[:musubi, :async, :lazy_discard],
-     "Late async result arrived after tracking was dropped (BDR-0019)."},
+    {[:musubi, :async, :lazy_discard], "Late async result arrived after tracking was dropped."},
     {[:musubi, :pubsub, :receive],
-     "`handle_info/2` dispatched on the root store; observability for app PubSub messages (BDR-0005)."},
+     "`handle_info/2` dispatched on the root store; observability for app PubSub messages."},
     {[:musubi, :auth, :deny],
-     "A `:before_command` hook returned `{:halt, reply, socket}` — graceful authorization denial (BDR-0008)."},
+     "A `:before_command` hook returned `{:halt, reply, socket}` — graceful authorization denial."},
     {[:musubi, :send_update, :no_target],
-     "`Musubi.send_update/2,3` addressed a store_id that is not mounted; no-op, no envelope pushed (BDR-0030). Metadata: store_id, page_id."}
+     "`Musubi.send_update/2,3` addressed a store_id that is not mounted; no-op, no envelope pushed. Metadata: store_id, page_id."}
   ]
 
   @doc """

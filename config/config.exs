@@ -27,19 +27,32 @@ reply_schema_hook =
 # Hooks are user-removable; pending stream ops MUST flush every cycle, so the
 # prune step lives in the runtime.
 
-state_validation_hooks =
+# Dev/test-only validation hooks (both `:after_serialize`, over the per-socket
+# frame), absent in prod. Detach/replace via the app's own `:default_hooks`.
+#
+#   * `ValidateRender` validates `frame.render`. It only acts on the root socket
+#     (self-skips children): the root frame carries the whole stitched wire tree,
+#     and validating a child frame standalone would reject legitimately-transient
+#     async/loading render.
+#   * `ValidateEvents` validates each store's own `frame.events` (BDR-0032).
+validation_hooks =
   if config_env() in [:dev, :test] do
     [
       {Musubi.Hooks.ValidateRender, :after_serialize,
-       &Musubi.Hooks.ValidateRender.after_serialize(:raise, &1, &2)}
+       &Musubi.Hooks.ValidateRender.after_serialize(:raise, &1, &2)},
+      {Musubi.Hooks.ValidateEvents, :after_serialize,
+       &Musubi.Hooks.ValidateEvents.after_serialize/2}
     ]
   else
     []
   end
 
+# `:default_hooks` are attached to every store socket (root + each child); each
+# hook self-scopes (validators skip commands/events they do not declare, and
+# `ValidateRender` skips non-root sockets).
 config :musubi,
        :default_hooks,
-       [command_schema_hook, reply_schema_hook | state_validation_hooks]
+       [command_schema_hook, reply_schema_hook | validation_hooks]
 
 if File.exists?(Path.join(__DIR__, "#{config_env()}.exs")) do
   import_config "#{config_env()}.exs"

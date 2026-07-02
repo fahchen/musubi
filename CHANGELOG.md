@@ -11,6 +11,42 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Added
+
+- **`musubi` / `@musubi/client` / `@musubi/react`** — **Push events** (BDR-0032):
+  transient, fire-and-forget server-to-client signals (a toast, "scroll to
+  bottom"), the analog of LiveView `push_event` + `handleEvent`. The server
+  queues them with the bare `push_event(socket, name, payload)` helper from any
+  store callback; they are folded into the cycle's patch envelope (a new `events`
+  field), so one push carries the diff and its events together. An events-only
+  cycle still emits an envelope and bumps `version`. Events own no ack, retry, or
+  reconnect replay — a handler only sees events fired after it registers, so data
+  that must exist at mount belongs in state. The client consumes them via
+  `store.handleEvent(name, cb)` (returns an unsubscribe thunk; registry survives
+  reconnect), and React via `useMusubiEvent(store, name, cb)`. Backend tests
+  assert delivery with `Musubi.Testing.assert_push_event/3` /
+  `refute_push_event/2`.
+- **`musubi` / `@musubi/client` / `@musubi/react`** — **Typed, per-store event
+  declarations.** Declare events in any store with the payload-only `event` DSL
+  (`event :toast do field :msg, String.t() end`). Events are per-store and tagged
+  on the wire with the emitting store's `store_id`, dispatched on the client per
+  `(store_id, name)` (symmetric with stream/upload ops), so the same name on two
+  stores never collides. The declaration drives codegen — `StoreDef` gains a 4th
+  `Events` type param (default `{}`, so existing references stay valid) — yielding
+  typed `handleEvent` / `useMusubiEvent` per store.
+- **`musubi`** — **`:after_render` / `:after_serialize` are transform stages.**
+  Both carry a per-socket `Musubi.Page.Frame` (`%{render, events}`) and return
+  `{:cont | :halt, frame, socket}` (`Lifecycle.run_transform_hooks/3`), so apps
+  can rewrite outbound render/events (audit, redact, enrich, drop). `:after_serialize`
+  runs at the page server's aggregation phase, iterating the registry so events
+  on memoized sockets still flush. Declared-event payload validation ships as a
+  default `:after_serialize` hook (`Musubi.Hooks.ValidateEvents`) in
+  `config :musubi, :default_hooks` (dev/test) — `:default_hooks` are attached to
+  every store socket and each hook self-scopes: `ValidateEvents` validates a
+  store's own events, `ValidateRender` acts only on the root, command/reply
+  validators skip commands they do not declare. Dev-correctness, not a security
+  boundary, never raises in prod.
+
 ## [0.12.0] — 2026-06-27
 
 ### Fixed

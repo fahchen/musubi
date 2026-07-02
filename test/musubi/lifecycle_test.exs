@@ -159,6 +159,51 @@ defmodule Musubi.LifecycleTest do
     assert Lifecycle.stage_arity(:after_serialize) == 2
   end
 
+  describe "run_transform_hooks/3" do
+    setup do
+      socket = %Socket{id: "", parent_path: [], module: RootStore, assigns: %{}, private: %{}}
+      %{socket: socket, frame: %{render: %{}, events: [%{name: "a"}, %{name: "b"}]}}
+    end
+
+    test "returns datum unchanged with no hooks", %{socket: socket, frame: frame} do
+      assert {^frame, ^socket} = Lifecycle.run_transform_hooks(socket, :after_serialize, frame)
+    end
+
+    test "threads a rewritten datum through the chain", %{socket: socket, frame: frame} do
+      socket =
+        socket
+        |> Lifecycle.attach_hook(:drop_a, :after_serialize, fn f, s ->
+          {:cont, Map.update!(f, :events, &Enum.reject(&1, fn e -> e.name == "a" end)), s}
+        end)
+        |> Lifecycle.attach_hook(:tag, :after_serialize, fn f, s ->
+          {:cont, Map.put(f, :tagged, true), s}
+        end)
+
+      assert {%{events: [%{name: "b"}], tagged: true}, ^socket} =
+               Lifecycle.run_transform_hooks(socket, :after_serialize, frame)
+    end
+
+    test "halt stops the chain, keeping that hook's datum", %{socket: socket, frame: frame} do
+      socket =
+        socket
+        |> Lifecycle.attach_hook(:halt, :after_serialize, fn f, s ->
+          {:halt, Map.put(f, :h, 1), s}
+        end)
+        |> Lifecycle.attach_hook(:never, :after_serialize, fn _f, _s -> raise "should not run" end)
+
+      assert {%{h: 1}, ^socket} = Lifecycle.run_transform_hooks(socket, :after_serialize, frame)
+    end
+
+    test "raises on an invalid hook result", %{socket: socket, frame: frame} do
+      socket =
+        Lifecycle.attach_hook(socket, :bad, :after_serialize, fn _f, s -> {:cont, s} end)
+
+      assert_raise ArgumentError, ~r/invalid :after_serialize hook result/, fn ->
+        Lifecycle.run_transform_hooks(socket, :after_serialize, frame)
+      end
+    end
+  end
+
   defp hook_fun_for(:before_command) do
     fn _command_name, _payload, current_socket -> {:cont, current_socket} end
   end

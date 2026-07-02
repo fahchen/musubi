@@ -23,6 +23,8 @@ export class FakeStoreProxy<M extends StoreModule<R>, R> {
   private dispatchImpl: (name: string, payload: unknown) => Promise<unknown> = async () =>
     undefined
 
+  private readonly eventHandlers = new Map<string, Set<(payload: unknown) => void>>()
+
   constructor(initialSnapshot: StoreSnapshot<M, R>) {
     this.snapshotValue = initialSnapshot
   }
@@ -35,6 +37,20 @@ export class FakeStoreProxy<M extends StoreModule<R>, R> {
   }
 
   snapshot = (): StoreSnapshot<M, R> => this.snapshotValue
+
+  handleEvent = (name: string, handler: (payload: unknown) => void): (() => void) => {
+    const handlers = this.eventHandlers.get(name) ?? new Set<(payload: unknown) => void>()
+    handlers.add(handler)
+    this.eventHandlers.set(name, handlers)
+    return () => {
+      handlers.delete(handler)
+      if (handlers.size === 0) this.eventHandlers.delete(name)
+    }
+  }
+
+  emitEvent(name: string, payload: unknown): void {
+    for (const handler of this.eventHandlers.get(name) ?? []) handler(payload)
+  }
 
   dispatchCommand = async (name: string, payload: unknown): Promise<unknown> => {
     this.dispatchCalls.push({ name, payload })

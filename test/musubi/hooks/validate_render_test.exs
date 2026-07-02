@@ -2,6 +2,7 @@ defmodule Musubi.Hooks.ValidateRenderTest do
   use ExUnit.Case, async: true
 
   alias Musubi.Hooks.ValidateRender
+  alias Musubi.Page.Frame
   alias Musubi.Socket
 
   defmodule MoneyState do
@@ -170,7 +171,7 @@ defmodule Musubi.Hooks.ValidateRenderTest do
     ref = attach_telemetry_handler(self())
 
     assert_raise ArgumentError, ~r/\$\.title/, fn ->
-      ValidateRender.after_serialize(:raise, %{"title" => 42}, socket)
+      ValidateRender.after_serialize(:raise, %Frame{render: %{"title" => 42}}, socket)
     end
 
     assert_receive {[:musubi, :validate, :exception], ^ref, %{count: 1}, metadata}
@@ -182,8 +183,8 @@ defmodule Musubi.Hooks.ValidateRenderTest do
     socket = %Socket{module: TitleStore, assigns: %{}, private: %{}}
     ref = attach_telemetry_handler(self())
 
-    assert {:cont, ^socket} =
-             ValidateRender.after_serialize(:telemetry, %{"title" => 42}, socket)
+    assert {:cont, %Frame{}, ^socket} =
+             ValidateRender.after_serialize(:telemetry, %Frame{render: %{"title" => 42}}, socket)
 
     # Filter on `store_module: TitleStore` at receive-time so concurrent tests
     # emitting `[:musubi, :validate, :exception]` for their own stores don't
@@ -196,8 +197,8 @@ defmodule Musubi.Hooks.ValidateRenderTest do
     socket = %Socket{module: TitleStore, assigns: %{}, private: %{}}
     ref = attach_telemetry_handler(self())
 
-    assert {:cont, ^socket} =
-             ValidateRender.after_serialize(:raise, %{"title" => "Inbox"}, socket)
+    assert {:cont, %Frame{}, ^socket} =
+             ValidateRender.after_serialize(:raise, %Frame{render: %{"title" => "Inbox"}}, socket)
 
     # Filter on `store_module: TitleStore` at receive-time so concurrent tests
     # emitting `[:musubi, :validate, :stop]` for their own stores don't race

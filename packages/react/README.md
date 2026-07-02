@@ -1,7 +1,8 @@
 # @musubi/react
 
 React bindings for Musubi stores. Provides `MusubiProvider`, `useMusubiRoot`,
-`useMusubiSnapshot`, and `useMusubiCommand` on top of `@musubi/client`.
+`useMusubiSnapshot`, `useMusubiCommand`, and `useMusubiEvent` on top of
+`@musubi/client`.
 
 ## Install
 

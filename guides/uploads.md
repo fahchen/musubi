@@ -2,8 +2,8 @@
 
 This guide walks an avatar upload from a Phoenix `Musubi.Store` to a
 React UI in two flavors: the default channel mode, and a direct-to-cloud
-external mode. The full reference (DSL options, wire protocol, BDRs)
-lives at `docs/uploads.md`.
+external mode. For the full reference (DSL options, wire protocol, BDRs)
+see [Uploads reference](docs/uploads.md).
 
 ## 1. Declare the upload on the store
 

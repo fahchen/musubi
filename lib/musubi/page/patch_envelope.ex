@@ -3,13 +3,14 @@ defmodule Musubi.Page.PatchEnvelope do
   Wire-shape of one Musubi patch update.
 
   An envelope groups one render cycle's RFC 6902 ops with the matching
-  `stream_ops` accumulated by the stream API. Per BDR-0014/0018:
+  `stream_ops` accumulated by the stream API:
 
     * `ops` are the post-filtered Musubi JSON Patch ops (`add`/`remove`/`replace` only).
     * `stream_ops` carry stream-typed content (the wire tree carries stable
       `%{"__musubi_stream__" => name}` markers at stream placement paths).
-    * The page runtime emits an envelope when `ops` *or* `stream_ops` is
-      non-empty; an idle render cycle produces no envelope.
+    * The page runtime emits an envelope when `ops`, `stream_ops`, `upload_ops`,
+      or `events` is non-empty; an idle render cycle produces no envelope. The
+      skip is content-driven: `build/5` returns `nil` when all four are empty.
 
   ## Cross-track contract
 
@@ -38,6 +39,13 @@ defmodule Musubi.Page.PatchEnvelope do
   @typedoc "Wire upload-op shape produced by `Musubi.Page.Server` from the `Musubi.Upload` accumulator."
   @type upload_op() :: map()
 
+  @typedoc "Wire push-event shape produced by `Musubi.Page.Server` from the `Musubi.Event` accumulator. `store_id` tags the emitting store (client dispatches per `(store_id, name)`)."
+  @type event() :: %{
+          required(:store_id) => [String.t()],
+          required(:name) => String.t(),
+          required(:payload) => term()
+        }
+
   typed_structor do
     field :type, String.t(),
       default: "patch",
@@ -55,17 +63,22 @@ defmodule Musubi.Page.PatchEnvelope do
     field :ops, [op()],
       default: [],
       doc:
-        "RFC 6902 ops describing the wire-form delta. Only `add`/`remove`/`replace` (BDR-0014). Stream item content never appears here."
+        "RFC 6902 ops describing the wire-form delta. Only `add`/`remove`/`replace`. Stream item content never appears here."
 
     field :stream_ops, [stream_op()],
       default: [],
       doc:
-        "Ordered wire ops for stream-typed slots (reset/insert/delete, each tagged with `store_id`). Applied after `ops` in array order on the client (BDR-0018)."
+        "Ordered wire ops for stream-typed slots (reset/insert/delete, each tagged with `store_id`). Applied after `ops` in array order on the client."
 
     field :upload_ops, [upload_op()],
       default: [],
       doc:
         "Ordered wire ops for upload-tracked entries (config/add/progress/complete/error/cancel/reset, each tagged with `store_id`). Independent of `stream_ops`."
+
+    field :events, [event()],
+      default: [],
+      doc:
+        "Transient push events, each `%{name, payload}`. Fire-and-forget: dispatched once on the client after `ops`, owns no version/recovery semantics, not replayed on reconnect. An event-only cycle still emits an envelope and bumps `version`."
   end
 
   @doc """
@@ -85,48 +98,54 @@ defmodule Musubi.Page.PatchEnvelope do
       iex> envelope.ops
       [%{op: "replace", path: "", value: %{"title" => "Inbox"}}]
   """
-  @spec initial(term(), [stream_op()], [upload_op()]) :: t()
-  def initial(wire_root, stream_ops, upload_ops \\ [])
-      when is_list(stream_ops) and is_list(upload_ops) do
+  @spec initial(term(), [stream_op()], [upload_op()], [event()]) :: t()
+  def initial(wire_root, stream_ops, upload_ops \\ [], events \\ [])
+      when is_list(stream_ops) and is_list(upload_ops) and is_list(events) do
     %__MODULE__{
       type: "patch",
       base_version: 0,
       version: 1,
       ops: [%{op: "replace", path: "", value: wire_root}],
       stream_ops: stream_ops,
-      upload_ops: upload_ops
+      upload_ops: upload_ops,
+      events: events
     }
   end
 
   @doc """
   Builds an envelope for a subsequent render cycle.
 
-  Returns `nil` when both `ops` and `stream_ops` are empty (BDR-0018 — idle
-  cycles emit nothing).
+  Returns `nil` only when `ops`, `stream_ops`, `upload_ops`, and `events` are all
+  empty (idle cycles emit nothing). An events-only cycle still emits
+  an envelope and bumps `version`.
 
   ## Examples
 
       iex> Musubi.Page.PatchEnvelope.build(0, [%{op: "replace", path: "/a", value: 1}], [])
-      %Musubi.Page.PatchEnvelope{type: "patch", base_version: 0, version: 1, ops: [%{op: "replace", path: "/a", value: 1}], stream_ops: [], upload_ops: []}
+      %Musubi.Page.PatchEnvelope{type: "patch", base_version: 0, version: 1, ops: [%{op: "replace", path: "/a", value: 1}], stream_ops: [], upload_ops: [], events: []}
 
-      iex> Musubi.Page.PatchEnvelope.build(3, [], [])
+      iex> Musubi.Page.PatchEnvelope.build(3, [], [], [], [])
       nil
+
+      iex> Musubi.Page.PatchEnvelope.build(3, [], [], [], [%{name: "toast", payload: %{}}])
+      %Musubi.Page.PatchEnvelope{type: "patch", base_version: 3, version: 4, ops: [], stream_ops: [], upload_ops: [], events: [%{name: "toast", payload: %{}}]}
   """
-  @spec build(non_neg_integer(), [op()], [stream_op()], [upload_op()]) :: t() | nil
-  def build(base_version, ops, stream_ops, upload_ops \\ [])
+  @spec build(non_neg_integer(), [op()], [stream_op()], [upload_op()], [event()]) :: t() | nil
+  def build(base_version, ops, stream_ops, upload_ops \\ [], events \\ [])
 
-  def build(_base_version, [], [], []), do: nil
+  def build(_base_version, [], [], [], []), do: nil
 
-  def build(base_version, ops, stream_ops, upload_ops)
+  def build(base_version, ops, stream_ops, upload_ops, events)
       when is_integer(base_version) and base_version >= 0 and is_list(ops) and
-             is_list(stream_ops) and is_list(upload_ops) do
+             is_list(stream_ops) and is_list(upload_ops) and is_list(events) do
     %__MODULE__{
       type: "patch",
       base_version: base_version,
       version: base_version + 1,
       ops: ops,
       stream_ops: stream_ops,
-      upload_ops: upload_ops
+      upload_ops: upload_ops,
+      events: events
     }
   end
 
@@ -138,9 +157,9 @@ defmodule Musubi.Page.PatchEnvelope do
 
   ## Examples
 
-      iex> envelope = %Musubi.Page.PatchEnvelope{base_version: 0, version: 1, ops: [], stream_ops: [], upload_ops: []}
+      iex> envelope = %Musubi.Page.PatchEnvelope{base_version: 0, version: 1, ops: [], stream_ops: [], upload_ops: [], events: []}
       iex> Musubi.Page.PatchEnvelope.to_wire(envelope)
-      %{"type" => "patch", "base_version" => 0, "version" => 1, "ops" => [], "stream_ops" => [], "upload_ops" => []}
+      %{"type" => "patch", "base_version" => 0, "version" => 1, "ops" => [], "stream_ops" => [], "upload_ops" => [], "events" => []}
   """
   @spec to_wire(t()) :: %{String.t() => term()}
   def to_wire(%__MODULE__{} = envelope) do
@@ -150,7 +169,8 @@ defmodule Musubi.Page.PatchEnvelope do
       "version" => envelope.version,
       "ops" => envelope.ops,
       "stream_ops" => envelope.stream_ops,
-      "upload_ops" => envelope.upload_ops
+      "upload_ops" => envelope.upload_ops,
+      "events" => envelope.events
     }
   end
 end

@@ -5,11 +5,12 @@
 declare namespace Musubi {
   const Type: unique symbol
 
-  interface StoreDef<Module extends string, Shape, Commands> {
+  interface StoreDef<Module extends string, Shape, Commands, Events = {}> {
     readonly [Type]: {
       module: Module
       shape: Shape
       commands: Commands
+      events: Events
     }
   }
 

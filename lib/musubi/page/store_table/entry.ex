@@ -49,12 +49,12 @@ defmodule Musubi.Page.StoreTable.Entry do
 
     field :module, module(),
       enforce: true,
-      doc: "Store module backing this node. Changing the module forces a fresh mount (BDR-0011)."
+      doc: "Store module backing this node. Changing the module forces a fresh mount."
 
     field :resolved_state, resolved_state(),
       default: nil,
       doc:
-        "Last resolved render output (Elixir form) for this node. Reused when memoization skips `update/2` and `render/1` (BDR-0013)."
+        "Last resolved render output (Elixir form) for this node. Reused when memoization skips `update/2` and `render/1`."
 
     field :raw_state, raw_state(),
       default: :not_rendered,

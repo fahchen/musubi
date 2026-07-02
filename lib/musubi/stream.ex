@@ -8,7 +8,7 @@ defmodule Musubi.Stream do
   `Musubi.Stream.Slot` struct stored under `socket.assigns.__streams__`. Each
   cycle's queued ops drain into the patch envelope's `stream_ops`, where the
   page runtime stamps each op with its owning `store_id`, and the struct is
-  pruned (BDR-0014, BDR-0018).
+  pruned.
 
   The runtime does not keep an ordered `item_keys` list, does not decide
   upsert-vs-insert, and does not trim for `:limit` server-side. The client

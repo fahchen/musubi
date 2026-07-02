@@ -99,9 +99,15 @@ defmodule Musubi.MixProject do
         "guides/getting-started.md",
         "guides/phoenix-setup.md",
         "guides/client-and-react.md",
+        "guides/streams.md",
         "guides/uploads.md",
+        "guides/push-events.md",
         "guides/testing.md",
         "docs/client-contract.md",
+        {"docs/streams.md", filename: "streams-reference", title: "Streams reference"},
+        {"docs/uploads.md", filename: "uploads-reference", title: "Uploads reference"},
+        {"docs/push-events.md",
+         filename: "push-events-reference", title: "Push events reference"},
         "docs/persistence-pattern.md"
       ],
       groups_for_extras: [
@@ -109,11 +115,16 @@ defmodule Musubi.MixProject do
           "guides/getting-started.md",
           "guides/phoenix-setup.md",
           "guides/client-and-react.md",
+          "guides/streams.md",
           "guides/uploads.md",
+          "guides/push-events.md",
           "guides/testing.md"
         ],
         Reference: [
           "docs/client-contract.md",
+          "docs/streams.md",
+          "docs/uploads.md",
+          "docs/push-events.md",
           "docs/persistence-pattern.md"
         ]
       ],
@@ -128,7 +139,9 @@ defmodule Musubi.MixProject do
         Runtime: [
           Musubi.Async,
           Musubi.AsyncResult,
+          Musubi.Event,
           Musubi.Lifecycle,
+          Musubi.Page.Frame,
           Musubi.Stream,
           Musubi.Telemetry
         ],
@@ -156,7 +169,9 @@ defmodule Musubi.MixProject do
       Musubi.Child,
       Musubi.Async,
       Musubi.AsyncResult,
+      Musubi.Event,
       Musubi.Lifecycle,
+      Musubi.Page.Frame,
       Musubi.Stream,
       Musubi.Telemetry,
       Musubi.Transport.Socket,
@@ -188,6 +203,7 @@ defmodule Musubi.MixProject do
       "Musubi.State.__using__/1",
       "Musubi.Store.__using__/1",
       "Musubi.Stream.Slot",
+      "Musubi.Transport.UploadChannel",
       "Musubi.Type",
       "Musubi.Wire",
       "Resolver",

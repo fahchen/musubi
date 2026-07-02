@@ -79,15 +79,10 @@ defmodule Musubi.ResolverRootShortCircuitTest do
     root_socket = root_socket(ShortCircuitRootStore, %{test_pid: test_pid})
 
     socket =
-      root_socket
-      |> Lifecycle.attach_hook(:root_after_render, :after_render, fn _term, current_socket ->
+      Lifecycle.attach_hook(root_socket, :root_after_render, :after_render, fn frame,
+                                                                               current_socket ->
         send(test_pid, :root_after_render_called)
-        {:cont, current_socket}
-      end)
-      |> Lifecycle.attach_hook(:root_after_serialize, :after_serialize, fn _term,
-                                                                           current_socket ->
-        send(test_pid, :root_after_serialize_called)
-        {:cont, current_socket}
+        {:cont, frame, current_socket}
       end)
 
     assert {:ok, %{child: %{count: 0}}, root_socket, registry} =
@@ -95,10 +90,8 @@ defmodule Musubi.ResolverRootShortCircuitTest do
 
     assert_receive :root_render_called
     assert_receive :root_after_render_called
-    assert_receive :root_after_serialize_called
     refute_receive :root_render_called, 50
     refute_receive :root_after_render_called, 50
-    refute_receive :root_after_serialize_called, 50
 
     assert %Entry{} = child_entry = StoreTable.get(registry, ["child"])
     assert %Socket{} = child_socket = child_entry.socket
@@ -113,9 +106,7 @@ defmodule Musubi.ResolverRootShortCircuitTest do
 
     refute_receive :root_render_called, 50
     assert_receive :root_after_render_called
-    assert_receive :root_after_serialize_called
     refute_receive :root_after_render_called, 50
-    refute_receive :root_after_serialize_called, 50
   end
 
   test "root render/1 still runs when the root has pending changed streams" do
@@ -123,15 +114,10 @@ defmodule Musubi.ResolverRootShortCircuitTest do
     root_socket = root_socket(RootStreamDirtyStore, %{test_pid: test_pid})
 
     socket =
-      root_socket
-      |> Lifecycle.attach_hook(:root_after_render, :after_render, fn _term, current_socket ->
+      Lifecycle.attach_hook(root_socket, :root_after_render, :after_render, fn frame,
+                                                                               current_socket ->
         send(test_pid, :root_after_render_called)
-        {:cont, current_socket}
-      end)
-      |> Lifecycle.attach_hook(:root_after_serialize, :after_serialize, fn _term,
-                                                                           current_socket ->
-        send(test_pid, :root_after_serialize_called)
-        {:cont, current_socket}
+        {:cont, frame, current_socket}
       end)
 
     assert {:ok,
@@ -144,10 +130,8 @@ defmodule Musubi.ResolverRootShortCircuitTest do
 
     assert_receive :root_render_called
     assert_receive :root_after_render_called
-    assert_receive :root_after_serialize_called
     refute_receive :root_render_called, 50
     refute_receive :root_after_render_called, 50
-    refute_receive :root_after_serialize_called, 50
 
     dirty_root_socket = Stream.stream_insert(root_socket, :messages, %{id: "m1"})
 
@@ -161,7 +145,6 @@ defmodule Musubi.ResolverRootShortCircuitTest do
 
     assert_receive :root_render_called
     assert_receive :root_after_render_called
-    assert_receive :root_after_serialize_called
   end
 
   defp registry(%Socket{} = socket) do

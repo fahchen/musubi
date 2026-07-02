@@ -256,7 +256,9 @@ function connectionEnvelope(
     base_version: baseVersion,
     version,
     ops,
-    stream_ops: streamOps
+    stream_ops: streamOps,
+    upload_ops: [],
+    events: []
   }
 }
 

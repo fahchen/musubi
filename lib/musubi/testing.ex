@@ -23,6 +23,7 @@ defmodule Musubi.Testing do
       }
   """
 
+  alias Musubi.Page.PatchEnvelope
   alias Musubi.Page.Server
   alias Musubi.Socket
   alias Musubi.Wire
@@ -140,8 +141,7 @@ defmodule Musubi.Testing do
   end
 
   @doc """
-  Targets a mounted child store with new assigns via `Musubi.send_update/3`
-  (BDR-0030).
+  Targets a mounted child store with new assigns via `Musubi.send_update/3`.
 
   The `assigns` map is delivered to the store's `update/2`, dirtying that
   subtree; the resulting coalesced patch lands on the transport pid for
@@ -155,6 +155,95 @@ defmodule Musubi.Testing do
       when is_list(store_id) and is_map(assigns) do
     Musubi.send_update(pid, store_id, assigns)
     :ok
+  end
+
+  @doc """
+  Asserts a transient push event named `name` was delivered with
+  `payload`, and returns the matched wire payload.
+
+  Push events ride the patch envelope, so this scans `{:patch, _}` messages
+  pushed to the test process and **consumes** the patches it scans past — assert
+  any state patches you care about *before* asserting events, or assert the event
+  first. `payload` is compared in wire shape (`Musubi.Wire.to_wire/1`), symmetric
+  with `dispatch_command/4` (atom keys/values normalize to strings).
+
+  Requires the page's `transport_pid` to be the test process (the `mount/3`
+  default).
+
+  ## Example
+
+      page = Musubi.Testing.mount(InboxStore)
+      Musubi.Testing.dispatch_command(page, :save, %{})
+      Musubi.Testing.assert_push_event(:toast, %{msg: "Saved", level: :info})
+  """
+  @spec assert_push_event(atom() | String.t(), term(), non_neg_integer()) :: term()
+  def assert_push_event(name, payload, timeout \\ 100)
+      when is_atom(name) or is_binary(name) do
+    name = to_string(name)
+    expected = Wire.to_wire(payload)
+
+    case scan_for_event(name, timeout) do
+      %{payload: ^expected} = event ->
+        event.payload
+
+      %{payload: other} ->
+        ExUnit.Assertions.flunk(
+          "push event #{inspect(name)} payload mismatch\n" <>
+            "  expected: #{inspect(expected)}\n  got:      #{inspect(other)}"
+        )
+
+      nil ->
+        ExUnit.Assertions.flunk(
+          "expected a push event named #{inspect(name)} within #{timeout}ms"
+        )
+    end
+  end
+
+  @doc """
+  Asserts NO push event named `name` is delivered within `timeout`.
+
+  Like `assert_push_event/3`, this consumes the patch messages it scans.
+  """
+  @spec refute_push_event(atom() | String.t(), non_neg_integer()) :: :ok
+  def refute_push_event(name, timeout \\ 100) when is_atom(name) or is_binary(name) do
+    name = to_string(name)
+
+    case scan_for_event(name, timeout) do
+      nil ->
+        :ok
+
+      event ->
+        ExUnit.Assertions.flunk(
+          "unexpected push event #{inspect(name)}: #{inspect(event.payload)}"
+        )
+    end
+  end
+
+  @spec scan_for_event(String.t(), non_neg_integer()) :: PatchEnvelope.event() | nil
+  defp scan_for_event(name, timeout) do
+    scan_until(name, System.monotonic_time(:millisecond) + timeout)
+  end
+
+  # Honors the original `timeout` as an absolute deadline: non-matching patches
+  # loop, but each `receive` waits only the time left — so a stream of unrelated
+  # patches can't reset the clock and block indefinitely.
+  @spec scan_until(String.t(), integer()) :: PatchEnvelope.event() | nil
+  defp scan_until(name, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      nil
+    else
+      receive do
+        {:patch, %PatchEnvelope{events: events}} ->
+          case Enum.find(events, &(&1.name == name)) do
+            nil -> scan_until(name, deadline)
+            event -> event
+          end
+      after
+        remaining -> nil
+      end
+    end
   end
 
   @doc """

@@ -11,7 +11,7 @@ defmodule Musubi.Hooks.ValidateCommandSchema do
 
   Validation walks each declared field, checks presence (string or atom
   key), and dispatches to `Musubi.Type.valid?/3`. Any mismatch raises
-  `ArgumentError` per BDR-0003 (let-it-crash for malformed commands).
+  `ArgumentError` (let-it-crash for malformed commands).
 
   Successful validation emits `[:musubi, :validate, :command, :stop]`.
   """

@@ -54,7 +54,7 @@ defmodule Musubi do
   The `assigns` map is delivered to the addressed store's `update/2`
   callback (or merged directly when the store does not export it). The
   store's socket goes dirty and only that subtree re-renders; a clean
-  root short-circuits its own `render/1` (BDR-0023). One coalesced patch
+  root short-circuits its own `render/1`. One coalesced patch
   envelope ships for the cycle. A `store_id` that no longer resolves to a
   mounted store is a no-op (LV-aligned) and emits
   `[:musubi, :send_update, :no_target]` telemetry.
@@ -62,7 +62,7 @@ defmodule Musubi do
   This two-arity form sends to `self()` — call it from inside the root
   store's `handle_info/2`, where `self()` is the page process. It is the
   intra-page last hop for cross-connection fan-out coordinated over
-  `Phoenix.PubSub` (BDR-0005 / BDR-0030); Musubi owns the targeting, the
+  `Phoenix.PubSub`; Musubi owns the targeting, the
   application owns the broadcast.
 
   `store_id` may address any mounted store, including the root (`[]`).
