@@ -91,11 +91,14 @@ still validated to catch handler mistakes, and a push event is the same kind of
 trusted-but-fallible server output. A declared event whose payload is missing a
 field or has a type mismatch raises `ArgumentError` (BDR-0003 let-it-crash); an
 *undeclared* event name is skipped. This is **not** a security boundary — events
-are server-pushed. It is gated by `config :musubi, :validate_push_events`
-(default `config_env() in [:dev, :test]`, off in prod), like `ValidateRender`, so
-a released app never crashes a page over a malformed event. Validation runs in
-the queuing handler's render cycle, so a bad `push_event` surfaces synchronously
-from `dispatch_command`.
+are server-pushed. It ships as the default `:after_serialize` hook
+`Musubi.Hooks.ValidateEvents`, attached to **every** store socket via
+`config :musubi, :store_hooks` (root + each child at creation), so each store
+validates its own events against its own schema — on in `:dev`/`:test`, absent in
+prod, like `ValidateRender`. (Render/command/reply validators stay root-only in
+`:default_hooks`; a per-child render validator would reject legitimately-transient
+async render.) Validation runs in the queuing handler's render cycle, so a bad
+`push_event` surfaces synchronously from `dispatch_command`.
 
 **Wire shape.** `PatchEnvelope` gains an `events` field. One event is
 `%{"store_id" => [string], "name" => string, "payload" => wire}` — `store_id`

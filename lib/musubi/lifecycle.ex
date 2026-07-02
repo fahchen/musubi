@@ -209,6 +209,25 @@ defmodule Musubi.Lifecycle do
   end
 
   @doc """
+  Attaches an application-configured hook list to a socket.
+
+  `config_key` is a `:musubi` application env key holding `{id, stage, fun}`
+  entries:
+
+    * `:default_hooks` — root-only concerns (command/reply schema validation,
+      whole-tree render validation), attached to the root socket at mount.
+    * `:store_hooks` — per-store concerns (push-event validation), attached to
+      every store socket (root + each child at creation) so each store validates
+      its own events.
+  """
+  @spec attach_hooks(Socket.t(), atom()) :: Socket.t()
+  def attach_hooks(%Socket{} = socket, config_key) when is_atom(config_key) do
+    :musubi
+    |> Application.get_env(config_key, [])
+    |> Enum.reduce(socket, fn {id, stage, fun}, acc -> attach_hook(acc, id, stage, fun) end)
+  end
+
+  @doc """
   Returns the supported lifecycle stages in execution order.
 
   ## Examples

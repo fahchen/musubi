@@ -39,9 +39,11 @@ not in lockstep yet; entries note which surface they affect.
   `{:cont | :halt, frame, socket}` (`Lifecycle.run_transform_hooks/3`), so apps
   can rewrite outbound render/events (audit, redact, enrich, drop). `:after_serialize`
   runs at the page server's aggregation phase, iterating the registry so events
-  on memoized sockets still flush. Declared-event payload validation runs there,
-  gated by `config :musubi, :validate_push_events` (dev/test default) — dev-correctness,
-  not a security boundary, never raises in prod.
+  on memoized sockets still flush. Declared-event payload validation ships as a
+  default `:after_serialize` hook (`Musubi.Hooks.ValidateEvents`) attached to
+  every store socket via `config :musubi, :store_hooks` (dev/test) — each store
+  validates its own events; render/command/reply validators stay root-only in
+  `:default_hooks`. Dev-correctness, not a security boundary, never raises in prod.
 
 ## [0.12.0] — 2026-06-27
 

@@ -3,6 +3,7 @@ defmodule Musubi.Reconciler do
 
   alias Musubi.Child
   alias Musubi.DSL.Attr
+  alias Musubi.Lifecycle
   alias Musubi.Page.StoreTable
   alias Musubi.Page.StoreTable.Entry
   alias Musubi.Socket
@@ -251,16 +252,16 @@ defmodule Musubi.Reconciler do
   @spec new_child_socket(Socket.t(), [String.t()], module(), String.t(), map()) :: Socket.t()
   defp new_child_socket(%Socket{} = parent_socket, parent_path, module, id, assigns)
        when is_list(parent_path) and is_atom(module) and is_binary(id) and is_map(assigns) do
-    Socket.assign(
-      Socket.inherit_context(parent_socket, %Socket{
-        id: id,
-        parent_path: parent_path,
-        module: module,
-        assigns: %{},
-        private: %{}
-      }),
-      assigns
-    )
+    parent_socket
+    |> Socket.inherit_context(%Socket{
+      id: id,
+      parent_path: parent_path,
+      module: module,
+      assigns: %{},
+      private: %{}
+    })
+    |> Lifecycle.attach_hooks(:store_hooks)
+    |> Socket.assign(assigns)
   end
 
   @spec validate_callback_result!({:ok, Socket.t()} | tuple(), module(), atom(), pos_integer()) ::

@@ -277,7 +277,8 @@ defmodule Musubi.Page.Server do
     root_socket =
       %{root_socket | id: "", parent_path: [], module: root_module, transport_pid: transport_pid}
       |> Socket.put_root_params(params)
-      |> attach_default_hooks()
+      |> Lifecycle.attach_hooks(:default_hooks)
+      |> Lifecycle.attach_hooks(:store_hooks)
       |> mount_root_store(params)
       |> normalize_root_assigns()
       |> Reconciler.init_store()
@@ -1063,11 +1064,12 @@ defmodule Musubi.Page.Server do
   # Per-entry outbound aggregation (root before children). For each store socket:
   # drains + wire-encodes its push events (BDR-0032), builds a `Frame` from the
   # entry's wire render + those events, runs the `:after_serialize` transform
-  # stage (render/event validation, app audit/redaction), then stamps each event
-  # with the socket's store_id (symmetric with stream/upload ops). Iterating the
-  # registry — not the render path — keeps events from memoized sockets flushing.
-  # Returns the (possibly hook-rewritten) root wire render, the flattened events,
-  # and the registry with hooked sockets + wire_state written back.
+  # stage (default `ValidateRender`/`ValidateEvents` hooks, plus app
+  # audit/redaction), then stamps each event with the socket's store_id
+  # (symmetric with stream/upload ops). Iterating the registry — not the render
+  # path — keeps events from memoized sockets flushing. Returns the (possibly
+  # hook-rewritten) root wire render, the flattened events, and the registry with
+  # hooked sockets + wire_state written back.
   @spec serialize_frames(StoreTable.t()) ::
           {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}
   defp serialize_frames(%StoreTable{} = registry) do
@@ -1081,7 +1083,7 @@ defmodule Musubi.Page.Server do
           {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}
   defp serialize_entry(store_id, {wire_root, events_acc, reg}) do
     case StoreTable.get(reg, store_id) do
-      %Entry{socket: socket, wire_state: wire_state, module: module} = entry ->
+      %Entry{socket: socket, wire_state: wire_state} = entry ->
         {wire_events, socket} = Event.flush_pending(socket)
 
         {%Frame{render: render, events: events}, socket} =
@@ -1091,7 +1093,6 @@ defmodule Musubi.Page.Server do
             %Frame{render: wire_state, events: wire_events}
           )
 
-        maybe_validate_events(events, module)
         stamped = Enum.map(events, &Map.put(&1, :store_id, store_id))
         reg = StoreTable.put(reg, store_id, %{entry | socket: socket, wire_state: render})
         {if(store_id == [], do: render, else: wire_root), events_acc ++ stamped, reg}
@@ -1099,17 +1100,6 @@ defmodule Musubi.Page.Server do
       nil ->
         {wire_root, events_acc, reg}
     end
-  end
-
-  # Dev-correctness only (config/config.exs): validate a socket's declared event
-  # payloads in dev/test, skip in prod. Not a security boundary — events are
-  # server-pushed (BDR-0032). Runs per store socket against its own module.
-  @spec maybe_validate_events([Event.event()], module()) :: :ok
-  defp maybe_validate_events(events, module) do
-    if Application.get_env(:musubi, :validate_push_events, false),
-      do: Event.validate_events!(events, module)
-
-    :ok
   end
 
   @spec flush_all_upload_ops(StoreTable.t()) :: {[Upload.op()], StoreTable.t()}
@@ -1380,15 +1370,6 @@ defmodule Musubi.Page.Server do
 
   defp append_error(existing, error) when is_list(existing) do
     List.insert_at(existing, -1, error)
-  end
-
-  @spec attach_default_hooks(Socket.t()) :: Socket.t()
-  defp attach_default_hooks(%Socket{} = socket) do
-    :musubi
-    |> Application.get_env(:default_hooks, [])
-    |> Enum.reduce(socket, fn {id, stage, fun}, acc ->
-      Lifecycle.attach_hook(acc, id, stage, fun)
-    end)
   end
 
   @spec page_id(State.t()) :: term()

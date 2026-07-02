@@ -43,11 +43,11 @@ mismatch raises `ArgumentError`, the same treatment a command reply gets from it
 declared schema. An undeclared event name is not validated. A bad `push_event` in
 a command handler surfaces synchronously from the dispatch.
 
-Validation is gated by `config :musubi, :validate_push_events` (default
-`config_env() in [:dev, :test]`, off in `:prod`), like render validation — so
-production never raises on a malformed event. The page server validates each
-store socket's events against that store's schema during `:after_serialize`
-aggregation.
+Validation is a **default `:after_serialize` hook** (`Musubi.Hooks.ValidateEvents`)
+attached to every store socket via `config :musubi, :store_hooks` — on in
+`:dev`/`:test`, absent in `:prod`, like render validation. Each store validates
+its own `frame.events` against its own schema. Detach or replace it there so
+production never raises on a malformed event.
 
 ## Extending: the `:after_serialize` frame hook
 
