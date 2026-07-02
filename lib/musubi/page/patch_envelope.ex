@@ -3,7 +3,7 @@ defmodule Musubi.Page.PatchEnvelope do
   Wire-shape of one Musubi patch update.
 
   An envelope groups one render cycle's RFC 6902 ops with the matching
-  `stream_ops` accumulated by the stream API. Per BDR-0014/0018:
+  `stream_ops` accumulated by the stream API:
 
     * `ops` are the post-filtered Musubi JSON Patch ops (`add`/`remove`/`replace` only).
     * `stream_ops` carry stream-typed content (the wire tree carries stable
@@ -39,7 +39,7 @@ defmodule Musubi.Page.PatchEnvelope do
   @typedoc "Wire upload-op shape produced by `Musubi.Page.Server` from the `Musubi.Upload` accumulator."
   @type upload_op() :: map()
 
-  @typedoc "Wire push-event shape (BDR-0032) produced by `Musubi.Page.Server` from the `Musubi.Event` accumulator. `store_id` tags the emitting store (client dispatches per `(store_id, name)`)."
+  @typedoc "Wire push-event shape produced by `Musubi.Page.Server` from the `Musubi.Event` accumulator. `store_id` tags the emitting store (client dispatches per `(store_id, name)`)."
   @type event() :: %{
           required(:store_id) => [String.t()],
           required(:name) => String.t(),
@@ -63,12 +63,12 @@ defmodule Musubi.Page.PatchEnvelope do
     field :ops, [op()],
       default: [],
       doc:
-        "RFC 6902 ops describing the wire-form delta. Only `add`/`remove`/`replace` (BDR-0014). Stream item content never appears here."
+        "RFC 6902 ops describing the wire-form delta. Only `add`/`remove`/`replace`. Stream item content never appears here."
 
     field :stream_ops, [stream_op()],
       default: [],
       doc:
-        "Ordered wire ops for stream-typed slots (reset/insert/delete, each tagged with `store_id`). Applied after `ops` in array order on the client (BDR-0018)."
+        "Ordered wire ops for stream-typed slots (reset/insert/delete, each tagged with `store_id`). Applied after `ops` in array order on the client."
 
     field :upload_ops, [upload_op()],
       default: [],
@@ -78,7 +78,7 @@ defmodule Musubi.Page.PatchEnvelope do
     field :events, [event()],
       default: [],
       doc:
-        "Transient push events (BDR-0032), each `%{name, payload}`. Fire-and-forget: dispatched once on the client after `ops`, owns no version/recovery semantics, not replayed on reconnect. An event-only cycle still emits an envelope and bumps `version`."
+        "Transient push events, each `%{name, payload}`. Fire-and-forget: dispatched once on the client after `ops`, owns no version/recovery semantics, not replayed on reconnect. An event-only cycle still emits an envelope and bumps `version`."
   end
 
   @doc """
@@ -116,8 +116,8 @@ defmodule Musubi.Page.PatchEnvelope do
   Builds an envelope for a subsequent render cycle.
 
   Returns `nil` only when `ops`, `stream_ops`, `upload_ops`, and `events` are all
-  empty (BDR-0018 — idle cycles emit nothing). An events-only cycle still emits
-  an envelope and bumps `version` (BDR-0032).
+  empty (idle cycles emit nothing). An events-only cycle still emits
+  an envelope and bumps `version`.
 
   ## Examples
 

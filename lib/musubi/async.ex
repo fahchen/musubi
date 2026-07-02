@@ -176,7 +176,7 @@ defmodule Musubi.Async do
   calling `assign_async/3,4` for the same data).
 
   A second `start_async/3,4` with the same `name` silently overwrites the
-  prior tracking ref (BDR-0019). The older task continues running and its
+  prior tracking ref. The older task continues running and its
   result is lazy-discarded on arrival, accompanied by a
   `[:musubi, :async, :lazy_discard]` telemetry event.
 

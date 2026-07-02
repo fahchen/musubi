@@ -18,7 +18,7 @@ defmodule Musubi.Child do
     field :assigns, assigns_map(),
       default: %{},
       doc:
-        "Parent-supplied assigns flowed into the child via `child(Module, id: ..., key: value, ...)`. The keys here form the child's consumed-key set used for memoization (BDR-0013)."
+        "Parent-supplied assigns flowed into the child via `child(Module, id: ..., key: value, ...)`. The keys here form the child's consumed-key set used for memoization."
   end
 
   @doc """

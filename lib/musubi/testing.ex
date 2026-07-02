@@ -141,8 +141,7 @@ defmodule Musubi.Testing do
   end
 
   @doc """
-  Targets a mounted child store with new assigns via `Musubi.send_update/3`
-  (BDR-0030).
+  Targets a mounted child store with new assigns via `Musubi.send_update/3`.
 
   The `assigns` map is delivered to the store's `update/2`, dirtying that
   subtree; the resulting coalesced patch lands on the transport pid for
@@ -159,7 +158,7 @@ defmodule Musubi.Testing do
   end
 
   @doc """
-  Asserts a transient push event (BDR-0032) named `name` was delivered with
+  Asserts a transient push event named `name` was delivered with
   `payload`, and returns the matched wire payload.
 
   Push events ride the patch envelope, so this scans `{:patch, _}` messages

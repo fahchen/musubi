@@ -1,7 +1,7 @@
 defmodule Musubi.Hooks.ValidateEvents do
   @moduledoc """
   Default `:after_serialize` hook that validates a store socket's drained push
-  events against that store's declared `event` schema (BDR-0032).
+  events against that store's declared `event` schema.
 
   Attached to the `:after_serialize` transform stage per store socket, so it
   receives (and returns unchanged) the wire-form `Musubi.Page.Frame` and
@@ -9,7 +9,7 @@ defmodule Musubi.Hooks.ValidateEvents do
   events. Dev-correctness only, mirroring `Musubi.Hooks.ValidateRender`: present
   in `:dev`/`:test` via `config :musubi, :default_hooks`, absent in `:prod`. A
   declared event whose payload is missing a field or has a type mismatch raises
-  `ArgumentError` (BDR-0003 let-it-crash); an undeclared event name is skipped.
+  `ArgumentError` (let-it-crash); an undeclared event name is skipped.
   Not a security boundary — events are server-pushed.
   """
 

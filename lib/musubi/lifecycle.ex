@@ -15,7 +15,7 @@ defmodule Musubi.Lifecycle do
 
   `:after_render` and `:after_serialize` are the two *outbound* stages: they run
   per store socket each render cycle over that socket's `Musubi.Page.Frame` — its
-  render output plus the push events (`Musubi.Event`, BDR-0032) it queued.
+  render output plus the push events (`Musubi.Event`) it queued.
   `:after_render` sees the Elixir-form frame (atom keys, structs, atom values,
   native event payloads); `:after_serialize` sees the wire-form frame after
   `Musubi.Wire.to_wire/1` (string keys, plain maps, atoms-as-strings).

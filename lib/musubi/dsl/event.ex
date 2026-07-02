@@ -9,7 +9,7 @@ defmodule Musubi.DSL.Event do
   @doc """
   Declares a push event with no payload fields. Events may be declared in any
   store; each store's events are dispatched to that store's proxy on the client,
-  keyed by `(store_id, name)` (BDR-0032).
+  keyed by `(store_id, name)`.
 
   ## Examples
 

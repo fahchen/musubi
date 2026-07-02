@@ -45,7 +45,7 @@ defmodule Musubi.Transport.Channel do
   On `join/3` the adapter starts a fresh `Musubi.Page.Server` for the resolved
   root module + params and links it to the channel pid. On channel
   `terminate/2` the adapter unlinks the page server and stops it with the
-  channel's terminate reason. Reconnect is recovery (BDR-0015): each new
+  channel's terminate reason. Reconnect is recovery: each new
   join builds a fresh page server with `version: 1` and an initial
   `replace ""` envelope.
 

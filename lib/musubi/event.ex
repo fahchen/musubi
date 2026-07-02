@@ -1,6 +1,6 @@
 defmodule Musubi.Event do
   @moduledoc """
-  Transient server-to-client push events (BDR-0032).
+  Transient server-to-client push events.
 
   `push_event/3` queues a fire-and-forget `{name, payload}` on the socket, the
   same accumulate-on-socket pattern as `Musubi.Stream`. Events are per-store:
@@ -69,7 +69,7 @@ defmodule Musubi.Event do
 
   @doc """
   Validates each drained event's wire payload against `module`'s declared `event`
-  schema (BDR-0032 dev-correctness, mirroring `Musubi.Hooks.ValidateReplySchema`).
+  schema (dev-correctness, mirroring `Musubi.Hooks.ValidateReplySchema`).
   Events are per-store, so `module` is the store socket that queued them.
   `Musubi.Hooks.ValidateEvents` calls this per socket at the `:after_serialize`
   stage (a default hook attached to every store socket via
@@ -77,7 +77,7 @@ defmodule Musubi.Event do
 
   Undeclared event names are skipped (a push with no matching `event` declaration
   is not validated). A declared event whose payload is missing a field or has a
-  type mismatch raises `ArgumentError` (BDR-0003 let-it-crash) — there is no
+  type mismatch raises `ArgumentError` (let-it-crash) — there is no
   *security* validation here (events are server-pushed, trusted); this only
   catches developer mistakes. Returns `events` unchanged.
   """

@@ -4,7 +4,7 @@ defmodule Musubi.Page.Frame do
   `:after_serialize` transform stages (`Musubi.Lifecycle`).
 
   A frame groups one store socket's render output with the push events
-  (`Musubi.Event`, BDR-0032) it queued this cycle. `:after_render` sees the
+  (`Musubi.Event`) it queued this cycle. `:after_render` sees the
   Elixir-form frame (`render` native, `events` empty — events are drained at the
   server aggregation phase); `:after_serialize` sees the wire-form frame
   (`render` serialized, `events` wire-encoded) and is where render / event
@@ -26,6 +26,6 @@ defmodule Musubi.Page.Frame do
     field :events, [Event.event()],
       default: [],
       doc:
-        "Push events this socket queued (BDR-0032). Empty at `:after_render`; drained/wire-encoded at `:after_serialize`."
+        "Push events this socket queued. Empty at `:after_render`; drained/wire-encoded at `:after_serialize`."
   end
 end

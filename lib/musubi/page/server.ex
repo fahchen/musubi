@@ -2,8 +2,7 @@ defmodule Musubi.Page.Server do
   @moduledoc """
   Page-scoped Musubi runtime GenServer. Hosts the store tree for one connected
   client session and runs the command pipeline (routing → `:before_command`
-  hooks → `handle_command/3` → `:after_command` hooks → reply) per
-  BDR-0007/0009.
+  hooks → `handle_command/3` → `:after_command` hooks → reply).
 
   ## Cross-track contract (M3 → M4 → M5)
 
@@ -14,15 +13,15 @@ defmodule Musubi.Page.Server do
   wire root, accumulates stream ops queued during the handler, builds an
   `Musubi.Page.PatchEnvelope`, and pushes it to the bound transport pid via a
   `{:patch, envelope}` message on `handle_continue/2` (so the reply lands
-  first per BDR-0009).
+  first).
 
   At mount, the same flow runs once with `previous_wire_root: nil` — the
   initial envelope replaces the entire root path (`""`) with the freshly
   rendered wire root and starts the version counter at 1.
 
-  Idle render cycles (no diff ops, no stream ops, no events) emit nothing per
-  BDR-0018. A halted command (a `:before_command` hook returned `{:halt, ...}`)
-  renders the same way — the push is content-driven, not halt-driven (BDR-0008):
+  Idle render cycles (no diff ops, no stream ops, no events) emit nothing. A
+  halted command (a `:before_command` hook returned `{:halt, ...}`)
+  renders the same way — the push is content-driven, not halt-driven:
   if the halting hook mutated state or queued stream/event ops those ship in one
   envelope; a pure denial that changed nothing emits nothing.
   """
@@ -89,7 +88,7 @@ defmodule Musubi.Page.Server do
     5. Return `{:ok, reply_payload}`.
     6. Render → diff → push patch envelope (after the reply lands).
 
-  store_id or command-name resolution failures `raise` (BDR-0003 let-it-crash);
+  store_id or command-name resolution failures `raise` (let-it-crash);
   the GenServer crashes and the supervisor/transport observe the exit.
 
   ## Examples

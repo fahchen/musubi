@@ -13,7 +13,7 @@ defmodule Musubi.Hooks.ValidateReplySchema do
   — the same whole-map shape the client receives — and validation walks
   each declared reply field against that wire map, dispatching to
   `Musubi.Type.valid?/3` (which expects wire form). Any mismatch raises
-  `ArgumentError` per BDR-0003. The raw `reply` argument is left
+  `ArgumentError`. The raw `reply` argument is left
   untouched so user `:after_command` hooks still observe it.
 
   Successful validation emits `[:musubi, :validate, :reply, :stop]`.
