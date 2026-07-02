@@ -99,12 +99,15 @@ defmodule Musubi.MixProject do
         "guides/getting-started.md",
         "guides/phoenix-setup.md",
         "guides/client-and-react.md",
+        "guides/streams.md",
         "guides/uploads.md",
+        "guides/push-events.md",
         "guides/testing.md",
         "docs/client-contract.md",
-        "docs/streams.md",
+        {"docs/streams.md", filename: "streams-reference", title: "Streams reference"},
         {"docs/uploads.md", filename: "uploads-reference", title: "Uploads reference"},
-        "docs/push-events.md",
+        {"docs/push-events.md",
+         filename: "push-events-reference", title: "Push events reference"},
         "docs/persistence-pattern.md"
       ],
       groups_for_extras: [
@@ -112,7 +115,9 @@ defmodule Musubi.MixProject do
           "guides/getting-started.md",
           "guides/phoenix-setup.md",
           "guides/client-and-react.md",
+          "guides/streams.md",
           "guides/uploads.md",
+          "guides/push-events.md",
           "guides/testing.md"
         ],
         Reference: [
