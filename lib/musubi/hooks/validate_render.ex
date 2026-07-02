@@ -5,8 +5,10 @@ defmodule Musubi.Hooks.ValidateRender do
   Runtime-injected reserved keys like `__musubi_store_id__` are ignored.
 
   Attached to the `:after_serialize` transform stage, so it receives (and returns
-  unchanged) the wire-form `Musubi.Page.Frame` and validates `frame.render`. Two
-  modes:
+  unchanged) the wire-form `Musubi.Page.Frame` and validates `frame.render`. Runs
+  only on the **root** socket (self-skips children): the root frame carries the
+  whole stitched wire tree, and validating a child frame standalone would reject
+  legitimately-transient async/loading render. Two modes:
 
     * `:raise` — raise `ArgumentError` on validation failure (dev/test default).
     * `:telemetry` — emit `[:musubi, :validate, :exception]` and continue
@@ -34,8 +36,19 @@ defmodule Musubi.Hooks.ValidateRender do
   """
   @spec after_serialize(validation_mode(), Frame.t(), Socket.t()) ::
           {:cont, Frame.t(), Socket.t()}
-  def after_serialize(mode, %Frame{render: wire_term} = frame, %Socket{module: store_module} = socket)
-      when mode in [:raise, :telemetry] and is_atom(store_module) do
+  def after_serialize(mode, %Frame{} = frame, %Socket{} = socket)
+      when mode in [:raise, :telemetry] do
+    # Root-only: the root frame is the full stitched wire tree. A child frame
+    # validated standalone would reject transient async/loading render.
+    if Socket.store_id(socket) == [],
+      do: validate_root_frame(mode, frame, socket),
+      else: {:cont, frame, socket}
+  end
+
+  @spec validate_root_frame(validation_mode(), Frame.t(), Socket.t()) ::
+          {:cont, Frame.t(), Socket.t()}
+  defp validate_root_frame(mode, %Frame{render: wire_term} = frame, %Socket{module: store_module} = socket)
+       when is_atom(store_module) do
     case validate(wire_term, store_module) do
       :ok ->
         emit_stop(store_module)

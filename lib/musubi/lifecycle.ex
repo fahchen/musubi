@@ -209,21 +209,18 @@ defmodule Musubi.Lifecycle do
   end
 
   @doc """
-  Attaches an application-configured hook list to a socket.
+  Attaches the application's configured default hooks
+  (`config :musubi, :default_hooks`, `{id, stage, fun}` entries) to a socket.
 
-  `config_key` is a `:musubi` application env key holding `{id, stage, fun}`
-  entries:
-
-    * `:default_hooks` — root-only concerns (command/reply schema validation,
-      whole-tree render validation), attached to the root socket at mount.
-    * `:store_hooks` — per-store concerns (push-event validation), attached to
-      every store socket (root + each child at creation) so each store validates
-      its own events.
+  Applied to the root socket at mount and to every child socket at creation, so
+  each store runs the validators. Hooks self-scope: command/reply/event
+  validators skip what the store does not declare, and `ValidateRender` skips
+  non-root sockets.
   """
-  @spec attach_hooks(Socket.t(), atom()) :: Socket.t()
-  def attach_hooks(%Socket{} = socket, config_key) when is_atom(config_key) do
+  @spec attach_default_hooks(Socket.t()) :: Socket.t()
+  def attach_default_hooks(%Socket{} = socket) do
     :musubi
-    |> Application.get_env(config_key, [])
+    |> Application.get_env(:default_hooks, [])
     |> Enum.reduce(socket, fn {id, stage, fun}, acc -> attach_hook(acc, id, stage, fun) end)
   end
 

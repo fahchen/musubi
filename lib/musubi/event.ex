@@ -72,7 +72,8 @@ defmodule Musubi.Event do
   schema (BDR-0032 dev-correctness, mirroring `Musubi.Hooks.ValidateReplySchema`).
   Events are per-store, so `module` is the store socket that queued them.
   `Musubi.Hooks.ValidateEvents` calls this per socket at the `:after_serialize`
-  stage (attached to every store socket via `config :musubi, :store_hooks`).
+  stage (a default hook attached to every store socket via
+  `config :musubi, :default_hooks`).
 
   Undeclared event names are skipped (a push with no matching `event` declaration
   is not validated). A declared event whose payload is missing a field or has a

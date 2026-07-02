@@ -92,13 +92,15 @@ trusted-but-fallible server output. A declared event whose payload is missing a
 field or has a type mismatch raises `ArgumentError` (BDR-0003 let-it-crash); an
 *undeclared* event name is skipped. This is **not** a security boundary — events
 are server-pushed. It ships as the default `:after_serialize` hook
-`Musubi.Hooks.ValidateEvents`, attached to **every** store socket via
-`config :musubi, :store_hooks` (root + each child at creation), so each store
-validates its own events against its own schema — on in `:dev`/`:test`, absent in
-prod, like `ValidateRender`. (Render/command/reply validators stay root-only in
-`:default_hooks`; a per-child render validator would reject legitimately-transient
-async render.) Validation runs in the queuing handler's render cycle, so a bad
-`push_event` surfaces synchronously from `dispatch_command`.
+`Musubi.Hooks.ValidateEvents` in `config :musubi, :default_hooks`. `:default_hooks`
+are attached to **every** store socket (root + each child at creation) and each
+hook self-scopes: `ValidateEvents` validates a store's own events, so per-store
+validation falls out naturally — on in `:dev`/`:test`, absent in prod. (The
+co-located `ValidateRender` acts only on the root socket; a per-child render
+validator would reject legitimately-transient async render. Command/reply
+validators skip commands they do not declare.) Validation runs in the queuing
+handler's render cycle, so a bad `push_event` surfaces synchronously from
+`dispatch_command`.
 
 **Wire shape.** `PatchEnvelope` gains an `events` field. One event is
 `%{"store_id" => [string], "name" => string, "payload" => wire}` — `store_id`

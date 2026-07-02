@@ -44,7 +44,7 @@ declared schema. An undeclared event name is not validated. A bad `push_event` i
 a command handler surfaces synchronously from the dispatch.
 
 Validation is a **default `:after_serialize` hook** (`Musubi.Hooks.ValidateEvents`)
-attached to every store socket via `config :musubi, :store_hooks` — on in
+attached to every store socket via `config :musubi, :default_hooks` — on in
 `:dev`/`:test`, absent in `:prod`, like render validation. Each store validates
 its own `frame.events` against its own schema. Detach or replace it there so
 production never raises on a malformed event.

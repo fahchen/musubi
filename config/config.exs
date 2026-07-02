@@ -28,36 +28,31 @@ reply_schema_hook =
 # prune step lives in the runtime.
 
 # Dev/test-only validation hooks (both `:after_serialize`, over the per-socket
-# frame), absent in prod. Detach/replace via the app's own `:default_hooks` /
-# `:store_hooks`.
+# frame), absent in prod. Detach/replace via the app's own `:default_hooks`.
 #
-#   * render validation is root-only (`:default_hooks`): the root frame carries
-#     the whole stitched wire tree and its validator recurses into child slots —
-#     validating a child frame standalone would reject legitimately-transient
+#   * `ValidateRender` validates `frame.render`. It only acts on the root socket
+#     (self-skips children): the root frame carries the whole stitched wire tree,
+#     and validating a child frame standalone would reject legitimately-transient
 #     async/loading render.
-#   * event validation is per-store (`:store_hooks`): each store validates its
-#     own `frame.events` (BDR-0032).
-dev_test? = config_env() in [:dev, :test]
-
-render_validation_hooks =
-  if dev_test?,
-    do: [
+#   * `ValidateEvents` validates each store's own `frame.events` (BDR-0032).
+validation_hooks =
+  if config_env() in [:dev, :test] do
+    [
       {Musubi.Hooks.ValidateRender, :after_serialize,
-       &Musubi.Hooks.ValidateRender.after_serialize(:raise, &1, &2)}
-    ],
-    else: []
-
-event_validation_hooks =
-  if dev_test?,
-    do: [
+       &Musubi.Hooks.ValidateRender.after_serialize(:raise, &1, &2)},
       {Musubi.Hooks.ValidateEvents, :after_serialize,
        &Musubi.Hooks.ValidateEvents.after_serialize/2}
-    ],
-    else: []
+    ]
+  else
+    []
+  end
 
-# `:default_hooks` — root socket. `:store_hooks` — every store socket.
-config :musubi, :default_hooks, [command_schema_hook, reply_schema_hook | render_validation_hooks]
-config :musubi, :store_hooks, event_validation_hooks
+# `:default_hooks` are attached to every store socket (root + each child); each
+# hook self-scopes (validators skip commands/events they do not declare, and
+# `ValidateRender` skips non-root sockets).
+config :musubi,
+       :default_hooks,
+       [command_schema_hook, reply_schema_hook | validation_hooks]
 
 if File.exists?(Path.join(__DIR__, "#{config_env()}.exs")) do
   import_config "#{config_env()}.exs"

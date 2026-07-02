@@ -277,8 +277,7 @@ defmodule Musubi.Page.Server do
     root_socket =
       %{root_socket | id: "", parent_path: [], module: root_module, transport_pid: transport_pid}
       |> Socket.put_root_params(params)
-      |> Lifecycle.attach_hooks(:default_hooks)
-      |> Lifecycle.attach_hooks(:store_hooks)
+      |> Lifecycle.attach_default_hooks()
       |> mount_root_store(params)
       |> normalize_root_assigns()
       |> Reconciler.init_store()

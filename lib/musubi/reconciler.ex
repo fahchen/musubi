@@ -260,7 +260,7 @@ defmodule Musubi.Reconciler do
       assigns: %{},
       private: %{}
     })
-    |> Lifecycle.attach_hooks(:store_hooks)
+    |> Lifecycle.attach_default_hooks()
     |> Socket.assign(assigns)
   end
 

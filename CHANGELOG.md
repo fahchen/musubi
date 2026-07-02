@@ -40,10 +40,12 @@ not in lockstep yet; entries note which surface they affect.
   can rewrite outbound render/events (audit, redact, enrich, drop). `:after_serialize`
   runs at the page server's aggregation phase, iterating the registry so events
   on memoized sockets still flush. Declared-event payload validation ships as a
-  default `:after_serialize` hook (`Musubi.Hooks.ValidateEvents`) attached to
-  every store socket via `config :musubi, :store_hooks` (dev/test) — each store
-  validates its own events; render/command/reply validators stay root-only in
-  `:default_hooks`. Dev-correctness, not a security boundary, never raises in prod.
+  default `:after_serialize` hook (`Musubi.Hooks.ValidateEvents`) in
+  `config :musubi, :default_hooks` (dev/test) — `:default_hooks` are attached to
+  every store socket and each hook self-scopes: `ValidateEvents` validates a
+  store's own events, `ValidateRender` acts only on the root, command/reply
+  validators skip commands they do not declare. Dev-correctness, not a security
+  boundary, never raises in prod.
 
 ## [0.12.0] — 2026-06-27
 
