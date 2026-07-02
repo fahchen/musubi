@@ -408,32 +408,37 @@ export const STORE_ID_KEY = "__musubi_store_id__" as const
 export const STREAM_MARKER_KEY = "__musubi_stream__" as const
 export const UPLOAD_MARKER_KEY = "__musubi_upload__" as const
 
-const UPLOAD_KEY_SEP = "\0"
-
-export function uploadStoreKey(storeId: StoreId, uploadName: string): string {
-  return `${storeIdKey(storeId)}${UPLOAD_KEY_SEP}${uploadName}`
-}
-
 export function storeIdKey(storeId: StoreId): string {
   return JSON.stringify(storeId)
 }
 
-const STREAM_KEY_SEP = "\0"
+// One separator + one builder for every `(store_id, name)` composite key —
+// streams, uploads, and push events. `storeIdKey` is JSON, so it never contains
+// an unescaped NUL; the NUL byte cleanly delimits it from the trailing name.
+const STORE_KEY_SEP = "\0"
+
+export function storeScopedKey(storeId: StoreId, name: string): string {
+  return `${storeIdKey(storeId)}${STORE_KEY_SEP}${name}`
+}
+
+export function uploadStoreKey(storeId: StoreId, uploadName: string): string {
+  return storeScopedKey(storeId, uploadName)
+}
 
 export function streamStoreKey(storeId: StoreId, streamName: string): string {
-  return `${storeIdKey(storeId)}${STREAM_KEY_SEP}${streamName}`
+  return storeScopedKey(storeId, streamName)
 }
 
 export function streamStoreKeyPrefix(storeId: StoreId): string {
-  return `${storeIdKey(storeId)}${STREAM_KEY_SEP}`
+  return `${storeIdKey(storeId)}${STORE_KEY_SEP}`
 }
 
 export function streamFieldNameFromKey(key: string): string {
-  const parts = key.split(STREAM_KEY_SEP)
+  const parts = key.split(STORE_KEY_SEP)
   return parts[1] ?? ""
 }
 
 export function storeKeyFromStreamStoreKey(key: string): string {
-  const parts = key.split(STREAM_KEY_SEP)
+  const parts = key.split(STORE_KEY_SEP)
   return parts[0] ?? key
 }

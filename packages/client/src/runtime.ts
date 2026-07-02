@@ -33,7 +33,7 @@ import type {
   StreamOp,
   UploadOp
 } from "./types"
-import { STORE_ID_KEY, storeIdKey } from "./types"
+import { STORE_ID_KEY, storeIdKey, storeScopedKey } from "./types"
 
 type PushStatus = "ok" | "error" | "timeout"
 
@@ -946,10 +946,10 @@ function acceptEnvelope(
   }
 }
 
-// Events are keyed by (store_id, name): handlers registered on a store proxy
-// only receive that store's events (BDR-0032).
+// Events are keyed by (store_id, name): a handler on a store proxy only receives
+// that store's events (BDR-0032). Shared key format with stream/upload ops.
 function eventKey(storeId: StoreId, name: string): string {
-  return `${storeIdKey(storeId)} ${name}`
+  return storeScopedKey(storeId, name)
 }
 
 function dispatchEvents(connection: RootConnection, events: readonly PushEvent[]): void {
