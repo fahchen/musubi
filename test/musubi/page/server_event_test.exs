@@ -1,10 +1,10 @@
 defmodule Musubi.Page.ServerEventTest do
   @moduledoc """
   Verifies push events (BDR-0032) fold into the patch envelope: the page server
-  drains queued events each render cycle into `PatchEnvelope.events`, ships one
-  consolidated `"patch"`, and an event-only cycle still emits an envelope and
-  bumps `version`. Events queued on a child socket flatten into the one root
-  envelope (root-scoped).
+  drains each store socket's events during `:after_serialize` aggregation into
+  `PatchEnvelope.events`, ships one consolidated `"patch"`, and an event-only
+  cycle still emits an envelope and bumps `version`. Events are per-store: each is
+  stamped with the emitting socket's `store_id`.
   """
 
   use ExUnit.Case, async: true
@@ -234,7 +234,7 @@ defmodule Musubi.Page.ServerEventTest do
            } = env
   end
 
-  test "event queued on a child socket flattens into the root envelope (root-scoped)" do
+  test "event queued on a child socket ships in the root envelope, stamped with its store_id" do
     pid = start!()
     assert_receive {:patch, %PatchEnvelope{version: 1}}
 

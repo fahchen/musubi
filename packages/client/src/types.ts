@@ -186,10 +186,11 @@ export interface StoreRuntime<M extends StoreModule<R>, R> {
   ): Promise<CommandReply<M, K, R>>
   subscribe(listener: () => void): () => void
   // Registers a handler for a transient push event (BDR-0032). Events are
-  // declared on the root store (`event :name do ... end`) and are root-scoped on
-  // the wire, so only the root proxy carries event names — `EventName` is `never`
-  // on child proxies. Returns an unsubscribe thunk. The handler is invoked once
-  // per matching event, after that envelope's state ops are applied.
+  // declared per store (`event :name do ... end`) and tagged on the wire with
+  // the emitting store's store_id, so `handleEvent` on a store proxy subscribes
+  // to that store's events (dispatch keyed by `(store_id, name)`); a child proxy
+  // exposes its own declared events. Returns an unsubscribe thunk. The handler
+  // is invoked once per matching event, after that envelope's state ops apply.
   handleEvent<K extends EventName<M, R>>(
     name: K,
     handler: (payload: EventPayload<M, K, R>) => void

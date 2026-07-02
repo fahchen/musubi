@@ -3,10 +3,11 @@ defmodule Musubi.Event do
   Transient server-to-client push events (BDR-0032).
 
   `push_event/3` queues a fire-and-forget `{name, payload}` on the socket, the
-  same accumulate-on-socket pattern as `Musubi.Stream`. The page server drains
-  every store socket once per render cycle via `flush_pending/1` and folds the
-  events into `Musubi.Page.PatchEnvelope.events`, so one `"patch"` push carries
-  diff + events.
+  same accumulate-on-socket pattern as `Musubi.Stream`. Events are per-store:
+  during `:after_serialize` aggregation the page server drains every store socket
+  via `flush_pending/1`, stamps each event with the socket's `store_id`, and folds
+  them into `Musubi.Page.PatchEnvelope.events`, so one `"patch"` push carries
+  diff + events. The client dispatches per `(store_id, name)`.
 
   Events own no version, ack, or retry: they ride the envelope, are dispatched
   once on the client, and are not replayed on reconnect. An event-only cycle
@@ -67,10 +68,10 @@ defmodule Musubi.Event do
   end
 
   @doc """
-  Validates each drained event's wire payload against the root store's declared
-  `event` schema (BDR-0032 dev-correctness, mirroring
-  `Musubi.Hooks.ValidateReplySchema`). Events are declared on the root store, so
-  `root_module` is the root regardless of which socket queued the event.
+  Validates each drained event's wire payload against `module`'s declared `event`
+  schema (BDR-0032 dev-correctness, mirroring `Musubi.Hooks.ValidateReplySchema`).
+  Events are per-store, so `module` is the store socket that queued them; the page
+  server calls this per socket during `:after_serialize` aggregation.
 
   Undeclared event names are skipped (a push with no matching `event` declaration
   is not validated). A declared event whose payload is missing a field or has a
@@ -79,15 +80,15 @@ defmodule Musubi.Event do
   catches developer mistakes. Returns `events` unchanged.
   """
   @spec validate_events!([event()], module()) :: [event()]
-  def validate_events!(events, root_module) when is_list(events) and is_atom(root_module) do
+  def validate_events!(events, module) when is_list(events) and is_atom(module) do
     declared =
-      if function_exported?(root_module, :__musubi__, 1),
-        do: List.wrap(root_module.__musubi__(:events)),
+      if function_exported?(module, :__musubi__, 1),
+        do: List.wrap(module.__musubi__(:events)),
         else: []
 
     Enum.each(events, fn %{name: name, payload: payload} ->
       case Enum.find(declared, &(to_string(&1.name) == name)) do
-        %{payload_fields: fields} -> validate_fields!(root_module, name, fields, payload)
+        %{payload_fields: fields} -> validate_fields!(module, name, fields, payload)
         nil -> :ok
       end
     end)
