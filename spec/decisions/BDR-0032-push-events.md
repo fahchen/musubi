@@ -3,7 +3,7 @@ id: BDR-0032
 title: Transient server-to-client push events ride the patch envelope
 date: 2026-06-30
 status: accepted
-summary: Add the bare `push_event/3` store helper (LV-aligned, delegating to `Musubi.Event`) queuing transient, fire-and-forget events on the socket; the page server drains them per render cycle and folds them into `PatchEnvelope.events`, so one consolidated `"patch"` push carries diff + events. Events have no version of their own, no ack, no retry, and are not replayed on reconnect. An event-only cycle still emits an envelope and bumps `version`.
+summary: Add the bare `push_event/3` store helper (LV-aligned, delegating to `Musubi.Event`) queuing transient, fire-and-forget events on the socket; the page server drains each store socket's events during the `:after_serialize` aggregation phase and folds them into `PatchEnvelope.events`, so one consolidated `"patch"` push carries diff + events. Events are per-store: declared in any store, tagged on the wire with the emitting store's `store_id`, and dispatched on the client per `(store_id, name)` — symmetric with stream/upload ops. Events have no version of their own, no ack, no retry, and are not replayed on reconnect. An event-only cycle still emits an envelope and bumps `version`.
 ---
 
 **Feature**: domains/runtime/features/command-routing.feature
@@ -45,12 +45,12 @@ push.
 
 `push_event(socket, name, payload)` queues `{name, payload}` on the socket
 (same accumulate-on-socket pattern as `stream_insert`). The page server drains
-all store sockets each render cycle (`flush_all_events`, mirroring
-`flush_all_stream_ops`) and folds the events into a new
-`PatchEnvelope.events` field. One `"patch"` push carries diff + stream + upload +
-events. Egress stays server-owned: events are wire-serialized
-(`Musubi.Wire.to_wire`) at drain and ship from `State.transport` like every
-other op.
+each store socket during `:after_serialize` aggregation (`serialize_frames`,
+mirroring `flush_all_stream_ops`), stamps each event with the socket's
+`store_id`, and folds them into a new `PatchEnvelope.events` field. One `"patch"`
+push carries diff + stream + upload + events. Egress stays server-owned: events
+are wire-serialized (`Musubi.Wire.to_wire`) at drain and ship from
+`State.transport` like every other op.
 
 ## Decision
 
@@ -63,54 +63,49 @@ socket for pipe-chaining (LV-aligned). Callable from any store callback (mount,
 command, `handle_info`, `handle_async`) on the root or any child socket — the
 runtime does not special-case the calling phase.
 
-**Typed declaration.** Events are declared in the **root store** with an `event`
-DSL (payload-only, mirroring `command`): `event :toast do field :msg, String.t()
-end`. The declaration is root-only (a child-store `event` is a compile-time
-error) because events are root-scoped on the wire. It drives codegen — `StoreDef`
-gains a 4th type param `Events` (default `{}`, so existing 3-arg references stay
-valid), yielding TS `EventName<M,R>` / `EventPayload<M,K,R>` that type
-`handleEvent` / `useMusubiEvent`. On a child proxy `EventName` is `never`, so
-events are subscribed off the root proxy.
+**Typed declaration.** Events are declared in **any store** with an `event` DSL
+(payload-only, mirroring `command`): `event :toast do field :msg, String.t() end`.
+Events are per-store, symmetric with streams — each store owns its declarations.
+It drives codegen — `StoreDef` gains a 4th type param `Events` (default `{}`, so
+existing 3-arg references stay valid), yielding TS `EventName<M,R>` /
+`EventPayload<M,K,R>` that type `handleEvent` / `useMusubiEvent` per store. A
+child proxy exposes its own store's events; there is no root-only restriction.
 
-**Runtime validation (dev-correctness only).** The declared payload schema is
-validated at drain (`Musubi.Event.validate_events!/2`), mirroring
+**Outbound frame + `:after_serialize`.** The render/serialize pipeline threads a
+per-socket `Musubi.Page.Frame` (`%{render, events}`) through two *transform*
+lifecycle stages (`Musubi.Lifecycle.run_transform_hooks/3`; hooks return
+`{:cont | :halt, frame, socket}`): `:after_render` (Elixir-form frame, in the
+resolver) and `:after_serialize` (wire-form frame). `:after_serialize` runs at
+the page server's **aggregation phase**, iterating the registry (not the render
+path) so events on memoized sockets still flush, and it is where a store socket's
+push events are drained + wire-encoded into `frame.events`. Applications attach
+`:after_serialize` hooks to audit, redact, enrich, or drop outbound render/events
+(something LiveView's `push_event/3` has no equivalent for). This replaced the
+earlier single-purpose `:before_events` stage.
+
+**Runtime validation (dev-correctness only).** During `:after_serialize`
+aggregation the page server validates each socket's drained events against that
+socket's declared `event` schema (`Musubi.Event.validate_events!/2`), mirroring
 `Musubi.Hooks.ValidateReplySchema`: a command *reply* is server-generated yet
-still validated against its declared `reply_fields` to catch handler mistakes,
-and a push event is the same kind of trusted-but-fallible server output, so it
-gets the same treatment. A declared event whose `push_event` payload is missing
-a field or has a type mismatch raises `ArgumentError` (BDR-0003 let-it-crash);
-an *undeclared* event name is skipped (not validated). This is **not** a
-security boundary — events are server-pushed, so there is no untrusted input to
-guard, unlike commands (`ValidateCommandSchema` on client input). Validation
-runs in the same render cycle as the queuing handler, so a bad `push_event` in a
-command handler surfaces synchronously from `dispatch_command`.
-
-Because it is dev-correctness rather than a wire invariant, it is a **default
-lifecycle hook**, not hard-wired: `Musubi.Hooks.ValidateEvents` is attached at
-the outbound `:before_events` stage via `config :musubi, :default_hooks`, exactly
-like `ValidateRender` at `:after_serialize` — present in `:dev`/`:test`, absent
-in `:prod`. This keeps it consistent with the other dev-correctness validators —
-all detachable/replaceable, none raising in production — and means a released app
-never crashes a page over a malformed event.
-
-`:before_events` is added as the one *outbound* lifecycle stage (all others act
-on inbound commands or the render pipeline). It runs on the root socket, once per
-render cycle, over the flattened event list the page server drained from every
-store socket, immediately before the events fold into the envelope. Unlike the
-socket-only stages it is a **transform** stage — run via
-`Lifecycle.run_event_hooks/2`, each hook returns `{:cont | :halt, events, socket}`
-— so applications get a first-class extension point to audit, redact, enrich, or
-drop outgoing events (something LiveView's `push_event/3` has no equivalent for).
-Default payload validation is simply the first hook installed there.
+still validated to catch handler mistakes, and a push event is the same kind of
+trusted-but-fallible server output. A declared event whose payload is missing a
+field or has a type mismatch raises `ArgumentError` (BDR-0003 let-it-crash); an
+*undeclared* event name is skipped. This is **not** a security boundary — events
+are server-pushed. It is gated by `config :musubi, :validate_push_events`
+(default `config_env() in [:dev, :test]`, off in prod), like `ValidateRender`, so
+a released app never crashes a page over a malformed event. Validation runs in
+the queuing handler's render cycle, so a bad `push_event` surfaces synchronously
+from `dispatch_command`.
 
 **Wire shape.** `PatchEnvelope` gains an `events` field. One event is
-`%{"name" => string, "payload" => wire}`. The envelope keeps `type: "patch"` —
-events are a field on the existing message, not a new frame:
+`%{"store_id" => [string], "name" => string, "payload" => wire}` — `store_id`
+tags the emitting store (as stream/upload ops do). The envelope keeps
+`type: "patch"` — events are a field on the existing message, not a new frame:
 
 ```json
 { "type": "patch", "base_version": 4, "version": 5,
   "ops": [...], "stream_ops": [...], "upload_ops": [...],
-  "events": [ {"name": "toast", "payload": {"msg": "saved"}} ] }
+  "events": [ {"store_id": [], "name": "toast", "payload": {"msg": "saved"}} ] }
 ```
 
 **Emit rule.** `PatchEnvelope.build` emits an envelope when *any* of `ops`,
@@ -148,16 +143,18 @@ semantics:
   for transient signals the client is already listening for.
 
 **Client consumption.** The client owns the consumption logic. `acceptEnvelope`
-dispatches `envelope.events` to a per-`RootConnection` handler registry after
-applying `ops`/`stream_ops`/`upload_ops`. `root.handleEvent(name, cb)` registers
-a handler and returns an unsubscribe thunk; multiple handlers per name are
+dispatches `envelope.events` to a per-`RootConnection` handler registry keyed by
+`(store_id, name)`, after applying `ops`/`stream_ops`/`upload_ops`.
+`store.handleEvent(name, cb)` on a store proxy registers a handler for that
+store's events and returns an unsubscribe thunk; multiple handlers per key are
 allowed; an event with no registered handler is dropped. The registry lives on
 the `RootConnection` (not the channel) so it survives reconnect.
 
-**Scope is root-level.** The wire event carries no `store_id`. Events queued on
-any store socket (root or child) are flattened in `store_id` order into the one
-root envelope and dispatched by `name` alone. Per-store scoping is deferred
-until a concrete need appears.
+**Scope is per-store.** The wire event carries the emitting store's `store_id`.
+Events queued on any store socket ship in the one root envelope but are tagged
+and dispatched per `(store_id, name)`, so the same name declared on two stores
+never collides — a handler on a store proxy only receives that store's events.
+This makes events fully symmetric with stream/upload ops.
 
 **Ordering is not guaranteed** beyond "within one envelope, events are
 dispatched after that envelope's state ops are applied." No ordering is promised

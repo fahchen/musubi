@@ -157,49 +157,47 @@ defmodule Musubi.LifecycleTest do
     assert Lifecycle.stage_arity(:handle_info) == 2
     assert Lifecycle.stage_arity(:after_render) == 2
     assert Lifecycle.stage_arity(:after_serialize) == 2
-    assert Lifecycle.stage_arity(:before_events) == 2
   end
 
-  describe "run_event_hooks/2" do
+  describe "run_transform_hooks/3" do
     setup do
       socket = %Socket{id: "", parent_path: [], module: RootStore, assigns: %{}, private: %{}}
-      %{socket: socket, events: [%{name: "a", payload: %{}}, %{name: "b", payload: %{}}]}
+      %{socket: socket, frame: %{render: %{}, events: [%{name: "a"}, %{name: "b"}]}}
     end
 
-    test "returns events unchanged with no hooks", %{socket: socket, events: events} do
-      assert {^events, ^socket} = Lifecycle.run_event_hooks(socket, events)
+    test "returns datum unchanged with no hooks", %{socket: socket, frame: frame} do
+      assert {^frame, ^socket} = Lifecycle.run_transform_hooks(socket, :after_serialize, frame)
     end
 
-    test "threads a rewritten event list through the chain", %{socket: socket, events: events} do
+    test "threads a rewritten datum through the chain", %{socket: socket, frame: frame} do
       socket =
         socket
-        |> Lifecycle.attach_hook(:drop_a, :before_events, fn evs, s ->
-          {:cont, Enum.reject(evs, &(&1.name == "a")), s}
+        |> Lifecycle.attach_hook(:drop_a, :after_serialize, fn f, s ->
+          {:cont, Map.update!(f, :events, &Enum.reject(&1, fn e -> e.name == "a" end)), s}
         end)
-        |> Lifecycle.attach_hook(:tag, :before_events, fn evs, s ->
-          {:cont, Enum.map(evs, &Map.put(&1, :tagged, true)), s}
+        |> Lifecycle.attach_hook(:tag, :after_serialize, fn f, s ->
+          {:cont, Map.put(f, :tagged, true), s}
         end)
 
-      assert {[%{name: "b", tagged: true}], ^socket} = Lifecycle.run_event_hooks(socket, events)
+      assert {%{events: [%{name: "b"}], tagged: true}, ^socket} =
+               Lifecycle.run_transform_hooks(socket, :after_serialize, frame)
     end
 
-    test "halt stops the chain, keeping that hook's events", %{socket: socket, events: events} do
+    test "halt stops the chain, keeping that hook's datum", %{socket: socket, frame: frame} do
       socket =
         socket
-        |> Lifecycle.attach_hook(:halt_empty, :before_events, fn _evs, s -> {:halt, [], s} end)
-        |> Lifecycle.attach_hook(:never, :before_events, fn _evs, _s ->
-          raise "should not run"
-        end)
+        |> Lifecycle.attach_hook(:halt, :after_serialize, fn f, s -> {:halt, Map.put(f, :h, 1), s} end)
+        |> Lifecycle.attach_hook(:never, :after_serialize, fn _f, _s -> raise "should not run" end)
 
-      assert {[], ^socket} = Lifecycle.run_event_hooks(socket, events)
+      assert {%{h: 1}, ^socket} = Lifecycle.run_transform_hooks(socket, :after_serialize, frame)
     end
 
-    test "raises on an invalid hook result", %{socket: socket, events: events} do
+    test "raises on an invalid hook result", %{socket: socket, frame: frame} do
       socket =
-        Lifecycle.attach_hook(socket, :bad, :before_events, fn _evs, s -> {:cont, s} end)
+        Lifecycle.attach_hook(socket, :bad, :after_serialize, fn _f, s -> {:cont, s} end)
 
-      assert_raise ArgumentError, ~r/invalid :before_events hook result/, fn ->
-        Lifecycle.run_event_hooks(socket, events)
+      assert_raise ArgumentError, ~r/invalid :after_serialize hook result/, fn ->
+        Lifecycle.run_transform_hooks(socket, :after_serialize, frame)
       end
     end
   end
@@ -226,9 +224,5 @@ defmodule Musubi.LifecycleTest do
 
   defp hook_fun_for(:after_serialize) do
     fn _wire_output, current_socket -> {:cont, current_socket} end
-  end
-
-  defp hook_fun_for(:before_events) do
-    fn events, current_socket -> {:cont, events, current_socket} end
   end
 end

@@ -1058,25 +1058,21 @@ defmodule Musubi.ResolverTest do
   end
 
   describe "lifecycle pipeline" do
-    test ":after_render runs on the Elixir term, :after_serialize on the wire term" do
+    test ":after_render receives the Elixir-form frame during resolve" do
       test_pid = self()
       socket = root_socket(RawMapRootStore)
 
+      # `:after_serialize` no longer runs in resolve — it moved to the page
+      # server's aggregation phase (over the wire frame + drained events).
       socket =
-        socket
-        |> Lifecycle.attach_hook(:elixir, :after_render, fn term, current_socket ->
-          send(test_pid, {:after_render, term})
-          {:cont, current_socket}
-        end)
-        |> Lifecycle.attach_hook(:wire, :after_serialize, fn term, current_socket ->
-          send(test_pid, {:after_serialize, term})
-          {:cont, current_socket}
+        Lifecycle.attach_hook(socket, :elixir, :after_render, fn frame, current_socket ->
+          send(test_pid, {:after_render, frame})
+          {:cont, frame, current_socket}
         end)
 
       assert {:ok, _resolved, _socket, registry} = Resolver.resolve(socket, registry(socket))
 
-      assert_receive {:after_render, %{header: %{user_name: "Alice"}}}
-      assert_receive {:after_serialize, %{"header" => %{"user_name" => "Alice"}}}
+      assert_receive {:after_render, %Musubi.Page.Frame{render: %{header: %{user_name: "Alice"}}}}
 
       assert %Entry{
                resolved_state: %{header: %{user_name: "Alice"}},

@@ -347,7 +347,7 @@ describe("connect", () => {
       version: 2,
       ops: [],
       stream_ops: [],
-      events: [{ name: "toast", payload: { msg: "saved" } }]
+      events: [{ store_id: [], name: "toast", payload: { msg: "saved" } }]
     })
 
     expect(toastHandler).toHaveBeenCalledTimes(1)
@@ -361,7 +361,7 @@ describe("connect", () => {
       version: 3,
       ops: [],
       stream_ops: [],
-      events: [{ name: "other", payload: {} }]
+      events: [{ store_id: [], name: "other", payload: {} }]
     })
     expect(toastHandler).toHaveBeenCalledTimes(1)
 
@@ -374,7 +374,7 @@ describe("connect", () => {
       version: 4,
       ops: [],
       stream_ops: [],
-      events: [{ name: "toast", payload: { msg: "again" } }]
+      events: [{ store_id: [], name: "toast", payload: { msg: "again" } }]
     })
     expect(toastHandler).toHaveBeenCalledTimes(1)
   })
@@ -399,9 +399,9 @@ describe("connect", () => {
       ops: [],
       stream_ops: [],
       events: [
-        { name: "toast", payload: { msg: "hi" } },
-        { name: "other", payload: { ignored: true } },
-        { name: "synced", payload: { count: 7 } }
+        { store_id: [], name: "toast", payload: { msg: "hi" } },
+        { store_id: [], name: "other", payload: { ignored: true } },
+        { store_id: [], name: "synced", payload: { count: 7 } }
       ]
     })
 
@@ -431,7 +431,7 @@ describe("connect", () => {
       version: 2,
       ops: [{ op: "replace", path: "/counter", value: 42 }],
       stream_ops: [],
-      events: [{ name: "synced", payload: {} }]
+      events: [{ store_id: [], name: "synced", payload: {} }]
     })
 
     expect(counterAtDispatch).toBe(42)

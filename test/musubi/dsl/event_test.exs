@@ -91,26 +91,27 @@ defmodule Musubi.DSL.EventTest do
     end
   end
 
-  test "declaring an event in a non-root store raises at compile time" do
-    assert_raise CompileError,
-                 ~r/event :toast not allowed: events may only be declared in a root store/,
-                 fn ->
-                   Code.compile_string("""
-                   defmodule Musubi.DSL.EventTest.NonRootEvents do
-                     use Musubi.Store
+  test "a non-root store may declare events (per-store, BDR-0032)" do
+    {events, _binding} =
+      Code.eval_string("""
+      defmodule Musubi.DSL.EventTest.ChildEvents do
+        use Musubi.Store
 
-                     state do
-                       field :ok, boolean()
-                     end
+        state do
+          field :ok, boolean()
+        end
 
-                     event :toast
+        event :toast
 
-                     @impl Musubi.Store
-                     def init(socket), do: {:ok, socket}
-                     @impl Musubi.Store
-                     def render(_socket), do: %{ok: true}
-                   end
-                   """)
-                 end
+        @impl Musubi.Store
+        def render(_socket), do: %{ok: true}
+        @impl Musubi.Store
+        def handle_command(_name, _payload, socket), do: {:noreply, socket}
+      end
+
+      Musubi.DSL.EventTest.ChildEvents.__musubi__(:events)
+      """)
+
+    assert [%{name: :toast}] = events
   end
 end

@@ -7,13 +7,14 @@ defmodule Musubi.DSL.Event do
   @allowed_field_opts [:doc]
 
   @doc """
-  Declares a push event with no payload fields. Events may only be declared in a
-  root store (BDR-0032).
+  Declares a push event with no payload fields. Events may be declared in any
+  store; each store's events are dispatched to that store's proxy on the client,
+  keyed by `(store_id, name)` (BDR-0032).
 
   ## Examples
 
-      defmodule ExampleRoot do
-        use Musubi.Store, root: true
+      defmodule ExampleStore do
+        use Musubi.Store
 
         event :ping
       end

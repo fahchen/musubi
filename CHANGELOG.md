@@ -26,21 +26,22 @@ not in lockstep yet; entries note which surface they affect.
   reconnect), and React via `useMusubiEvent(store, name, cb)`. Backend tests
   assert delivery with `Musubi.Testing.assert_push_event/3` /
   `refute_push_event/2`.
-- **`musubi` / `@musubi/client` / `@musubi/react`** — **Typed event
-  declarations.** Declare events in a root store with the payload-only `event`
-  DSL (`event :toast do field :msg, String.t() end`); declaring one in a child
-  store is a compile-time error (events are root-scoped). The declaration drives
-  codegen — `StoreDef` gains a 4th `Events` type param (default `{}`, so existing
-  references stay valid) — yielding typed `handleEvent` / `useMusubiEvent` whose
-  payload is inferred per event.
-- **`musubi`** — **`:before_events` lifecycle hook.** A new outbound lifecycle
-  stage runs on the root socket over a cycle's flattened push-event list before
-  it folds into the envelope. It is a transform stage (`run_event_hooks/2`; hooks
-  return `{:cont | :halt, events, socket}`), so apps can audit, redact, enrich, or
-  drop outgoing events. Declared-event payload validation ships as a default hook
-  here (`Musubi.Hooks.ValidateEvents`), attached in dev/test and detachable via
-  `:default_hooks` — dev-correctness, not a security boundary, and never raises in
-  prod.
+- **`musubi` / `@musubi/client` / `@musubi/react`** — **Typed, per-store event
+  declarations.** Declare events in any store with the payload-only `event` DSL
+  (`event :toast do field :msg, String.t() end`). Events are per-store and tagged
+  on the wire with the emitting store's `store_id`, dispatched on the client per
+  `(store_id, name)` (symmetric with stream/upload ops), so the same name on two
+  stores never collides. The declaration drives codegen — `StoreDef` gains a 4th
+  `Events` type param (default `{}`, so existing references stay valid) — yielding
+  typed `handleEvent` / `useMusubiEvent` per store.
+- **`musubi`** — **`:after_render` / `:after_serialize` are transform stages.**
+  Both carry a per-socket `Musubi.Page.Frame` (`%{render, events}`) and return
+  `{:cont | :halt, frame, socket}` (`Lifecycle.run_transform_hooks/3`), so apps
+  can rewrite outbound render/events (audit, redact, enrich, drop). `:after_serialize`
+  runs at the page server's aggregation phase, iterating the registry so events
+  on memoized sockets still flush. Declared-event payload validation runs there,
+  gated by `config :musubi, :validate_push_events` (dev/test default) — dev-correctness,
+  not a security boundary, never raises in prod.
 
 ## [0.12.0] — 2026-06-27
 

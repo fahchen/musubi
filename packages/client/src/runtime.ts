@@ -946,9 +946,15 @@ function acceptEnvelope(
   }
 }
 
+// Events are keyed by (store_id, name): handlers registered on a store proxy
+// only receive that store's events (BDR-0032).
+function eventKey(storeId: StoreId, name: string): string {
+  return `${storeIdKey(storeId)} ${name}`
+}
+
 function dispatchEvents(connection: RootConnection, events: readonly PushEvent[]): void {
   for (const event of events) {
-    const handlers = connection.eventListeners.get(event.name)
+    const handlers = connection.eventListeners.get(eventKey(event.store_id, event.name))
     if (!handlers) {
       continue
     }
@@ -961,19 +967,21 @@ function dispatchEvents(connection: RootConnection, events: readonly PushEvent[]
 
 export function subscribeConnectionEvent(
   connection: RootConnection,
+  storeId: StoreId,
   name: string,
   handler: (payload: unknown) => void
 ): () => void {
-  const handlers = connection.eventListeners.get(name) ?? new Set<(payload: unknown) => void>()
+  const key = eventKey(storeId, name)
+  const handlers = connection.eventListeners.get(key) ?? new Set<(payload: unknown) => void>()
 
   handlers.add(handler)
-  connection.eventListeners.set(name, handlers)
+  connection.eventListeners.set(key, handlers)
 
   return () => {
     handlers.delete(handler)
 
     if (handlers.size === 0) {
-      connection.eventListeners.delete(name)
+      connection.eventListeners.delete(key)
     }
   }
 }

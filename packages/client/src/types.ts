@@ -368,8 +368,10 @@ export type StreamOp =
     }
 
 // Transient push event (BDR-0032) folded into the patch envelope. Dispatched
-// once on receipt, owns no version/recovery semantics.
+// once on receipt, owns no version/recovery semantics. `store_id` tags the
+// emitting store; the client dispatches per `(store_id, name)`.
 export type PushEvent = {
+  store_id: StoreId
   name: string
   payload: unknown
 }

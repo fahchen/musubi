@@ -27,17 +27,15 @@ reply_schema_hook =
 # Hooks are user-removable; pending stream ops MUST flush every cycle, so the
 # prune step lives in the runtime.
 
-# Dev/test-only validation hooks. `ValidateRender` checks render output at
-# `:after_serialize`; `ValidateEvents` checks push-event payloads at the
-# outbound `:before_events` stage (BDR-0032). Both raise in dev/test and are
-# absent in prod — detach or replace via an app's own `:default_hooks`.
+# Dev/test-only render validation hook. `ValidateRender` checks a store's render
+# output against its declared state schema at the `:after_serialize` transform
+# stage (over `frame.render`). Raises in dev/test, absent in prod — detach or
+# replace via an app's own `:default_hooks`.
 state_validation_hooks =
   if config_env() in [:dev, :test] do
     [
       {Musubi.Hooks.ValidateRender, :after_serialize,
-       &Musubi.Hooks.ValidateRender.after_serialize(:raise, &1, &2)},
-      {Musubi.Hooks.ValidateEvents, :before_events,
-       &Musubi.Hooks.ValidateEvents.before_events/2}
+       &Musubi.Hooks.ValidateRender.after_serialize(:raise, &1, &2)}
     ]
   else
     []
@@ -46,6 +44,12 @@ state_validation_hooks =
 config :musubi,
        :default_hooks,
        [command_schema_hook, reply_schema_hook | state_validation_hooks]
+
+# Push-event payload validation (BDR-0032), dev/test only. The page server
+# validates each store socket's declared event payloads against that store's
+# `event` schema during `:after_serialize` aggregation. Dev-correctness, not a
+# security boundary — events are server-pushed. Set `false` to disable.
+config :musubi, :validate_push_events, config_env() in [:dev, :test]
 
 if File.exists?(Path.join(__DIR__, "#{config_env()}.exs")) do
   import_config "#{config_env()}.exs"

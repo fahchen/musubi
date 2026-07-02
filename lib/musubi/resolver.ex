@@ -6,10 +6,14 @@ defmodule Musubi.Resolver do
   placeholders bottom-up, then for each rendered store runs the lifecycle
   pipeline:
 
-    1. `:after_render` hooks — receive the resolved Elixir term.
-    2. Wire serialization — converts the resolved Elixir term to wire form while
-       stitching cached child `wire_state` at reused store boundaries.
-    3. `:after_serialize` hooks — receive the wire term.
+    1. `:after_render` hooks — receive the Elixir-form `Musubi.Page.Frame` and may
+       rewrite its `render`.
+    2. Wire serialization — converts the (possibly hook-rewritten) resolved
+       Elixir term to wire form while stitching cached child `wire_state` at
+       reused store boundaries.
+
+  The `:after_serialize` stage runs later, at the page server's aggregation phase
+  (over the wire frame, including drained push events), not here.
 
   Each rendered store node's resolved state map carries
   `__musubi_store_id__: store_id_array`, the array runtime identity the client
@@ -31,6 +35,7 @@ defmodule Musubi.Resolver do
   alias Musubi.AsyncResult
   alias Musubi.Child
   alias Musubi.Lifecycle
+  alias Musubi.Page.Frame
   alias Musubi.Page.StoreTable
   alias Musubi.Page.StoreTable.Entry
   alias Musubi.Reconciler
@@ -124,8 +129,9 @@ defmodule Musubi.Resolver do
     resolved_state = validate_and_inject_upload_markers!(resolved_state, socket)
     resolved_state = inject_store_id(resolved_state, store_id)
 
+    {resolved_state, next_socket} = finalize_socket(socket, resolved_state)
+
     wire_state = stitch_wire(resolved_state, resolved_registry, store_id)
-    next_socket = finalize_socket(socket, resolved_state, wire_state)
 
     next_registry =
       StoreTable.put(
@@ -165,25 +171,16 @@ defmodule Musubi.Resolver do
   defp render_input(%Socket{} = socket, %StoreTable{}, _store_id),
     do: socket.module.render(socket)
 
-  @spec finalize_socket(Socket.t(), resolved_value(), Entry.wire_state() | nil) :: Socket.t()
-  defp finalize_socket(%Socket{} = socket, resolved_state, wire_state) do
-    after_render_socket =
-      case Lifecycle.run_hooks(socket, :after_render, [resolved_state], false) do
-        {:cont, %Socket{} = hooked_socket} -> hooked_socket
-        {:halt, %Socket{} = hooked_socket} -> hooked_socket
-      end
+  # Runs the `:after_render` transform stage over the Elixir-form frame, then
+  # prunes streams and resets change tracking. `:after_serialize` runs later at
+  # the page server's aggregation phase. Returns the (possibly hook-rewritten)
+  # resolved render term plus the updated socket.
+  @spec finalize_socket(Socket.t(), resolved_value()) :: {resolved_value(), Socket.t()}
+  defp finalize_socket(%Socket{} = socket, resolved_state) do
+    {%Frame{render: render}, hooked_socket} =
+      Lifecycle.run_transform_hooks(socket, :after_render, %Frame{render: resolved_state})
 
-    case Lifecycle.run_hooks(after_render_socket, :after_serialize, [wire_state], false) do
-      {:cont, %Socket{} = hooked_socket} ->
-        hooked_socket
-        |> Stream.drain_and_prune()
-        |> Socket.reset_changed()
-
-      {:halt, %Socket{} = hooked_socket} ->
-        hooked_socket
-        |> Stream.drain_and_prune()
-        |> Socket.reset_changed()
-    end
+    {render, hooked_socket |> Stream.drain_and_prune() |> Socket.reset_changed()}
   end
 
   @spec has_changed_streams?(Socket.t()) :: boolean()

@@ -74,7 +74,7 @@ function buildProxy(connection: RootConnection, storeId: StoreId): object {
 
       if (prop === "handleEvent") {
         return (name: string, handler: (payload: unknown) => void) =>
-          subscribeConnectionEvent(connection, name, handler)
+          subscribeConnectionEvent(connection, storeId, name, handler)
       }
 
       if (prop === "snapshot") {

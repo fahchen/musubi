@@ -234,6 +234,7 @@ type StreamOp =
     }
 
 type PushEvent = {
+  store_id: string[]
   name: string
   payload: unknown
 }
@@ -266,10 +267,11 @@ Envelope rules:
   (matching that channel's root) for envelope symmetry
 - stream placement paths contain `WireStreamMarker` objects in `ops`
 - stream contents move through `stream_ops`
-- `events` carries transient push events (BDR-0032), dispatched once on receipt
-  via `store.handleEvent(name, cb)`; they own no version/recovery state and are
-  not replayed on reconnect. A cycle with only events still emits an envelope and
-  bumps `version`
+- `events` carries transient push events (BDR-0032), each tagged with the
+  emitting store's `store_id` and dispatched once on receipt via
+  `store.handleEvent(name, cb)` per `(store_id, name)`; they own no
+  version/recovery state and are not replayed on reconnect. A cycle with only
+  events still emits an envelope and bumps `version`
 
 See `Musubi.Stream` for declaration, render placement, and validation
 rules, and `docs/push-events.md` for push events.
@@ -523,10 +525,11 @@ object.
 and `EventPayload<M, K, R>` mirror `CommandName` / `CommandPayload`, derived from
 the store's declared `events` (the `StoreDef` `Events` slot). When `name` is a
 literal the payload narrows to that event's exact declared shape — not a union
-and not `unknown`. Events are root-scoped, so `EventName` is `never` on a child
-proxy (subscribe off the root proxy). The handler is invoked once per matching
-event, after that envelope's state ops are applied; the registry lives on the
-root connection and survives reconnect.
+and not `unknown`. Events are per-store: `handleEvent` on a store proxy subscribes
+to that store's events (dispatch keyed by `(store_id, name)`), so a child proxy
+exposes its own declared events. The handler is invoked once per matching event,
+after that envelope's state ops are applied; the registry lives on the root
+connection and survives reconnect.
 
 Reserved runtime member names on every store proxy:
 

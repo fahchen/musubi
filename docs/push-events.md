@@ -11,9 +11,10 @@ stays application-owned.
 
 ## Declaration
 
-Declare events in the **root store** with the `event` DSL — like `command`, but
-payload-only. Events are root-scoped (no `store_id` on the wire), so declaring
-one in a child store is a compile-time error.
+Declare events in **any store** with the `event` DSL — like `command`, but
+payload-only. Events are per-store (symmetric with streams): each store owns its
+declarations, and on the wire each event is tagged with the emitting store's
+`store_id`.
 
 ```elixir
 defmodule MyApp.Inbox do
@@ -42,38 +43,39 @@ mismatch raises `ArgumentError`, the same treatment a command reply gets from it
 declared schema. An undeclared event name is not validated. A bad `push_event` in
 a command handler surfaces synchronously from the dispatch.
 
-This validation is a **default `:before_events` hook** (`Musubi.Hooks.ValidateEvents`),
-attached exactly like render validation — on in `:dev`/`:test`, absent in `:prod` —
-through `config :musubi, :default_hooks`. Detach or replace it there so production
-never raises on a malformed event.
+Validation is gated by `config :musubi, :validate_push_events` (default
+`config_env() in [:dev, :test]`, off in `:prod`), like render validation — so
+production never raises on a malformed event. The page server validates each
+store socket's events against that store's schema during `:after_serialize`
+aggregation.
 
-## Extending: the `:before_events` hook
+## Extending: the `:after_serialize` frame hook
 
-`:before_events` is an outbound lifecycle stage (`Musubi.Lifecycle`) that runs on
-the root socket once per render cycle, over the cycle's flattened event list,
-just before it folds into the envelope. It is a *transform* stage: attach a hook
-returning `{:cont, events, socket}` (or `{:halt, events, socket}` to stop the
-chain) to audit, redact, enrich, or drop outgoing events.
+`:after_render` and `:after_serialize` are *transform* lifecycle stages
+(`Musubi.Lifecycle`) that carry a per-socket `Musubi.Page.Frame`
+(`%{render, events}`) — `:after_render` the Elixir-form frame during resolve,
+`:after_serialize` the wire-form frame at the server's aggregation phase (where a
+socket's events are drained in). A hook returns `{:cont | :halt, frame, socket}`
+and may rewrite `frame.render` or `frame.events` — audit, redact, enrich, or drop
+outbound render/events.
 
 ```elixir
 def mount(socket) do
   socket =
-    Musubi.Lifecycle.attach_hook(socket, :redact, :before_events, fn events, socket ->
-      {:cont, Enum.reject(events, &(&1.name == "internal")), socket}
+    Musubi.Lifecycle.attach_hook(socket, :redact, :after_serialize, fn frame, socket ->
+      kept = Enum.reject(frame.events, &(&1.name == "internal"))
+      {:cont, %{frame | events: kept}, socket}
     end)
 
   {:ok, socket}
 end
 ```
 
-Default payload validation is just the first hook attached at this stage.
-
 ## Server
 
 Queue an event from any store callback (a command handler, `handle_info`,
-`handle_async`) with `push_event`. Although events are *declared* on the root,
-`push_event` may be *called* from any store socket — the events flatten into the
-one root envelope.
+`handle_async`) with `push_event`. Each store's events are tagged with its own
+`store_id` and dispatched to that store's proxy on the client.
 
 ```elixir
 def handle_command(:save, _payload, socket) do
@@ -104,11 +106,13 @@ const off = store.handleEvent("toast", (payload) => {
 off() // unsubscribe
 ```
 
-`handleEvent(name, handler)` returns an unsubscribe thunk. Multiple handlers per
-name are allowed; an event with no registered handler is dropped. Handlers run
-once per matching event, **after** that envelope's state ops are applied (so the
-store reflects the new state when the handler reads it). Registrations live on
-the root connection and survive reconnect.
+`handleEvent(name, handler)` on a store proxy subscribes to **that store's**
+events (keyed by `(store_id, name)`), so the same name on two stores never
+collides. It returns an unsubscribe thunk. Multiple handlers per key are allowed;
+an event with no registered handler is dropped. Handlers run once per matching
+event, **after** that envelope's state ops are applied (so the store reflects the
+new state when the handler reads it). Registrations live on the root connection
+and survive reconnect.
 
 ### React
 
@@ -130,8 +134,9 @@ useMusubiEvent(store, "toast", (payload: { msg: string }) => {
   `push_event` runs, the event is dropped.
 - **Dropped on version mismatch.** If the envelope is rejected for a version gap
   and recovery kicks in, that envelope's events are discarded with it.
-- **Root-scoped.** Events carry no `store_id`; they are dispatched by `name`
-  alone, regardless of which store queued them.
+- **Per-store.** Each event carries the emitting store's `store_id` and is
+  dispatched per `(store_id, name)`; a handler on a store proxy only sees that
+  store's events. Symmetric with stream/upload ops.
 - **Event-only cycles still emit.** A cycle that only pushes events (no state
   change) still ships an envelope and bumps `version` — events are not subject
   to the idle-cycle skip that empty diffs are.

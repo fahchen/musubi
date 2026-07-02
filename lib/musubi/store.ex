@@ -330,31 +330,9 @@ defmodule Musubi.Store do
             "declare `use Musubi.Store, root: true` before defining it"
     end
 
-    validate_events_root_only!(env, root?)
     validate_uploads_against_fields!(env)
 
     quote(do: :ok)
-  end
-
-  # Events are root-scoped (BDR-0032): they carry no store_id on the wire and the
-  # client subscribes them off the root proxy, so declaring them on a child store
-  # is rejected at compile time.
-  @spec validate_events_root_only!(Macro.Env.t(), boolean()) :: :ok
-  defp validate_events_root_only!(%Macro.Env{} = env, root?) do
-    events = Module.get_attribute(env.module, :__musubi_events__) || []
-
-    if not root? and events != [] do
-      name = events |> Enum.reverse() |> hd() |> Map.fetch!(:name)
-
-      raise CompileError,
-        file: env.file,
-        line: env.line,
-        description:
-          "event :#{name} not allowed: events may only be declared in a root store; " <>
-            "declare `use Musubi.Store, root: true`"
-    end
-
-    :ok
   end
 
   @spec validate_uploads_against_fields!(Macro.Env.t()) :: :ok

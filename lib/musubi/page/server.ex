@@ -36,6 +36,7 @@ defmodule Musubi.Page.Server do
   alias Musubi.Event
   alias Musubi.Hooks.ValidateCommandSchema
   alias Musubi.Lifecycle
+  alias Musubi.Page.Frame
   alias Musubi.Page.PatchEnvelope
   alias Musubi.Page.Server.State
   alias Musubi.Page.StoreTable
@@ -289,10 +290,9 @@ defmodule Musubi.Page.Server do
 
     {root_socket, store_table} = run_render_cycle(root_socket, store_table)
 
-    {wire_root, store_table} = root_wire(store_table, root_socket)
+    {wire_root, events, store_table} = serialize_frames(store_table)
     {stream_ops, store_table} = flush_all_stream_ops(store_table)
     {upload_ops_raw, store_table} = flush_all_upload_ops(store_table)
-    {events, store_table} = drain_events(store_table, root_socket)
 
     {upload_ops, upload_throttle} = throttle_progress(upload_ops_raw, %{})
 
@@ -721,10 +721,9 @@ defmodule Musubi.Page.Server do
     {next_root_socket, next_registry} =
       run_render_cycle(state.root_socket, state.store_table)
 
-    {wire_root, next_registry} = root_wire(next_registry, next_root_socket)
+    {wire_root, events, next_registry} = serialize_frames(next_registry)
     {stream_ops, next_registry} = flush_all_stream_ops(next_registry)
     {upload_ops_raw, next_registry} = flush_all_upload_ops(next_registry)
-    {events, next_registry} = drain_events(next_registry, next_root_socket)
 
     {upload_ops, next_throttle} =
       throttle_progress(upload_ops_raw, state.upload_progress_last_emitted)
@@ -1019,14 +1018,6 @@ defmodule Musubi.Page.Server do
     {next_root_socket, next_registry}
   end
 
-  @spec root_wire(StoreTable.t(), Socket.t()) :: {term(), StoreTable.t()}
-  defp root_wire(%StoreTable{} = registry, %Socket{}) do
-    case StoreTable.get(registry, []) do
-      %Entry{wire_state: wire_state} -> {wire_state, registry}
-      nil -> {nil, registry}
-    end
-  end
-
   @spec root_socket(StoreTable.t(), Socket.t()) :: Socket.t()
   defp root_socket(%StoreTable{} = registry, %Socket{} = fallback) do
     case StoreTable.get(registry, []) do
@@ -1069,43 +1060,56 @@ defmodule Musubi.Page.Server do
     end
   end
 
-  # Drains push events (BDR-0032) from every store socket, flattened in
-  # store_id order (root before children). Events are root-scoped: no store_id
-  # tag is attached, unlike stream/upload ops.
-  # Drains a cycle's push events from every store socket, then runs the outbound
-  # `:before_events` transform stage on the root socket (BDR-0032): default
-  # payload validation plus any app-attached audit/redaction hook may rewrite or
-  # drop events before they fold into the envelope. The hooked root socket is
-  # written back so hook-side socket mutations persist.
-  @spec drain_events(StoreTable.t(), Socket.t()) :: {[Event.event()], StoreTable.t()}
-  defp drain_events(%StoreTable{} = registry, %Socket{} = fallback) do
-    {events, registry} = flush_all_events(registry)
-    {events, root} = Lifecycle.run_event_hooks(root_socket(registry, fallback), events)
-    {events, put_root_socket(registry, root)}
+  # Per-entry outbound aggregation (root before children). For each store socket:
+  # drains + wire-encodes its push events (BDR-0032), builds a `Frame` from the
+  # entry's wire render + those events, runs the `:after_serialize` transform
+  # stage (render/event validation, app audit/redaction), then stamps each event
+  # with the socket's store_id (symmetric with stream/upload ops). Iterating the
+  # registry — not the render path — keeps events from memoized sockets flushing.
+  # Returns the (possibly hook-rewritten) root wire render, the flattened events,
+  # and the registry with hooked sockets + wire_state written back.
+  @spec serialize_frames(StoreTable.t()) ::
+          {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}
+  defp serialize_frames(%StoreTable{} = registry) do
+    registry
+    |> StoreTable.keys()
+    |> Enum.sort_by(&length/1)
+    |> Enum.reduce({nil, [], registry}, &serialize_entry/2)
   end
 
-  @spec put_root_socket(StoreTable.t(), Socket.t()) :: StoreTable.t()
-  defp put_root_socket(%StoreTable{} = registry, %Socket{} = socket) do
-    case StoreTable.get(registry, []) do
-      %Entry{} = entry -> StoreTable.put(registry, [], %{entry | socket: socket})
-      nil -> registry
+  @spec serialize_entry(store_id(), {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}) ::
+          {Entry.wire_state() | nil, [PatchEnvelope.event()], StoreTable.t()}
+  defp serialize_entry(store_id, {wire_root, events_acc, reg}) do
+    case StoreTable.get(reg, store_id) do
+      %Entry{socket: socket, wire_state: wire_state, module: module} = entry ->
+        {wire_events, socket} = Event.flush_pending(socket)
+
+        {%Frame{render: render, events: events}, socket} =
+          Lifecycle.run_transform_hooks(
+            socket,
+            :after_serialize,
+            %Frame{render: wire_state, events: wire_events}
+          )
+
+        maybe_validate_events(events, module)
+        stamped = Enum.map(events, &Map.put(&1, :store_id, store_id))
+        reg = StoreTable.put(reg, store_id, %{entry | socket: socket, wire_state: render})
+        {if(store_id == [], do: render, else: wire_root), events_acc ++ stamped, reg}
+
+      nil ->
+        {wire_root, events_acc, reg}
     end
   end
 
-  @spec flush_all_events(StoreTable.t()) :: {[Event.event()], StoreTable.t()}
-  defp flush_all_events(%StoreTable{} = registry) do
-    sorted_keys = registry |> StoreTable.keys() |> Enum.sort_by(&length/1)
+  # Dev-correctness only (config/config.exs): validate a socket's declared event
+  # payloads in dev/test, skip in prod. Not a security boundary — events are
+  # server-pushed (BDR-0032). Runs per store socket against its own module.
+  @spec maybe_validate_events([Event.event()], module()) :: :ok
+  defp maybe_validate_events(events, module) do
+    if Application.get_env(:musubi, :validate_push_events, false),
+      do: Event.validate_events!(events, module)
 
-    Enum.reduce(sorted_keys, {[], registry}, fn store_id, {acc, reg} ->
-      case StoreTable.get(reg, store_id) do
-        %Entry{socket: socket} = entry ->
-          {events, next_socket} = Event.flush_pending(socket)
-          {acc ++ events, StoreTable.put(reg, store_id, %{entry | socket: next_socket})}
-
-        nil ->
-          {acc, reg}
-      end
-    end)
+    :ok
   end
 
   @spec flush_all_upload_ops(StoreTable.t()) :: {[Upload.op()], StoreTable.t()}

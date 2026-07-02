@@ -134,13 +134,13 @@ defmodule Musubi.Page.ServerEventTest do
     @impl Musubi.Store
     def mount(socket) do
       socket =
-        Lifecycle.attach_hook(socket, :redact, :before_events, fn events, sock ->
+        Lifecycle.attach_hook(socket, :redact, :after_serialize, fn frame, sock ->
           kept =
-            events
+            frame.events
             |> Enum.reject(&(&1.name == "secret"))
             |> Enum.map(&Map.update!(&1, :payload, fn p -> Map.put(p, "seen", true) end))
 
-          {:cont, kept, sock}
+          {:cont, %{frame | events: kept}, sock}
         end)
 
       {:ok, assign(socket, :title, "Page")}
@@ -241,19 +241,22 @@ defmodule Musubi.Page.ServerEventTest do
     {:ok, %{}} = Server.command(pid, ["child"], :child_toast, %{})
     assert_receive {:patch, env}
 
-    assert %PatchEnvelope{events: [%{name: "from_child", payload: %{"ok" => true}}]} = env
+    # Event stamped with the emitting store's store_id (per-store, BDR-0032).
+    assert %PatchEnvelope{
+             events: [%{store_id: ["child"], name: "from_child", payload: %{"ok" => true}}]
+           } = env
   end
 
-  test "a :before_events hook rewrites the outbound event list before egress" do
+  test "an :after_serialize hook rewrites the outbound frame's events before egress" do
     pid = start_supervised!({Server, {TransformEventStore, %{}, %{transport_pid: self()}}})
     assert_receive {:patch, %PatchEnvelope{version: 1}}
 
-    # mount attaches a :before_events hook dropping "secret" and tagging the rest.
+    # mount attaches an :after_serialize hook dropping "secret" and tagging the rest.
     {:ok, %{}} = Server.command(pid, [], :emit, %{})
     assert_receive {:patch, env}
 
     assert %PatchEnvelope{
-             events: [%{name: "public", payload: %{"n" => 2, "seen" => true}}]
+             events: [%{store_id: [], name: "public", payload: %{"n" => 2, "seen" => true}}]
            } = env
   end
 end

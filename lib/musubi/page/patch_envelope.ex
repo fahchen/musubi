@@ -39,8 +39,12 @@ defmodule Musubi.Page.PatchEnvelope do
   @typedoc "Wire upload-op shape produced by `Musubi.Page.Server` from the `Musubi.Upload` accumulator."
   @type upload_op() :: map()
 
-  @typedoc "Wire push-event shape (BDR-0032) produced by `Musubi.Page.Server` from the `Musubi.Event` accumulator."
-  @type event() :: %{required(:name) => String.t(), required(:payload) => term()}
+  @typedoc "Wire push-event shape (BDR-0032) produced by `Musubi.Page.Server` from the `Musubi.Event` accumulator. `store_id` tags the emitting store (client dispatches per `(store_id, name)`)."
+  @type event() :: %{
+          required(:store_id) => [String.t()],
+          required(:name) => String.t(),
+          required(:payload) => term()
+        }
 
   typed_structor do
     field :type, String.t(),
