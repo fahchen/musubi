@@ -102,8 +102,9 @@ defmodule Musubi.MixProject do
         "guides/uploads.md",
         "guides/testing.md",
         "docs/client-contract.md",
-        "docs/persistence-pattern.md",
-        "docs/push-events.md"
+        "docs/streams.md",
+        "docs/push-events.md",
+        "docs/persistence-pattern.md"
       ],
       groups_for_extras: [
         Tutorials: [
@@ -115,8 +116,9 @@ defmodule Musubi.MixProject do
         ],
         Reference: [
           "docs/client-contract.md",
-          "docs/persistence-pattern.md",
-          "docs/push-events.md"
+          "docs/streams.md",
+          "docs/push-events.md",
+          "docs/persistence-pattern.md"
         ]
       ],
       groups_for_modules: [
