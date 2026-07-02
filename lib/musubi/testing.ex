@@ -177,9 +177,9 @@ defmodule Musubi.Testing do
       Musubi.Testing.dispatch_command(page, :save, %{})
       Musubi.Testing.assert_push_event(:toast, %{msg: "Saved", level: :info})
   """
-  @spec assert_push_event(atom() | String.t(), map(), non_neg_integer()) :: map()
+  @spec assert_push_event(atom() | String.t(), term(), non_neg_integer()) :: term()
   def assert_push_event(name, payload, timeout \\ 100)
-      when (is_atom(name) or is_binary(name)) and is_map(payload) do
+      when is_atom(name) or is_binary(name) do
     name = to_string(name)
     expected = Wire.to_wire(payload)
 
@@ -222,14 +222,28 @@ defmodule Musubi.Testing do
 
   @spec scan_for_event(String.t(), non_neg_integer()) :: PatchEnvelope.event() | nil
   defp scan_for_event(name, timeout) do
-    receive do
-      {:patch, %PatchEnvelope{events: events}} ->
-        case Enum.find(events, &(&1.name == name)) do
-          nil -> scan_for_event(name, timeout)
-          event -> event
-        end
-    after
-      timeout -> nil
+    scan_until(name, System.monotonic_time(:millisecond) + timeout)
+  end
+
+  # Honors the original `timeout` as an absolute deadline: non-matching patches
+  # loop, but each `receive` waits only the time left — so a stream of unrelated
+  # patches can't reset the clock and block indefinitely.
+  @spec scan_until(String.t(), integer()) :: PatchEnvelope.event() | nil
+  defp scan_until(name, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      nil
+    else
+      receive do
+        {:patch, %PatchEnvelope{events: events}} ->
+          case Enum.find(events, &(&1.name == name)) do
+            nil -> scan_until(name, deadline)
+            event -> event
+          end
+      after
+        remaining -> nil
+      end
     end
   end
 

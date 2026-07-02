@@ -33,10 +33,15 @@ defmodule Musubi.TestingTest do
 
     command :flash
 
+    command :blast
+
     event :toast do
       field :msg, String.t()
       field :level, atom()
     end
+
+    # No-field event: payload may be any wire-encodable term, not just a map.
+    event(:blob)
 
     @impl Musubi.Store
     def mount(_params, socket) do
@@ -72,6 +77,10 @@ defmodule Musubi.TestingTest do
 
     def handle_command(:flash, _payload, socket) do
       {:reply, %{"ok" => true}, push_event(socket, :toast, %{msg: "Saved", level: :info})}
+    end
+
+    def handle_command(:blast, _payload, socket) do
+      {:reply, %{"ok" => true}, push_event(socket, :blob, [1, 2, 3])}
     end
   end
 
@@ -155,6 +164,13 @@ defmodule Musubi.TestingTest do
 
       payload = Musubi.Testing.assert_push_event(:toast, %{msg: "Saved", level: :info})
       assert payload == %{"msg" => "Saved", "level" => "info"}
+    end
+
+    test "matches a non-map payload (any wire-encodable term)" do
+      page = Musubi.Testing.mount(SimpleStore)
+      {:ok, _reply} = Musubi.Testing.dispatch_command(page, :blast, %{})
+
+      assert [1, 2, 3] = Musubi.Testing.assert_push_event(:blob, [1, 2, 3])
     end
 
     test "flunks on a payload mismatch" do
