@@ -102,7 +102,8 @@ defmodule Musubi.MixProject do
         "guides/uploads.md",
         "guides/testing.md",
         "docs/client-contract.md",
-        "docs/persistence-pattern.md"
+        "docs/persistence-pattern.md",
+        "docs/push-events.md"
       ],
       groups_for_extras: [
         Tutorials: [
@@ -114,7 +115,8 @@ defmodule Musubi.MixProject do
         ],
         Reference: [
           "docs/client-contract.md",
-          "docs/persistence-pattern.md"
+          "docs/persistence-pattern.md",
+          "docs/push-events.md"
         ]
       ],
       groups_for_modules: [
@@ -128,7 +130,9 @@ defmodule Musubi.MixProject do
         Runtime: [
           Musubi.Async,
           Musubi.AsyncResult,
+          Musubi.Event,
           Musubi.Lifecycle,
+          Musubi.Page.Frame,
           Musubi.Stream,
           Musubi.Telemetry
         ],
@@ -156,7 +160,9 @@ defmodule Musubi.MixProject do
       Musubi.Child,
       Musubi.Async,
       Musubi.AsyncResult,
+      Musubi.Event,
       Musubi.Lifecycle,
+      Musubi.Page.Frame,
       Musubi.Stream,
       Musubi.Telemetry,
       Musubi.Transport.Socket,
