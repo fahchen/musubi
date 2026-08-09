@@ -49,7 +49,7 @@ defmodule Musubi.MixProject do
       {:telemetry, "~> 0.4 or ~> 1.0"},
       {:typed_structor, "~> 0.6.1"},
       {:jsonpatch, "~> 2.2"},
-      {:phoenix, System.get_env("PHOENIX_VERSION", ">= 1.7.0 and < 2.0.0")},
+      {:phoenix, System.get_env("PHOENIX_VERSION", ">= 1.5.3 and < 2.0.0")},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
