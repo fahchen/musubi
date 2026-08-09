@@ -1,7 +1,7 @@
 defmodule Musubi.MixProject do
   use Mix.Project
 
-  @version "0.13.0"
+  @version "0.13.1"
   @source_url "https://github.com/fahchen/musubi"
 
   def project do
