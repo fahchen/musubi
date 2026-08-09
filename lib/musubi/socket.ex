@@ -239,9 +239,8 @@ defmodule Musubi.Socket do
   @spec assign(t(), assign_key(), term()) :: t()
   def assign(%__MODULE__{} = socket, key, value) do
     current_assigns = ensure_changed_map(socket.assigns)
-    current_value = Map.get(current_assigns, key)
 
-    if current_value === value do
+    if match?({:ok, ^value}, Map.fetch(current_assigns, key)) do
       %{socket | assigns: current_assigns}
     else
       changed =

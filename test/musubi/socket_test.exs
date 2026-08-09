@@ -32,6 +32,22 @@ defmodule Musubi.SocketTest do
       assert unchanged.assigns.__changed__ == %{status: true}
     end
 
+    test "assign/3 creates a nil-valued key on an absent key" do
+      socket = Socket.assign(%Socket{}, :cursor, nil)
+
+      assert Map.has_key?(socket.assigns, :cursor)
+      assert socket.assigns[:cursor] == nil
+      assert socket.assigns.__changed__ == %{cursor: true}
+    end
+
+    test "assign/3 short-circuits re-assigning nil to an existing nil key" do
+      socket = Socket.assign(%Socket{}, :cursor, nil) |> Socket.reset_changed()
+      unchanged = Socket.assign(socket, :cursor, nil)
+
+      assert unchanged == socket
+      assert unchanged.assigns.__changed__ == %{}
+    end
+
     test "assign/2 handles maps and keyword lists" do
       socket =
         %Socket{}
