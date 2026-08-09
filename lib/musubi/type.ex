@@ -221,10 +221,10 @@ defmodule Musubi.Type do
   defp resolve_alias(module, _host_module) when is_atom(module), do: {:ok, module}
   defp resolve_alias(_other, _host_module), do: :error
 
+  # Only reached when `resolve_alias/2` returns `:error`, which never happens for
+  # a bare atom module — that clause resolves to `{:ok, module}`.
   defp unresolved_module({:__aliases__, _meta, parts}) when is_list(parts),
     do: concat_module(parts)
-
-  defp unresolved_module(module) when is_atom(module), do: module
 
   defp candidate_modules(nil, parts), do: [concat_module(parts)]
 

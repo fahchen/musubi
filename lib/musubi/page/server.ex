@@ -1417,12 +1417,10 @@ defmodule Musubi.Page.Server do
   defp expected_shutdown_reason?({:shutdown, _reason}), do: true
   defp expected_shutdown_reason?(_reason), do: false
 
-  @spec envelope_op_count(PatchEnvelope.t() | nil) :: non_neg_integer()
-  defp envelope_op_count(nil), do: 0
+  @spec envelope_op_count(PatchEnvelope.t()) :: non_neg_integer()
   defp envelope_op_count(%PatchEnvelope{ops: ops}), do: length(ops)
 
-  @spec envelope_stream_count(PatchEnvelope.t() | nil) :: non_neg_integer()
-  defp envelope_stream_count(nil), do: 0
+  @spec envelope_stream_count(PatchEnvelope.t()) :: non_neg_integer()
   defp envelope_stream_count(%PatchEnvelope{stream_ops: ops}), do: length(ops)
 
   # ---------------------------------------------------------------------------

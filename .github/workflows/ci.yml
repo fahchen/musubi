@@ -23,25 +23,19 @@ jobs:
       matrix:
         include:
           - elixir: "1.18.4"
-            otp: "25.3"
-            phoenix: "~> 1.5.0"
-          - elixir: "1.18.4"
-            otp: "26.2"
-            phoenix: "~> 1.6.0"
-          - elixir: "1.18.4"
             otp: "27.3"
             phoenix: "~> 1.7.0"
           - elixir: "1.18.4"
             otp: "27.3"
             phoenix: "~> 1.8.0"
           - elixir: "1.19.5"
-            otp: "26.2"
-            phoenix: "~> 1.8.0"
-          - elixir: "1.19.5"
-            otp: "27.3"
-            phoenix: "~> 1.8.0"
+            otp: "28.3"
+            phoenix: "~> 1.7.0"
           - elixir: "1.19.5"
             otp: "28.3"
+            phoenix: "~> 1.8.0"
+          - elixir: "1.20.3"
+            otp: "29.0"
             phoenix: "~> 1.8.0"
             lint: lint
 
@@ -50,7 +44,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup BEAM
         uses: erlef/setup-beam@v1
@@ -59,7 +53,7 @@ jobs:
           otp-version: ${{ matrix.otp }}
 
       - name: Restore deps + build cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             deps
@@ -96,7 +90,7 @@ jobs:
       - name: Restore PLT cache
         if: ${{ matrix.lint }}
         id: plt-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: priv/plts
           key: plt-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('**/mix.lock') }}
