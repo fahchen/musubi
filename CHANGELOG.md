@@ -11,6 +11,26 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-08-09
+
+### Fixed
+
+- **`musubi`** — `Musubi.Socket.assign/3` now stores `nil` on a key that was
+  never assigned before. Change tracking read the current value with
+  `Map.get/2`, which cannot tell a missing key from a key present with a `nil`
+  value, so the assign short-circuited and the key was never created — a later
+  read then raised `KeyError` far from the cause. A store can now hold a
+  nullable field initialized to `nil` (cursors, current selection, optional
+  errors). `assign_new/3` is unchanged.
+
+### Changed
+
+- **`musubi`** — CI now covers the three most recent Elixir series (1.18.4,
+  1.19.5, 1.20.3) against Phoenix 1.7 and 1.8. Phoenix 1.5 and 1.6 are no
+  longer exercised, because Elixir 1.20 requires OTP 27+ and those legs ran on
+  OTP 25/26. The declared requirement stays `>= 1.5.3 and < 2.0.0` — untested,
+  not forbidden. The supported Elixir requirement is still `~> 1.18`.
+
 ## [0.13.0] — 2026-07-02
 
 ### Added
@@ -467,7 +487,8 @@ Initial public release of the Musubi runtime (then `Arbor`):
 - TypeScript client and React adapter that materialize the diff stream
   into immutable snapshots.
 
-[Unreleased]: https://github.com/fahchen/musubi/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/fahchen/musubi/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/fahchen/musubi/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/fahchen/musubi/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/fahchen/musubi/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/fahchen/musubi/compare/v0.11.0...v0.11.1
