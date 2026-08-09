@@ -41,7 +41,7 @@ defmodule Musubi.SocketTest do
     end
 
     test "assign/3 short-circuits re-assigning nil to an existing nil key" do
-      socket = Socket.assign(%Socket{}, :cursor, nil) |> Socket.reset_changed()
+      socket = Socket.reset_changed(Socket.assign(%Socket{}, :cursor, nil))
       unchanged = Socket.assign(socket, :cursor, nil)
 
       assert unchanged == socket
