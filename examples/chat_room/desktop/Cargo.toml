@@ -1,0 +1,42 @@
+[package]
+name = "chat-room-desktop"
+version = "0.1.0"
+edition = "2024"
+# Matches musubi-client's MSRV; neither gpui 0.2.2 nor gpui-component 0.5.1
+# declares a `rust-version`, and both are edition 2024, so 1.85 is the floor.
+rust-version = "1.85"
+publish = false
+license = "MIT"
+
+# Detached from the repo-root Cargo workspace on purpose. Examples are
+# documentation, not members of the library's build graph (AGENTS.md), and gpui
+# must not appear in the root Cargo.lock or in musubi-client's CI.
+[workspace]
+
+[dependencies]
+# The Musubi client runtime core — runtime-free by construction. It re-exports
+# the four `phoenix-channel` seams (`Connector`/`Socket`/`Spawner`/`Timer`), so
+# an embedder implements them against `musubi_client` alone and never names the
+# transport crate. `musubi-client-tokio` is deliberately absent.
+musubi-client = { path = "../../../crates/musubi-client" }
+
+# UI. Both from crates.io, both Apache-2.0. Use gpui's DEFAULT features:
+# gpui-component 0.5.1 declares a plain `gpui = "0.2.2"` dependency, so cargo
+# feature unification re-enables everything a `default-features = false` here
+# would try to drop.
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+
+# Transport: the smol family, driven by gpui's own executor. No tokio reactor.
+async-net = "2"
+# `handshake` gives `client_async`, `futures-03-sink` gives the `Sink` impl on
+# `WebSocketStream`. They are the crate's defaults; spelling them out pins away
+# the `tokio-runtime` / `async-std-runtime` / TLS features.
+async-tungstenite = { version = "0.35", default-features = false, features = [
+  "handshake",
+  "futures-03-sink",
+] }
+futures = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

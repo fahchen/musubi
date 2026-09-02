@@ -3,6 +3,7 @@ import Config
 config :phoenix, :json_library, Jason
 
 config :musubi, :ts_codegen_output_path, "ui/src/generated/musubi.d.ts"
+config :musubi, :rust_codegen_output_path, "desktop/src/generated.rs"
 
 config :chat_room, ChatRoomWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
