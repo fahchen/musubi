@@ -107,3 +107,50 @@ jobs:
 
       - name: Run tests
         run: mix test
+
+  rust:
+    name: Rust (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Edition 2024 needs 1.85; the MSRV leg is the check
+          # `docs/rust-client.md` §1.4 refers to.
+          - toolchain: stable
+            lint: lint
+          - toolchain: "1.85"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: ${{ matrix.lint }}
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        if: ${{ matrix.lint }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `musubi-client` must stay runtime-free: the gpui embedder drives it off
+      # its own executor, so tokio may only reach the `musubi-client-tokio`
+      # crate (docs/rust-client.md §12.4).
+      - name: Runtime-free core
+        if: ${{ matrix.lint }}
+        run: |
+          cargo check -p musubi-client
+          ! cargo tree -p musubi-client -i tokio
+
+      - name: Run tests
+        run: cargo test --workspace

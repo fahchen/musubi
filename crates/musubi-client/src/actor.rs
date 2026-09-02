@@ -1,0 +1,877 @@
+//! The connection actor: one owned task, one registry of mounted roots
+//! (`docs/rust-client.md` §2.4, §6, §9).
+//!
+//! Every handle method turns into one [`ActorMsg`]; the actor is the only
+//! consumer, so there is no shared mutable state and no lock around the tree.
+//! Inbound channel events reach the actor through one forwarding task per
+//! channel incarnation, stamped with the generation that was current when the
+//! channel was attached — anything from a superseded incarnation is dropped.
+
+use std::any::Any;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures_channel::oneshot;
+use futures_util::StreamExt;
+use phoenix_channel::{
+    Channel, ChannelEvent, ChannelEvents, PhoenixSocket, PushError, Reply, ReplyStatus, Spawner,
+};
+use serde_json::{Value, json};
+
+use crate::engine::PatchEngine;
+use crate::envelope::PatchEnvelope;
+use crate::error::{CommandError, MusubiError, Result};
+use crate::generated::StoreId;
+use crate::mounted::RootSink;
+
+/// The push event a patch envelope arrives under.
+const EVENT_PATCH: &str = "patch";
+/// The push event a command is dispatched under.
+const EVENT_COMMAND: &str = "command";
+/// The error-response fields a command's `code` is read from, in priority
+/// order; the first **string-valued** one wins (§6.2).
+const CODE_FIELDS: [&str; 3] = ["code", "error", "reason"];
+
+/// The typed cell of a mounted root, as the actor sees it: opaque, and handed
+/// back to the mount caller to downcast.
+pub(crate) type AnyCell = Arc<dyn Any + Send + Sync>;
+
+/// Everything the actor accepts. Every handle method and every forwarding task
+/// is a sender; the actor is the only consumer.
+pub(crate) enum ActorMsg {
+    /// Mount a root, or alias an existing one.
+    Mount(Box<MountRequest>),
+    /// A [`Mounted`](crate::Mounted) handle was cloned.
+    Retain {
+        /// The root the clone holds.
+        root_id: Arc<str>,
+    },
+    /// A [`Mounted`](crate::Mounted) handle was dropped.
+    Release {
+        /// The root the handle held.
+        root_id: Arc<str>,
+    },
+    /// Dispatch a command on a mounted root.
+    Command(Box<CommandRequest>),
+    /// A dispatched command's push resolved.
+    CommandReply {
+        /// The root the command was dispatched on.
+        root_id: Arc<str>,
+        /// The actor-assigned id of the command.
+        id: u64,
+        /// What the push produced.
+        outcome: std::result::Result<Reply, PushError>,
+    },
+    /// One channel event, stamped with the generation it was forwarded for.
+    Channel {
+        /// The root the channel belongs to.
+        root_id: Arc<str>,
+        /// The channel incarnation that produced the event.
+        generation: u64,
+        /// The event itself.
+        event: ChannelEvent,
+    },
+    /// Tear everything down; the socket is closed for good.
+    Disconnect {
+        /// Resolved once every root is gone and the socket is closed.
+        ack: oneshot::Sender<()>,
+    },
+    /// The last handle went away.
+    Shutdown,
+}
+
+/// A mount request, carrying the cell the caller already built.
+///
+/// The cell travels with the request because only the caller knows the
+/// [`Store`](crate::generated::Store) type; the actor either adopts it (fresh
+/// root) or drops it and returns the existing one (alias).
+pub(crate) struct MountRequest {
+    /// The store's Elixir module name.
+    pub(crate) module: &'static str,
+    /// The caller-supplied root id.
+    pub(crate) id: String,
+    /// The mount params, already validated to be a JSON object.
+    pub(crate) params: Value,
+    /// The candidate cell, typed by the caller.
+    pub(crate) cell: AnyCell,
+    /// The same allocation, as the actor's publish target.
+    pub(crate) sink: Arc<dyn RootSink>,
+    /// Resolved with the root's cell once the initial patch has landed.
+    pub(crate) reply: oneshot::Sender<Result<AnyCell>>,
+}
+
+/// A command dispatch.
+pub(crate) struct CommandRequest {
+    /// The root whose channel carries the push.
+    pub(crate) root_id: Arc<str>,
+    /// The target store, server-authored (`[]` for the root).
+    pub(crate) store_id: StoreId,
+    /// The declared command name.
+    pub(crate) name: &'static str,
+    /// The serialized command payload.
+    pub(crate) payload: Value,
+    /// Resolved with the raw `phx_reply` response.
+    pub(crate) reply: oneshot::Sender<Result<Value>>,
+}
+
+/// The shared sender behind every handle.
+///
+/// Dropping the last handle — the [`Connection`](crate::Connection) and every
+/// [`Mounted`](crate::Mounted) — shuts the actor down, so a forgotten
+/// connection does not keep a socket reconnecting forever.
+pub(crate) struct ConnectionInner {
+    tx: UnboundedSender<ActorMsg>,
+}
+
+impl ConnectionInner {
+    /// Wraps the actor's inbox.
+    pub(crate) fn new(tx: UnboundedSender<ActorMsg>) -> Self {
+        Self { tx }
+    }
+
+    /// Enqueues one message; a dead actor means the connection is gone.
+    pub(crate) fn send(&self, msg: ActorMsg) -> Result<()> {
+        self.tx
+            .unbounded_send(msg)
+            .map_err(|_| MusubiError::Disconnected)
+    }
+}
+
+impl Drop for ConnectionInner {
+    fn drop(&mut self) {
+        let _ = self.tx.unbounded_send(ActorMsg::Shutdown);
+    }
+}
+
+/// The single owner of the socket and the root registry.
+pub(crate) struct Actor {
+    socket: PhoenixSocket,
+    base_topic: String,
+    spawner: Arc<dyn Spawner>,
+    tx: UnboundedSender<ActorMsg>,
+    rx: UnboundedReceiver<ActorMsg>,
+    roots: HashMap<Arc<str>, Root>,
+    next_command_id: u64,
+    closed: bool,
+}
+
+impl Actor {
+    /// Builds the actor. [`run`](Self::run) is what the spawner is handed.
+    pub(crate) fn new(
+        socket: PhoenixSocket,
+        base_topic: String,
+        spawner: Arc<dyn Spawner>,
+        tx: UnboundedSender<ActorMsg>,
+        rx: UnboundedReceiver<ActorMsg>,
+    ) -> Self {
+        Self {
+            socket,
+            base_topic,
+            spawner,
+            tx,
+            rx,
+            roots: HashMap::new(),
+            next_command_id: 0,
+            closed: false,
+        }
+    }
+
+    /// Drains the inbox until the last handle goes away.
+    pub(crate) async fn run(mut self) {
+        while let Some(msg) = self.rx.next().await {
+            if matches!(msg, ActorMsg::Shutdown) {
+                break;
+            }
+
+            self.handle(msg).await;
+        }
+    }
+
+    async fn handle(&mut self, msg: ActorMsg) {
+        match msg {
+            ActorMsg::Mount(request) => self.mount(*request).await,
+            ActorMsg::Retain { root_id } => self.retain(&root_id),
+            ActorMsg::Release { root_id } => self.release(&root_id),
+            ActorMsg::Command(request) => self.command(*request),
+            ActorMsg::CommandReply {
+                root_id,
+                id,
+                outcome,
+            } => self.command_replied(&root_id, id, outcome),
+            ActorMsg::Channel {
+                root_id,
+                generation,
+                event,
+            } => self.channel_event(&root_id, generation, event).await,
+            ActorMsg::Disconnect { ack } => self.disconnect(ack).await,
+            // Handled by the loop so it can break.
+            ActorMsg::Shutdown => {}
+        }
+    }
+
+    /// Mounts `(module, id)`, or aliases the root that already holds it.
+    ///
+    /// The registry insert happens **before the first await**, so two
+    /// concurrent mounts of one `(module, id)` cannot open two channels on the
+    /// same topic (§7).
+    async fn mount(&mut self, request: MountRequest) {
+        let root_id: Arc<str> = Arc::from(format!("{}:{}", request.module, request.id));
+
+        if self.roots.contains_key(&root_id) {
+            self.alias(&root_id, request);
+            return;
+        }
+
+        if self.closed {
+            let _ = request.reply.send(Err(MusubiError::Disconnected));
+            return;
+        }
+
+        let topic: Arc<str> = Arc::from(format!("{}:{}", self.base_topic, root_id));
+
+        self.roots.insert(
+            Arc::clone(&root_id),
+            Root {
+                module: request.module,
+                id: request.id,
+                topic,
+                params: request.params,
+                refcount: 1,
+                generation: 0,
+                channel: None,
+                engine: PatchEngine::new(),
+                sink: request.sink,
+                cell: request.cell,
+                published: false,
+                recovering: false,
+                pending_mounts: vec![request.reply],
+                pending_commands: HashMap::new(),
+            },
+        );
+
+        self.attach_and_join(&root_id).await;
+    }
+
+    /// Adds a second consumer to a live root: first-mount params win, and the
+    /// caller only waits when the root has never published state.
+    fn alias(&mut self, root_id: &Arc<str>, request: MountRequest) {
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return;
+        };
+
+        root.refcount += 1;
+
+        if root.params != request.params {
+            tracing::warn!(
+                root_id = %root_id,
+                "mount aliased an existing root with different params; first-mount params are \
+                 authoritative and the later ones are ignored — use a distinct id for a separate \
+                 instance"
+            );
+        }
+
+        if !root.published {
+            root.pending_mounts.push(request.reply);
+            return;
+        }
+
+        let cell = Arc::clone(&root.cell);
+
+        // The hold was taken above, before the send; a caller whose mount
+        // future was already dropped never receives the cell and never builds
+        // the `Mounted` that would release it.
+        if request.reply.send(Ok(cell)).is_err() {
+            self.release(root_id);
+        }
+    }
+
+    /// Opens a fresh channel incarnation for `root_id` and joins it.
+    ///
+    /// Used by the first mount and by version-mismatch recovery. The join-ok
+    /// event fires on this join and on every transport-level rejoin, which is
+    /// the single recovery hook (§9).
+    async fn attach_and_join(&mut self, root_id: &Arc<str>) {
+        let Some(root) = self.roots.get(root_id) else {
+            return;
+        };
+        let topic = root.topic.to_string();
+        let params = json!({"module": root.module, "id": root.id, "params": root.params});
+
+        let attached = self.socket.channel(topic, params).await;
+
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return;
+        };
+
+        let Ok((channel, events)) = attached else {
+            self.fail_join(root_id, || MusubiError::Disconnected);
+            return;
+        };
+
+        root.generation += 1;
+        let generation = root.generation;
+
+        if channel.join().is_err() {
+            self.fail_join(root_id, || MusubiError::Disconnected);
+            return;
+        }
+
+        root.channel = Some(channel);
+        self.forward(Arc::clone(root_id), generation, events);
+    }
+
+    /// Pumps one channel's events into the inbox, stamped with `generation`.
+    fn forward(&self, root_id: Arc<str>, generation: u64, mut events: ChannelEvents) {
+        let tx = self.tx.clone();
+
+        self.spawner.spawn(Box::pin(async move {
+            while let Some(event) = events.next().await {
+                let msg = ActorMsg::Channel {
+                    root_id: Arc::clone(&root_id),
+                    generation,
+                    event,
+                };
+
+                if tx.unbounded_send(msg).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn retain(&mut self, root_id: &Arc<str>) {
+        if let Some(root) = self.roots.get_mut(root_id) {
+            root.refcount += 1;
+        }
+    }
+
+    /// Drops one hold on a root; at zero the root is torn down and its channel
+    /// left, which stops the server-side root via `terminate/2`.
+    fn release(&mut self, root_id: &Arc<str>) {
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return;
+        };
+
+        root.refcount = root.refcount.saturating_sub(1);
+
+        if root.refcount == 0 {
+            self.teardown(root_id, || MusubiError::Unmounted);
+        }
+    }
+
+    /// Dispatches a command, or rejects it outright: there is no queueing and
+    /// no retry (§6.2).
+    fn command(&mut self, request: CommandRequest) {
+        if self.closed {
+            let _ = request.reply.send(Err(MusubiError::Disconnected));
+            return;
+        }
+
+        // The root left the registry: its last handle was dropped, or a failed
+        // mount released it.
+        let Some(root) = self.roots.get_mut(&request.root_id) else {
+            let _ = request.reply.send(Err(MusubiError::Unmounted));
+            return;
+        };
+
+        // No channel, or `version == 0` (mid-reconnect): a dispatch is either
+        // sendable now or rejected.
+        if root.engine.version() == 0 {
+            let _ = request.reply.send(Err(MusubiError::NotConnected));
+            return;
+        }
+
+        let Some(channel) = root.channel.clone() else {
+            let _ = request.reply.send(Err(MusubiError::NotConnected));
+            return;
+        };
+
+        self.next_command_id += 1;
+        let id = self.next_command_id;
+        let payload = json!({
+            "store_id": request.store_id,
+            "name": request.name,
+            "payload": request.payload,
+        });
+
+        root.pending_commands.insert(
+            id,
+            PendingCommand {
+                name: request.name,
+                store_id: request.store_id,
+                reply: request.reply,
+            },
+        );
+
+        let root_id = request.root_id;
+        let tx = self.tx.clone();
+
+        self.spawner.spawn(Box::pin(async move {
+            let outcome = channel.push(EVENT_COMMAND, payload).await;
+
+            let _ = tx.unbounded_send(ActorMsg::CommandReply {
+                root_id,
+                id,
+                outcome,
+            });
+        }));
+    }
+
+    /// Resolves one command. A command already rejected in bulk is gone from
+    /// the map, and its late reply is dropped.
+    fn command_replied(
+        &mut self,
+        root_id: &Arc<str>,
+        id: u64,
+        outcome: std::result::Result<Reply, PushError>,
+    ) {
+        let Some(pending) = self
+            .roots
+            .get_mut(root_id)
+            .and_then(|root| root.pending_commands.remove(&id))
+        else {
+            return;
+        };
+
+        let result = match outcome {
+            Ok(Reply {
+                status: ReplyStatus::Ok,
+                response,
+            }) => Ok(response),
+            Ok(Reply {
+                status: ReplyStatus::Error,
+                response,
+            }) => Err(CommandError::Failed {
+                command: pending.name,
+                store_id: pending.store_id,
+                code: error_code(&response),
+                reply: response,
+            }
+            .into()),
+            Err(PushError::Timeout) => Err(CommandError::Timeout {
+                command: pending.name,
+                store_id: pending.store_id,
+            }
+            .into()),
+            Err(PushError::NotJoined | PushError::Stale) => Err(MusubiError::NotConnected),
+            Err(PushError::Disconnected | PushError::SocketClosed(_)) => {
+                Err(MusubiError::Disconnected)
+            }
+            Err(PushError::MalformedReply) => Err(MusubiError::Protocol(
+                "command reply was not a phx_reply payload",
+            )),
+            // `PushError` is `#[non_exhaustive]`; any future variant still
+            // means no reply can arrive, which is what `Disconnected` says.
+            Err(error) => {
+                tracing::warn!(%error, "unrecognized command push failure");
+                Err(MusubiError::Disconnected)
+            }
+        };
+
+        let _ = pending.reply.send(result);
+    }
+
+    /// Routes one channel event, dropping anything from a superseded channel
+    /// incarnation (§3.2 generation guarding).
+    async fn channel_event(&mut self, root_id: &Arc<str>, generation: u64, event: ChannelEvent) {
+        let Some(root) = self.roots.get(root_id) else {
+            return;
+        };
+
+        if root.generation != generation {
+            return;
+        }
+
+        let topic = Arc::clone(&root.topic);
+
+        match event {
+            ChannelEvent::Joined { response } => self.joined(root_id, &response),
+            ChannelEvent::JoinError { response } => {
+                let reason = join_reason(&response);
+
+                self.fail_join(root_id, || MusubiError::Join {
+                    topic: topic.to_string(),
+                    reason: reason.clone(),
+                });
+            }
+            ChannelEvent::JoinTimeout => self.fail_join(root_id, || MusubiError::Timeout),
+            ChannelEvent::Message { event, payload } if event == EVENT_PATCH => {
+                self.patch(root_id, payload).await;
+            }
+            ChannelEvent::Message { event, .. } => {
+                tracing::debug!(%event, "ignoring an unknown channel event");
+            }
+            ChannelEvent::Close | ChannelEvent::Error { .. } => self.disconnected(root_id),
+            // `ChannelEvent` is `#[non_exhaustive]`; a variant this crate does
+            // not know cannot carry Musubi state.
+            _ => tracing::debug!("ignoring an unrecognized channel event"),
+        }
+    }
+
+    /// Handles a join ok — the first join **and** every rejoin.
+    ///
+    /// The server (re)started the page server and will push a fresh initial
+    /// patch, so the version goes back to `0` while the last-good tree stays in
+    /// place; the `replace ""` then swaps it out atomically (§9).
+    fn joined(&mut self, root_id: &Arc<str>, response: &Value) {
+        let mismatched = response
+            .get("root_id")
+            .and_then(Value::as_str)
+            .is_some_and(|reply_root_id| reply_root_id != &**root_id);
+
+        if mismatched {
+            tracing::error!(expected = %root_id, "join reply carried a different root id");
+            self.fail_join(root_id, || {
+                MusubiError::Protocol("join reply root_id did not match the mounted root")
+            });
+            return;
+        }
+
+        if let Some(root) = self.roots.get_mut(root_id) {
+            root.engine.soft_reset();
+        }
+    }
+
+    /// A join was rejected, timed out, or could not be sent.
+    ///
+    /// Pending mounts fail (each releasing the hold it took) and pending
+    /// commands are rejected. A **live** root is deliberately kept: a failed
+    /// re-join must not blank the consumer, and the transport keeps rejoining
+    /// (§9).
+    fn fail_join(&mut self, root_id: &Arc<str>, reason: impl Fn() -> MusubiError) {
+        if let Some(root) = self.roots.get_mut(root_id) {
+            root.recovering = false;
+            reject_commands(root, &reason);
+        }
+
+        self.fail_pending_mounts(root_id, reason);
+    }
+
+    /// Applies one `"patch"` push (§4.3).
+    async fn patch(&mut self, root_id: &Arc<str>, payload: Value) {
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return;
+        };
+        let awaiting_initial = root.engine.version() == 0;
+        // Whether anything is actually waiting on this envelope. Nothing is,
+        // after a rejoin of an already-published root — and there the initial
+        // check would otherwise reject every later envelope forever.
+        let stalled = root.pending_mounts.is_empty();
+
+        let envelope = match PatchEnvelope::decode(payload) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                self.reject_envelope(root_id, &error, awaiting_initial, stalled)
+                    .await;
+
+                return;
+            }
+        };
+
+        if envelope.root_id != **root_id {
+            tracing::warn!(
+                expected = %root_id,
+                actual = %envelope.root_id,
+                "dropping a patch envelope addressed to another root"
+            );
+            return;
+        }
+
+        match root.engine.apply(&envelope) {
+            Ok(state) => {
+                if let Err(error) = self.publish(root_id, &envelope, &state) {
+                    // A silent partial state is worse than a loud stall, so the
+                    // envelope fails and the last-good rendering is kept. The
+                    // waiting mounts learn it is codegen drift (§11) before the
+                    // root goes into recovery.
+                    tracing::error!(root_id = %root_id, %error, "root state did not match the generated types");
+                    self.fail_mounts_with(root_id, error);
+                    self.recover(root_id).await;
+                }
+            }
+            // §4.5: the initial envelope must be `0 -> 1`. Nothing is recovered
+            // by rejoining a root that never started, so the mount just fails —
+            // unless nothing was waiting, in which case only a rejoin can move
+            // the engine off version 0 again.
+            Err(MusubiError::Protocol(message)) => {
+                tracing::warn!(reason = message, "rejecting the initial patch envelope");
+                self.fail_pending_mounts(root_id, || MusubiError::Protocol(message));
+
+                if stalled {
+                    self.recover(root_id).await;
+                }
+            }
+            // A version gap or a failed op both mean client and server
+            // diverged; the tree is untouched, so recovery keeps rendering it.
+            Err(error) => {
+                tracing::warn!(%error, "patch envelope rejected; recovering the root");
+                self.recover(root_id).await;
+            }
+        }
+    }
+
+    /// Handles an undecodable `"patch"` payload: fail whatever was waiting on
+    /// it, and recover when the failure is version-mismatch-class.
+    async fn reject_envelope(
+        &mut self,
+        root_id: &Arc<str>,
+        error: &MusubiError,
+        awaiting_initial: bool,
+        stalled: bool,
+    ) {
+        tracing::warn!(%error, "rejecting a patch envelope");
+
+        if awaiting_initial {
+            // Nothing else will resolve a mount that was waiting for this
+            // envelope, so fail it rather than hang.
+            self.fail_pending_mounts(root_id, || {
+                MusubiError::Protocol("initial patch envelope was rejected")
+            });
+
+            if stalled {
+                self.recover(root_id).await;
+            }
+        } else if matches!(error, MusubiError::Patch(_)) {
+            // §4.1: an op outside the allowlist is a version-mismatch-class
+            // failure. A payload that is not an envelope at all is only
+            // dropped, as in the TypeScript client — the next envelope's
+            // version gap recovers it.
+            self.recover(root_id).await;
+        }
+    }
+
+    /// Publishes an accepted envelope: state first, then its push events, then
+    /// the mounts that were waiting for it (§4.3 steps 6–7).
+    ///
+    /// Returns [`MusubiError::Decode`] when the tree did not match the
+    /// generated types, which is codegen drift (§11).
+    fn publish(
+        &mut self,
+        root_id: &Arc<str>,
+        envelope: &PatchEnvelope,
+        state: &Value,
+    ) -> Result<()> {
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return Ok(());
+        };
+
+        // The root's own subtree is what failed, so the reported store is the
+        // root path even when a nested store node is the culprit.
+        root.sink
+            .publish(state)
+            .map_err(|source| MusubiError::Decode {
+                store_id: StoreId::root(),
+                source,
+            })?;
+
+        root.published = true;
+        root.recovering = false;
+
+        for event in &envelope.events {
+            root.sink
+                .dispatch_event(&event.store_id, &event.name, &event.payload);
+        }
+
+        let cell = Arc::clone(&root.cell);
+
+        // A mount whose future was dropped never receives the cell, so the hold
+        // it took at mount time has to be given back here — nothing else will.
+        let mut abandoned = 0;
+
+        for reply in root.pending_mounts.drain(..) {
+            if reply.send(Ok(Arc::clone(&cell))).is_err() {
+                abandoned += 1;
+            }
+        }
+
+        for _ in 0..abandoned {
+            self.release(root_id);
+        }
+
+        Ok(())
+    }
+
+    /// Fails every pending mount of one root, handing `error` itself to the
+    /// first of them.
+    ///
+    /// [`MusubiError`] is not `Clone` — `Decode` carries a `serde_json::Error`
+    /// — so the remaining mounts get the [`MusubiError::VersionMismatch`] that
+    /// describes the recovery which follows.
+    fn fail_mounts_with(&mut self, root_id: &Arc<str>, error: MusubiError) {
+        let error = Cell::new(Some(error));
+
+        self.fail_pending_mounts(root_id, || {
+            error.take().unwrap_or(MusubiError::VersionMismatch)
+        });
+    }
+
+    /// Version-mismatch recovery on a still-live channel (§9).
+    ///
+    /// Soft reset — the last-good tree, index and streams keep rendering — then
+    /// leave the diverged channel (which stops the server-side root) and join a
+    /// fresh one. A failed re-join is **not** fatal: the transport keeps
+    /// rejoining and the join-ok hook finishes the recovery.
+    async fn recover(&mut self, root_id: &Arc<str>) {
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return;
+        };
+
+        if root.recovering {
+            return;
+        }
+
+        root.recovering = true;
+        root.engine.soft_reset();
+        reject_commands(root, &|| MusubiError::VersionMismatch);
+
+        if let Some(channel) = root.channel.take() {
+            let _ = channel.leave();
+        }
+
+        self.fail_pending_mounts(root_id, || MusubiError::VersionMismatch);
+
+        if self.roots.contains_key(root_id) {
+            self.attach_and_join(root_id).await;
+        }
+    }
+
+    /// Transport drop or server-initiated close for one root's channel.
+    ///
+    /// The channel stays registered so the socket layer rejoins it; the
+    /// last-good state keeps rendering and `version = 0` makes the rejoin's
+    /// initial patch swap fresh state in atomically (§9).
+    fn disconnected(&mut self, root_id: &Arc<str>) {
+        if let Some(root) = self.roots.get_mut(root_id) {
+            // Whatever recovery was in flight is over; the rejoin's join-ok
+            // hook restarts it.
+            root.recovering = false;
+            root.engine.soft_reset();
+            reject_commands(root, &|| MusubiError::Disconnected);
+        }
+
+        self.fail_pending_mounts(root_id, || MusubiError::Disconnected);
+    }
+
+    /// Fails every mount waiting on this root, releasing the hold each took.
+    ///
+    /// A root left with no holder is torn down: nothing must rejoin an orphan.
+    fn fail_pending_mounts(&mut self, root_id: &Arc<str>, reason: impl Fn() -> MusubiError) {
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return;
+        };
+
+        let pending: Vec<_> = root.pending_mounts.drain(..).collect();
+
+        if pending.is_empty() {
+            return;
+        }
+
+        root.refcount = root.refcount.saturating_sub(pending.len());
+        let orphaned = root.refcount == 0;
+
+        for reply in pending {
+            let _ = reply.send(Err(reason()));
+        }
+
+        if orphaned {
+            self.teardown(root_id, reason);
+        }
+    }
+
+    /// Drops a root from the registry and leaves its channel.
+    fn teardown(&mut self, root_id: &Arc<str>, reason: impl Fn() -> MusubiError) {
+        let Some(mut root) = self.roots.remove(root_id) else {
+            return;
+        };
+
+        reject_commands(&mut root, &reason);
+
+        for reply in root.pending_mounts.drain(..) {
+            let _ = reply.send(Err(reason()));
+        }
+
+        root.sink.clear();
+
+        if let Some(channel) = root.channel.take() {
+            let _ = channel.leave();
+        }
+    }
+
+    /// Closes the connection for good: every root torn down, every pending
+    /// caller rejected with [`MusubiError::Disconnected`], socket closed.
+    async fn disconnect(&mut self, ack: oneshot::Sender<()>) {
+        self.closed = true;
+
+        for root_id in self.roots.keys().cloned().collect::<Vec<_>>() {
+            self.teardown(&root_id, || MusubiError::Disconnected);
+        }
+
+        let _ = self.socket.disconnect().await;
+        let _ = ack.send(());
+    }
+}
+
+/// One mounted root: its channel incarnation, its patch engine, and everything
+/// waiting on it.
+struct Root {
+    module: &'static str,
+    id: String,
+    /// `"<base_topic>:<root_id>"`, shared so routing one event costs no
+    /// allocation.
+    topic: Arc<str>,
+    params: Value,
+    /// Live [`Mounted`](crate::Mounted) handles **plus** mounts still awaiting
+    /// their initial patch.
+    refcount: usize,
+    /// Bumped per `attach_and_join`; stamps every forwarded channel event.
+    generation: u64,
+    channel: Option<Channel>,
+    engine: PatchEngine,
+    sink: Arc<dyn RootSink>,
+    cell: AnyCell,
+    /// Whether any state has ever been published. Aliasing mounts only wait
+    /// while it is `false`; afterwards the last-good snapshot is good enough.
+    published: bool,
+    /// Guards re-entry into version-mismatch recovery (§9).
+    recovering: bool,
+    pending_mounts: Vec<oneshot::Sender<Result<AnyCell>>>,
+    pending_commands: HashMap<u64, PendingCommand>,
+}
+
+/// A command whose push has not resolved yet.
+struct PendingCommand {
+    name: &'static str,
+    store_id: StoreId,
+    reply: oneshot::Sender<Result<Value>>,
+}
+
+/// Rejects every in-flight command of one root.
+///
+/// The bulk-rejection sets of §6.2: `Disconnected` on channel close/error,
+/// `Unmounted` on teardown, `VersionMismatch` on recovery, and the join failure
+/// reason on a failed (re)join.
+fn reject_commands(root: &mut Root, reason: &impl Fn() -> MusubiError) {
+    for (_, pending) in root.pending_commands.drain() {
+        let _ = pending.reply.send(Err(reason()));
+    }
+}
+
+/// Reads a command error response's `code`: the first string-valued field among
+/// `code`, `error` and `reason` (§6.2).
+fn error_code(response: &Value) -> Option<String> {
+    CODE_FIELDS
+        .iter()
+        .find_map(|field| response.get(field).and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+/// Reads a join error's reason, falling back to the whole response when the
+/// server did not send a `reason` string.
+fn join_reason(response: &Value) -> String {
+    response
+        .get("reason")
+        .and_then(Value::as_str)
+        .map_or_else(|| response.to_string(), str::to_owned)
+}

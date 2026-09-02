@@ -1,0 +1,27 @@
+[package]
+name = "musubi-client"
+description = "Runtime-agnostic Musubi client core: patch engine, stream materialization and the generated-code support types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "musubi_client"
+
+[dependencies]
+futures-channel.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+json-patch.workspace = true
+phoenix-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true

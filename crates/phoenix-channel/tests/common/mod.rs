@@ -1,0 +1,358 @@
+//! The scripted-transport rig both protocol test suites drive: a `LocalPool`
+//! pumped by hand, the three seams wired to it, and the server end of the mock
+//! socket.
+//!
+//! `crates/musubi-client/tests/connection.rs` includes this file directly
+//! (`#[path = "../../phoenix-channel/tests/common/mod.rs"]`) so the two suites
+//! cannot drift; each keeps only what is specific to its own layer.
+
+// Each suite uses a subset of the rig.
+#![allow(dead_code)]
+
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures_core::future::BoxFuture;
+use futures_executor::LocalPool;
+use futures_util::task::{LocalSpawnExt, noop_waker};
+use futures_util::{Sink, Stream, StreamExt};
+use phoenix_channel::{
+    Connector, Frame, Message, ReplyStatus, Socket, Spawner, Timer, TransportError,
+};
+use serde_json::{Value, json};
+
+/// Pending `ManualTimer` sleeps: how long each was for, and how to wake it.
+pub type Sleeps = Arc<Mutex<Vec<(Duration, futures_channel::oneshot::Sender<()>)>>>;
+
+/// Where a spawned future parks its output until a test collects it.
+pub type Slot<T> = Arc<Mutex<Option<T>>>;
+
+/// Anything a [`ServerEnd`] can drive forward — i.e. a [`Harness`].
+pub trait Pump {
+    fn pump(&mut self);
+}
+
+/// The three seams, already wired to one harness.
+pub struct Seams {
+    pub connector: MockConnector,
+    pub spawner: PumpSpawner,
+    pub timer: ManualTimer,
+}
+
+/// A `LocalPool` plus the three seams, wired to whatever `inner` the suite
+/// builds out of them (a `PhoenixSocket`, a `Connection`).
+pub struct Harness<T> {
+    pool: LocalPool,
+    spawned: Arc<Mutex<Vec<BoxFuture<'static, ()>>>>,
+    sleeps: Sleeps,
+    sockets: Arc<Mutex<VecDeque<MockSocket>>>,
+    urls: Arc<Mutex<Vec<String>>>,
+    pub inner: T,
+}
+
+impl<T> Harness<T> {
+    /// Builds the seams, hands them to `build`, and keeps both ends.
+    pub fn new_with(build: impl FnOnce(Seams) -> T) -> Self {
+        let spawned = Arc::new(Mutex::new(Vec::new()));
+        let sleeps: Sleeps = Arc::new(Mutex::new(Vec::new()));
+        let sockets = Arc::new(Mutex::new(VecDeque::new()));
+        let urls = Arc::new(Mutex::new(Vec::new()));
+
+        let inner = build(Seams {
+            connector: MockConnector {
+                sockets: Arc::clone(&sockets),
+                urls: Arc::clone(&urls),
+            },
+            spawner: PumpSpawner {
+                spawned: Arc::clone(&spawned),
+            },
+            timer: ManualTimer {
+                sleeps: Arc::clone(&sleeps),
+            },
+        });
+
+        Self {
+            pool: LocalPool::new(),
+            spawned,
+            sleeps,
+            sockets,
+            urls,
+            inner,
+        }
+    }
+
+    /// Hands the connector one more socket and keeps its server end.
+    pub fn queue_socket(&mut self) -> ServerEnd {
+        let (to_client, inbound) = mpsc::unbounded();
+        let (outbound, from_client) = mpsc::unbounded();
+
+        self.sockets
+            .lock()
+            .unwrap()
+            .push_back(MockSocket { inbound, outbound });
+
+        ServerEnd {
+            to_client: Some(to_client),
+            from_client,
+        }
+    }
+
+    /// Every URL the connector was asked for, in order.
+    pub fn connected_urls(&self) -> Vec<String> {
+        self.urls.lock().unwrap().clone()
+    }
+
+    /// Resolves every pending sleep of exactly `dur`, then settles.
+    pub fn fire(&mut self, dur: Duration) {
+        self.fire_where(|pending| pending == dur);
+    }
+
+    /// Resolves the reconnect/rejoin ladder, whose rungs are all sub-second.
+    pub fn fire_backoff(&mut self) {
+        self.fire_where(|pending| pending < Duration::from_secs(1));
+    }
+
+    pub fn fire_where(&mut self, matches: impl Fn(Duration) -> bool) {
+        let mut kept = Vec::new();
+
+        for (dur, waker) in self.sleeps.lock().unwrap().drain(..) {
+            if matches(dur) {
+                let _ = waker.send(());
+            } else {
+                kept.push((dur, waker));
+            }
+        }
+
+        self.sleeps.lock().unwrap().extend(kept);
+        self.pump();
+    }
+
+    pub fn spawn_capture<T2: Send + 'static>(
+        &mut self,
+        fut: impl Future<Output = T2> + Send + 'static,
+    ) -> Slot<T2> {
+        let slot = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&slot);
+
+        self.spawned.lock().unwrap().push(Box::pin(async move {
+            let value = fut.await;
+            *sink.lock().unwrap() = Some(value);
+        }));
+
+        slot
+    }
+
+    pub fn settle<T2>(&mut self, slot: Slot<T2>) -> T2 {
+        self.peek(&slot)
+            .expect("future should have resolved by now")
+    }
+
+    pub fn peek<T2>(&mut self, slot: &Slot<T2>) -> Option<T2> {
+        self.pump();
+
+        slot.lock().unwrap().take()
+    }
+}
+
+impl<T> Pump for Harness<T> {
+    /// Moves every spawned future into the pool and runs until nothing is
+    /// runnable and nothing new was spawned.
+    fn pump(&mut self) {
+        for _ in 0..64 {
+            let batch: Vec<BoxFuture<'static, ()>> =
+                self.spawned.lock().unwrap().drain(..).collect();
+            let idle = batch.is_empty();
+
+            for fut in batch {
+                self.pool
+                    .spawner()
+                    .spawn_local(fut)
+                    .expect("the local pool accepts tasks");
+            }
+
+            self.pool.run_until_stalled();
+
+            if idle && self.spawned.lock().unwrap().is_empty() {
+                return;
+            }
+        }
+
+        panic!("the harness never settled");
+    }
+}
+
+/// The server side of a [`MockSocket`].
+pub struct ServerEnd {
+    to_client: Option<UnboundedSender<Result<Frame, TransportError>>>,
+    from_client: UnboundedReceiver<Frame>,
+}
+
+impl ServerEnd {
+    /// Everything the client wrote since the last call, decoded.
+    pub fn sent(&mut self, harness: &mut impl Pump) -> Vec<Message> {
+        harness.pump();
+
+        let mut messages = Vec::new();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        while let Poll::Ready(Some(Frame::Text(text))) = self.from_client.poll_next_unpin(&mut cx) {
+            messages.push(Message::decode(&text).expect("client frames are five-tuples"));
+        }
+
+        messages
+    }
+
+    pub fn push(&self, message: Message) {
+        if let Some(to_client) = &self.to_client {
+            let _ = to_client.unbounded_send(Ok(message.encode()));
+        }
+    }
+
+    /// Pushes a server-initiated event on the channel `join` established.
+    pub fn push_event(&self, join: &Message, event: &str, payload: Value) {
+        self.push(Message {
+            join_ref: join.msg_ref.clone(),
+            msg_ref: None,
+            topic: join.topic.clone(),
+            event: event.to_owned(),
+            payload,
+        });
+    }
+
+    pub fn reply(&self, to: &Message, status: ReplyStatus, response: Value) {
+        self.push(Message {
+            join_ref: to.join_ref.clone(),
+            msg_ref: to.msg_ref.clone(),
+            topic: to.topic.clone(),
+            event: "phx_reply".to_owned(),
+            payload: json!({
+                "status": match status {
+                    ReplyStatus::Ok => "ok",
+                    ReplyStatus::Error => "error",
+                },
+                "response": response,
+            }),
+        });
+    }
+
+    /// Ends the inbound stream, which is how a transport reports a drop.
+    pub fn disconnect(&mut self) {
+        self.to_client = None;
+    }
+}
+
+/// A socket whose two halves are plain unbounded channels.
+pub struct MockSocket {
+    inbound: UnboundedReceiver<Result<Frame, TransportError>>,
+    outbound: UnboundedSender<Frame>,
+}
+
+impl Stream for MockSocket {
+    type Item = Result<Frame, TransportError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inbound.poll_next_unpin(cx)
+    }
+}
+
+impl Sink<Frame> for MockSocket {
+    type Error = TransportError;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Frame) -> Result<(), Self::Error> {
+        self.outbound
+            .unbounded_send(item)
+            .map_err(|_| TransportError::Closed)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Hands out pre-queued sockets and records the URLs it was asked for.
+pub struct MockConnector {
+    sockets: Arc<Mutex<VecDeque<MockSocket>>>,
+    urls: Arc<Mutex<Vec<String>>>,
+}
+
+impl Connector for MockConnector {
+    fn connect(&self, url: &str) -> BoxFuture<'static, Result<Box<dyn Socket>, TransportError>> {
+        self.urls.lock().unwrap().push(url.to_owned());
+        let next = self.sockets.lock().unwrap().pop_front();
+
+        Box::pin(async move {
+            match next {
+                Some(socket) => Ok(Box::new(socket) as Box<dyn Socket>),
+                None => Err(TransportError::connect("no socket queued")),
+            }
+        })
+    }
+}
+
+/// Parks every spawned future until the harness pumps it.
+pub struct PumpSpawner {
+    spawned: Arc<Mutex<Vec<BoxFuture<'static, ()>>>>,
+}
+
+impl Spawner for PumpSpawner {
+    fn spawn(&self, fut: BoxFuture<'static, ()>) {
+        self.spawned.lock().unwrap().push(fut);
+    }
+}
+
+/// A clock that only moves when a test says so.
+pub struct ManualTimer {
+    sleeps: Sleeps,
+}
+
+impl Timer for ManualTimer {
+    fn sleep(&self, dur: Duration) -> BoxFuture<'static, ()> {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        self.sleeps.lock().unwrap().push((dur, tx));
+
+        Box::pin(async move {
+            let _ = rx.await;
+        })
+    }
+}
+
+/// Everything a subscription has emitted so far.
+pub fn drain<S: Stream + Unpin>(stream: &mut S) -> Vec<S::Item> {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut drained = Vec::new();
+
+    while let Poll::Ready(Some(item)) = stream.poll_next_unpin(&mut cx) {
+        drained.push(item);
+    }
+
+    drained
+}
+
+/// Whether a subscription has ended, i.e. its sender was dropped.
+pub fn ended<S: Stream + Unpin>(stream: &mut S) -> bool {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    loop {
+        match stream.poll_next_unpin(&mut cx) {
+            Poll::Ready(Some(_)) => continue,
+            Poll::Ready(None) => return true,
+            Poll::Pending => return false,
+        }
+    }
+}
