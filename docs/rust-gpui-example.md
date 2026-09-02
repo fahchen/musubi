@@ -346,7 +346,7 @@ re-exports them.**
   and its `pub mod musubi` contains nothing but
   `pub use ::musubi_client::generated::{AsyncError, AsyncResult, Command, Event,
   NoReply, Store, StoreField, StoreId, UploadSlot};`
-  (`docs/rust-codegen.md` §4.5, `docs/rust-client.md` §8.5).
+  (`docs/rust-codegen.md` §4.5, `docs/rust-client.md` §8.2).
 - The traits are **not** sealed — a sealed trait cannot be implemented from a
   file generated into a consumer crate.
 - `:rust_codegen_runtime_path` (default `"musubi_client"`) selects the path, so

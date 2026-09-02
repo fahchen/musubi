@@ -9,7 +9,7 @@ specific milestone: every normative statement is derived from
 `docs/client-contract.md`, `docs/streams.md`, `docs/push-events.md`,
 `docs/uploads.md`, the `spec/decisions/BDR-*` records, and the current
 `packages/client/src/*.ts` behavior. Where those disagree, the runtime and
-`packages/client/src/types.ts` win (see "Known contract discrepancies").
+`packages/client/src/types.ts` win (see §14).
 
 The Rust client is a **second consumer of the same wire contract**, not a port
 of the TypeScript runtime. The TS client is dynamically typed at the edges
@@ -28,7 +28,7 @@ below.
 | Core crate (runtime-agnostic) | `musubi-client` (lib `musubi_client`) |
 | Tokio transport crate | `musubi-client-tokio` (lib `musubi_client_tokio`) |
 | Phoenix Channel protocol crate | `phoenix-channel` (lib `phoenix_channel`) — not Musubi-aware, see §3 |
-| Generated code crate-side helper module | `musubi_client::generated` (the shared runtime types the generated file re-exports; see §8.5) |
+| Generated code crate-side helper module | `musubi_client::generated` (the shared runtime types the generated file re-exports; see §8.2) |
 | Elixir compiler task | `mix compile.musubi_rust` (`Mix.Tasks.Compile.MusubiRust`), compiler atom `:musubi_rust` |
 | Elixir renderer | `Musubi.Codegen.Rust` + `Musubi.Codegen.Rust.TypeRenderer` |
 
@@ -917,13 +917,13 @@ One stamp, two renderers. Adding a second `@after_compile` per target was
 explicitly rejected: it doubles compile-time IO for identical data. The same
 commit fixed the stale `@type entry()` definitions (both omitted `:events`) and
 hoisted the `:__streams__` field filter to `Manifest.renderable_fields/1` so
-Rust does not re-derive a target-agnostic policy. The full file-by-file
-checklist is `docs/rust-codegen.md` §1.2.
+Rust does not re-derive a target-agnostic policy. The record of everything the
+rename touched is `docs/rust-codegen.md` §1.2.
 
 Note what this refactor does **not** add: `:attrs`. Mount params therefore stay
 untyped in v1 (§7).
 
-### 8.5 What the generated file depends on
+### 8.2 What the generated file depends on
 
 The generated bundle is type-only — no runtime logic, no registries, no store
 objects (same rule as the TS bundle). Its entire dependency surface is `serde`,
@@ -1202,28 +1202,20 @@ with that decision.
 
 ---
 
-## 14. Known contract discrepancies (fix upstream)
+## 14. Contract discrepancies (resolved)
 
-`docs/client-contract.md` is out of date on three points; `packages/client/src/types.ts`,
-`lib/musubi/page/patch_envelope.ex`, and `lib/musubi/async_result.ex` are
-correct and are what this design implements:
+Nothing open. `docs/client-contract.md` now agrees with the sources this design
+implements against — `packages/client/src/types.ts`,
+`lib/musubi/page/patch_envelope.ex`, and `lib/musubi/async_result.ex` — on the
+three points this section used to track: `upload_ops` on `PatchEnvelope` (with
+the "any of `ops` / `stream_ops` / `upload_ops` / `events` non-empty" emission
+rule), the `__musubi_async__: true` discriminator on the wire async shape, and
+the four-parameter `StoreDef<Module, Shape, Commands, Events = {}>` the Rust
+design assumes (`docs/rust-codegen.md` §4.6).
 
-1. The contract doc omits `upload_ops` from `PatchEnvelope`. The struct has it
-   (`lib/musubi/page/patch_envelope.ex`), and the emission rule is "any of
-   `ops`, `stream_ops`, `upload_ops`, `events` non-empty".
-2. The contract doc omits the `__musubi_async__: true` discriminator from the
-   wire async shape. It exists and is part of the detection predicate.
-3. The contract doc's "Generated TypeScript" section documents
-   `interface StoreDef<Module extends string, Shape, Commands>` (three
-   parameters), but `lib/musubi/codegen/type_script.ex:161` emits
-   `StoreDef<Module extends string, Shape, Commands, Events = {}>`. The Rust
-   design assumes the four-parameter form (`docs/rust-codegen.md` §4.6), so this
-   one must be fixed with the rest.
-
-One smaller item is still open: the `Mix.Tasks.Compile.MusubiTs` moduledoc
-documents a default output path of `musubi.ts` while `@default_output_path` is
-`musubi.d.ts`. (`AGENTS.md` and the two `@type entry()` definitions were listed
-here as well and were fixed with the §8.1 refactor.)
+The `Mix.Tasks.Compile.MusubiTs` moduledoc's stale `musubi.ts` default output
+path is fixed as well; `AGENTS.md` and the two `@type entry()` definitions were
+fixed earlier with the §8.1 refactor.
 
 ---
 

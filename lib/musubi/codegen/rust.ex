@@ -44,7 +44,7 @@ defmodule Musubi.Codegen.Rust do
   @default_runtime_path "musubi_client"
 
   # The re-export list is normative (docs/rust-codegen.md §4.5) and mirrored
-  # verbatim in docs/rust-client.md §8.5.
+  # verbatim in docs/rust-client.md §8.2.
   @runtime_types "AsyncError, AsyncResult, Command, Event, NoReply, Store, StoreField, StoreId, UploadSlot"
 
   # One level of Rust indentation, owned by the type renderer so the two

@@ -199,10 +199,19 @@ defmodule Musubi.MixProject do
   end
 
   defp skip_doc_reference?(reference) when is_binary(reference) do
-    Enum.any?(skipped_doc_references(), &String.starts_with?(reference, &1))
+    reference in verbatim_skipped_doc_references() or
+      Enum.any?(skipped_doc_references(), &String.starts_with?(reference, &1))
   end
 
   defp skip_doc_reference?(_other), do: false
+
+  # Bare project names, matched verbatim rather than by prefix: the CHANGELOG's
+  # historical "renamed from `Arbor` to `Musubi`" entry is prose, not a module
+  # reference, and prefix-matching `Musubi` would silence every real
+  # `Musubi.*` reference in the docs.
+  defp verbatim_skipped_doc_references do
+    ["Arbor", "Musubi"]
+  end
 
   defp skipped_doc_references do
     [

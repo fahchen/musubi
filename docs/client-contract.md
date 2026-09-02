@@ -233,6 +233,62 @@ type StreamOp =
       item_key: string
     }
 
+type UploadError = {
+  code:
+    | "too_large"
+    | "too_many_files"
+    | "not_accepted"
+    | "chunk_timeout"
+    | "external_failed"
+    | "preflight_rejected"
+    | (string & {})
+  message: string
+}
+
+type WireUploadConfig = {
+  accept: string[] | "any"
+  max_entries: number
+  max_file_size: number
+  chunk_size: number
+}
+
+type WireUploadEntry = {
+  ref: string
+  client_name: string
+  client_size: number
+  client_type: string
+  progress: number
+  status: "pending" | "uploading" | "success" | "error" | "cancelled"
+  errors: UploadError[]
+}
+
+type UploadOp =
+  | { op: "config"; upload: string; store_id: StoreId; config: WireUploadConfig }
+  | {
+      op: "add"
+      upload: string
+      store_id: StoreId
+      ref: string
+      entry: WireUploadEntry
+    }
+  | {
+      op: "progress"
+      upload: string
+      store_id: StoreId
+      ref: string
+      progress: number
+    }
+  | { op: "complete"; upload: string; store_id: StoreId; ref: string }
+  | {
+      op: "error"
+      upload: string
+      store_id: StoreId
+      ref?: string
+      error: UploadError
+    }
+  | { op: "cancel"; upload: string; store_id: StoreId; ref: string }
+  | { op: "reset"; upload: string; store_id: StoreId }
+
 type PushEvent = {
   store_id: string[]
   name: string
@@ -245,6 +301,7 @@ type PatchEnvelope = {
   version: number
   ops: JsonPatchOp[]
   stream_ops: StreamOp[]
+  upload_ops: UploadOp[]
   events: PushEvent[]
 }
 
@@ -261,12 +318,17 @@ Envelope rules:
 
 - the initial envelope carries `base_version: 0` and `version: 1`
 - each later envelope must apply to the client's current version
-- idle render cycles emit no envelope
+- an envelope is emitted when **any** of `ops`, `stream_ops`, `upload_ops`, or
+  `events` is non-empty; idle render cycles (all four empty) emit no envelope
 - reconnect creates a fresh page runtime and fresh version sequence
 - each channel carries one root; the patch envelope still includes `root_id`
   (matching that channel's root) for envelope symmetry
 - stream placement paths contain `WireStreamMarker` objects in `ops`
 - stream contents move through `stream_ops`
+- `upload_ops` carries upload transfer state (config/add/progress/complete/
+  error/cancel/reset), each tagged with the owning store's `store_id`. It is
+  independent of `stream_ops` and applied in array order; the transfer protocol
+  around it (tokens, chunking, progress coalescing) is in `docs/uploads.md`
 - `events` carries transient push events (BDR-0032), each tagged with the
   emitting store's `store_id` and dispatched once on receipt via
   `store.handleEvent(name, cb)` per `(store_id, name)`; they own no
@@ -286,10 +348,25 @@ type WireAsyncError =
   | { kind: "exit"; value: unknown }
 
 type WireAsyncResult<T = unknown> =
-  | { status: "loading"; result: T | null; reason: null }
-  | { status: "ok"; result: T; reason: null }
-  | { status: "failed"; result: T | null; reason: WireAsyncError | unknown }
+  | {
+      __musubi_async__: true
+      status: "loading"
+      result: T | null
+      reason: null
+    }
+  | { __musubi_async__: true; status: "ok"; result: T; reason: null }
+  | {
+      __musubi_async__: true
+      status: "failed"
+      result: T | null
+      reason: WireAsyncError | unknown
+    }
 ```
+
+`__musubi_async__: true` is the runtime discriminator the serializer adds
+(`Musubi.AsyncResult`'s `Musubi.Wire` impl): it is what the client detects an
+async value by, so an ordinary map that happens to carry `status` / `result` /
+`reason` keys is never mistaken for one.
 
 The public client normalizes this to:
 
@@ -308,6 +385,8 @@ Normalization rules:
 
 - `result` becomes `data`
 - `reason` becomes `error`
+- `__musubi_async__` is consumed by the detection predicate and dropped — it
+  never appears on the public `AsyncResult<T>`
 - `AsyncResult.of(T)` projects to `AsyncResult<T>`
 - `AsyncResult.of(stream(T))` projects to `AsyncResult<T[]>`; on the wire the
   async `result` is the stream marker, and item content still arrives through
@@ -417,11 +496,12 @@ declare namespace Musubi {
 
   const Type: unique symbol
 
-  interface StoreDef<Module extends string, Shape, Commands> {
+  interface StoreDef<Module extends string, Shape, Commands, Events = {}> {
     readonly [Type]: {
       module: Module
       shape: Shape
       commands: Commands
+      events: Events
     }
   }
 
@@ -451,11 +531,23 @@ declare namespace Musubi {
           payload: {}
           reply: { order_id: string } | { error: string }
         }
+      },
+      {
+        checkout_failed: {
+          payload: { message: string }
+        }
       }
     >
   }
 }
 ```
+
+The fourth slot is the store's declared push events (BDR-0032), keyed by event
+name with a `payload` shape each — the source `EventName<M, R>` /
+`EventPayload<M, K, R>` (and therefore `handleEvent`) narrow against. It
+defaults to `{}`, so a store that declares no `event` blocks is emitted with an
+empty literal in that position and `handleEvent` accepts no name. Events carry
+no `reply` counterpart: they are fire-and-forget.
 
 Marker rules:
 

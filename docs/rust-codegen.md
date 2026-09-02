@@ -66,64 +66,55 @@ is not.
 TS-specific. The new siblings are `Musubi.Codegen.Rust` and
 `Musubi.Codegen.Rust.TypeRenderer`.
 
-### 1.2 Migration note
+### 1.2 What the rename changed
 
-This landed as the preparatory commit ahead of the Rust renderer; it is kept
-here as the migration record. Both renamed modules are internal and pre-1.0:
+The rename landed as one standalone preparatory commit ahead of the Rust
+renderer, with **no deprecation shim** — both renamed modules are internal and
+pre-1.0. `Musubi.Codegen.TypeScript.Manifest` was `@moduledoc false` and listed
+in `mix.exs` `skipped_doc_references/0`; `Musubi.Plugin.TypeScript` was covered
+by the `"Musubi.Plugin."` prefix in the same list, absent from `docs_modules/0`,
+and referenced only from `Musubi.DSL.State.state/1`, so no consumer ever named
+either.
 
-- `Musubi.Codegen.TypeScript.Manifest` is `@moduledoc false` and is listed in
-  `mix.exs` `skipped_doc_references/0`.
-- `Musubi.Plugin.TypeScript` is covered by the `"Musubi.Plugin."` prefix in the
-  same list, is not in `docs_modules/0`, and is only ever referenced from
-  `Musubi.DSL.State.state/1` — consumers never name it.
+Beyond the two module names and the `@subdir` / process-key constants, the
+commit touched four non-test sites a naive grep misses, and they are the places
+to check first if the naming ever drifts again:
 
-The rename therefore landed as one standalone preparatory commit with **no
-deprecation shim**:
+- `lib/musubi/plugin/type_script.ex` moved to `lib/musubi/plugin/codegen.ex`,
+  carrying its module name, moduledoc, and the `@after_compile` literal.
+- The "Discovery" section of the `Mix.Tasks.Compile.MusubiTs` moduledoc, which
+  spells the manifest path and the plugin module out in prose.
+- The `@typedoc` on the manifest entry type in
+  `lib/musubi/codegen/type_script.ex`.
+- `.github/copilot-instructions.md`.
 
-1. Rename the two modules and the `@subdir` / process-key constants.
-2. Update the three test files that reference them
-   (`test/musubi/codegen/type_script/manifest_test.exs`,
-   `test/musubi/codegen/type_script_test.exs`,
-   `test/mix/tasks/compile/musubi_ts_test.exs`) plus the fixture comment in
-   `test/support/typespec_probe.ex`, and these four non-test sites the naive
-   grep misses:
-   - `lib/musubi/plugin/type_script.ex` itself — module name, moduledoc, and
-     the `@after_compile` literal; the file also moves to
-     `lib/musubi/plugin/codegen.ex`.
-   - `lib/mix/tasks/compile/musubi_ts.ex` "Discovery" moduledoc section
-     (`musubi-codegen-ts` path + `Musubi.Plugin.TypeScript`).
-   - `lib/musubi/codegen/type_script.ex:57` `@typedoc`.
-   - `.github/copilot-instructions.md:47` (`Musubi.Plugin.TypeScript`,
-     `Musubi.Codegen.TypeScript.Manifest`, `musubi-codegen-ts`).
-3. Update `mix.exs` `skipped_doc_references/0`
-   (`"Musubi.Codegen.TypeScript.Manifest"` → `"Musubi.Codegen.Manifest"`).
-4. Update the two `AGENTS.md` codegen bullets (which are separately stale — they
-   still describe the pre-`StoreDef` `export namespace` output shape and
-   `priv/codegen/ts/musubi.ts`).
-5. Fix the two stale `@type entry()` definitions (`manifest.ex`,
-   `type_script.ex`) that omit `:events` while you are in the file.
+`mix.exs` `skipped_doc_references/0` moved to `"Musubi.Codegen.Manifest"`, the
+two `AGENTS.md` codegen bullets were rewritten onto the current `StoreDef`
+output shape and the `priv/codegen/ts/musubi.d.ts` default, and the two stale
+`@type entry()` definitions (`manifest.ex`, `type_script.ex`) that omitted
+`:events` were fixed in the same pass.
 
-Consumer impact: the old `_build/<env>/musubi-codegen-ts/` directory becomes an
+Consumer impact: the old `_build/<env>/musubi-codegen-ts/` directory became an
 orphan. Nothing reads it and the TypeScript compiler's `manifests/0` callback
 no longer points at it, but `mix clean` does **not** remove it — `clean/0`
 `rm_rf`s `Manifest.target_dir()`, which after the rename is the *new*
-directory. The orphan survives until the next `_build` wipe. No code change is
-required in any consumer app; the next `mix compile` restamps into
-`musubi-codegen/` because `@after_compile` fires on recompilation of every
-`state do` module (which the plugin change itself forces).
+directory. The orphan survives until the next `_build` wipe. No consumer app
+needed a code change; the next `mix compile` restamps into `musubi-codegen/`
+because `@after_compile` fires on recompilation of every `state do` module
+(which the plugin change itself forces).
 
-Two additional generalizations landed in the same commit, because both targets
-need them and neither is TS-specific:
+Two target-agnostic generalizations landed in the same commit, and both are
+normative for any future renderer:
 
-- **`:__streams__` filtering.** `Musubi.Codegen.TypeScript.filter_renderable_fields/1`
-  rejects the internal `:__streams__` field. This is a target-agnostic policy —
-  hoist it to `Musubi.Codegen.Manifest.renderable_fields/1` so the Rust
-  renderer does not re-derive the exclusion list.
-- **`stamp/3` alias expansion.** `Manifest.stamp/3` builds the same 7-key map
-  *without* alias expansion because it has no `Macro.Env`. Document it as
-  test/manual-only in the `@doc false`, or accept an optional env. Leaving it
-  undocumented invites the Rust renderer to be written against single-segment
-  aliases that `__after_compile__/2` never produces.
+- **`:__streams__` filtering** lives on the shared layer as
+  `Musubi.Codegen.Manifest.renderable_fields/1`, not in a renderer. Every
+  renderer calls it rather than re-deriving the exclusion list.
+- **`stamp/3` performs no alias expansion.** It builds the same 7-key map from
+  module reflection alone, having no `Macro.Env`, so entries it writes can
+  carry single-segment `{:__aliases__, _, [:Child]}` nodes the real compile
+  path never produces. Its `@doc false` says so; renderers are written against
+  the expanded form `collect/1` emits, never against what `stamp/3` happens to
+  persist.
 
 ### 1.3 What the Rust target consumes
 
@@ -174,6 +165,7 @@ def run(argv) do
     existing == {:ok, contents} -> :noop
     entries == [] and existing == {:error, :enoent} -> :noop
     check? -> {:error, [drift_diagnostic(output_path)]}
+    entries == [] and match?({:ok, _bundle}, existing) -> warn_and_keep(...); {:ok, []}
     true -> write_bundle!(contents, output_path); {:ok, []}
   end
 end
@@ -186,7 +178,9 @@ Byte-for-byte the same shape as the TS task, including clause order:
    repo emits no bundle (its only `state do` modules live under `test/`, which
    `eligible_source?/1` skips) and why `--check` passes here.
 3. `--check` with any difference ⇒ `{:error, [diagnostic]}`, no write.
-4. Otherwise write.
+4. Empty manifest **and** an existing bundle ⇒ keep the file, warn, `{:ok, []}`.
+   See the empty-manifest guard below.
+5. Otherwise write.
 
 `drift_diagnostic/1`:
 
@@ -208,15 +202,27 @@ Byte-for-byte the same shape as the TS task, including clause order:
 `manifests/0` return the same path and both `clean/0` delete it. That is
 harmless (`rm_rf` on a missing dir is `:ok`, and either compiler restamps
 nothing — stamping is owned by `@after_compile`, not by the compilers), but it
-does mean `mix compile.musubi_rust --check` run after `mix clean` without a
-recompile sees an **empty manifest**. Walk the decision table for that case: if
-a committed bundle exists on disk, `existing == {:ok, contents}` is false
-(`render([])` is not the full bundle) and the empty-manifest clause does not
-apply either (the file exists), so `--check` reports **drift** — a spurious CI
-failure if a job runs `mix clean` before `mix compile.musubi_rust --check`.
-Only the no-bundle case (Musubi's own repo) returns `:noop`. Identical to
-today's TS behavior; not a regression, but document the ordering requirement:
-`--check` must run after a compile, not after a clean.
+does mean a run after `mix clean` (or after any `_build` wipe) without a
+recompile sees an **empty manifest** while a committed bundle still sits on
+disk. Both compilers handle that case identically:
+
+- `--check` reports **drift** (clause 3): `existing == {:ok, contents}` is false
+  because `render([])` is not the full bundle, and clause 2 does not apply
+  because the file exists. Only the no-bundle case (Musubi's own repo) returns
+  `:noop`. So the ordering requirement stands — `--check` must run after a
+  compile, not after a clean, or CI fails spuriously.
+- A plain run (clause 4) **refuses to write**. Without the guard, `mix compile`
+  after a manifest wipe would silently replace both committed bundles with their
+  empty renders (`interface Stores {}` / prelude-only), because no `state do`
+  module recompiles, so nothing restamps and `Manifest.list/0` legitimately
+  returns `[]`. The empty manifest is indistinguishable from "every store was
+  deleted" at this layer, and only one of the two readings is recoverable from,
+  so the compiler keeps the file, emits a `Mix.shell/0` warning naming the cause
+  and the remedy (`mix compile --force` restamps), and returns `{:ok, []}` —
+  **not** `:error`: a missing manifest is not a reason to fail a consumer's
+  build. The genuine all-stores-deleted case still converges, one step later:
+  deleting a store recompiles the project, which restamps, and the next run
+  writes the empty bundle truthfully.
 
 ### 2.3 Configuration
 
@@ -733,7 +739,7 @@ pub use ::musubi_client::generated::{
 };
 ```
 
-That list is normative and is mirrored verbatim in `docs/rust-client.md` §8.5.
+That list is normative and is mirrored verbatim in `docs/rust-client.md` §8.2.
 The crate-side definitions (`docs/rust-client.md` §6.1, §7) are the single
 source of truth for their shapes; reproduced here only for the reader:
 
@@ -989,16 +995,16 @@ Anchors (see `docs/client-contract.md`, `packages/client/src/types.ts`,
 
 ---
 
-## 6. Test plan
+## 6. Test coverage
 
-Mirrors the four existing TS test files one-for-one.
+Four suites, mirroring the TS ones file-for-file.
 
 ### 6.1 `test/musubi/codegen/rust/type_renderer_test.exs` (`async: true`)
 
-Pure table test, cloned from
-`test/musubi/codegen/type_script/type_renderer_test.exs`, same `describe`
-grouping: `primitives / literals / containers / unions / module references /
-fallback`, plus two new groups `hoisting` and `identifiers`.
+A pure table test over `Musubi.Codegen.Rust.TypeRenderer`, grouped
+`primitives / literals / containers / unions / module references / hoisting /
+identifiers` — the TS renderer's groups plus the two Rust needs. Simple rows
+assert the rendered string:
 
 ```elixir
 assert render!(quote(do: String.t())) == "String"
@@ -1007,106 +1013,114 @@ assert render!(quote(do: String.t() | nil)) == "Option<String>"
 assert render!(quote(do: stream(String.t()))) == "Vec<String>"
 ```
 
-Hoisting cases assert the returned pair — the rendered reference *and* the
-accumulated declarations:
+Hoisting rows assert the returned pair — the rendered reference *and* the
+accumulated declarations — and cover depth-first nesting, name-transparent
+wrappers (`stream`, `AsyncResult`), siblings descending from the enclosing name
+rather than from each other, and the §3.5 numeric-suffix collision policy in
+allocation order. Every §3.4 union branch has a row: nil-stripping, atom enums
+with per-variant renames, internally tagged maps (including which key wins as
+discriminant and which candidate keys disqualify), literal collapse, and the
+`serde_json::Value` total fallback. `depth` and the `:root_module` override are
+exercised on the cross-module `super::`-chain rows.
 
-```elixir
-{rendered, ctx} = TypeRenderer.render(quote(do: %{street: String.t()}), ctx("CartState", :address))
-assert rendered == "CartStateAddress"
-assert [%{name: "CartStateAddress", code: code}] = Hoist.declarations(ctx)
-assert code =~ "pub struct CartStateAddress"
-```
-
-Plus explicit collision cases (two distinct anonymous maps claiming the same
-base name ⇒ `…2`, the single collision policy per §3.5) and every §3.4 union
-branch (nil-strip, atom enum, internally tagged with inline struct variants,
-literal collapse, and the `serde_json::Value` total fallback).
-
-`Musubi.Codegen.Rust.Names` gets its own table test for keyword escaping
-(`type` ⇒ `r#type` with no rename; `self` ⇒ `self_` with
-`#[serde(rename = "self")]`), snake/pascal casing, and sanitization.
-
-Module `@doc` examples are doctested per AGENTS.md, mirroring the TS renderer's
-four `iex>` examples.
+`test/musubi/codegen/rust/names_test.exs` is the companion table test for
+`Musubi.Codegen.Rust.Names`: raw-ident keyword escaping (`type` ⇒ `r#type`, no
+rename; non-raw-able keywords ⇒ trailing underscore plus
+`#[serde(rename = ...)]`), variant PascalCasing, module/struct path derivation,
+`hoisted_name/2`, and `allocate/2`. Module `@doc` examples are doctested per
+AGENTS.md.
 
 ### 6.2 `test/musubi/codegen/rust_test.exs` (`async: true`)
 
-Golden-string bundle test, cloned from
-`test/musubi/codegen/type_script_test.exs`:
+The golden-string bundle test. Expected output is built from a `@preamble`
+heredoc (plus a `@merged_preamble` variant for the `Musubi.*` probe fixtures,
+whose own top-level `pub mod musubi` merges with the prelude) and compared
+through a `normalize/1` that strips leading whitespace per line, so assertions
+bind content and ordering rather than indentation. Entries come from the
+`__env__/0` fixture trick — `Manifest.collect(module.__env__())` — so real alias
+expansion is exercised with zero disk I/O.
 
-- `@preamble` heredoc holding the full expected prelude.
-- `normalize/1` stripping leading whitespace per line so assertions bind
-  content + ordering rather than indentation.
-- Entries built via the existing `__env__/0` fixture trick —
-  `Manifest.collect(module.__env__()) |> Map.take([:kind, :fields, :commands, :events, :uploads])`
-  — exercising real alias expansion with zero disk I/O.
-- Order independence: `render(entries) == render(Enum.reverse(entries))`.
-- `:root_module` override.
-- Negative assertions: no `use ` at file scope (the only `pub use` is inside
-  `pub mod musubi`), no `crate::` (v1 uses `super::` chains), **no `rename_all`
-  anywhere** — every atom-literal variant carries an explicit
-  `#[serde(rename = "...")]` per §3.4, and the prelude no longer defines types —
-  no `deny_unknown_fields`, no `StreamField`, no `STORES`.
-- `assert_raise ArgumentError, ~r/collides with a state field/` for the upload
-  collision, from a hand-rolled entry tuple.
-- New: `assert_raise ArgumentError, ~r/collide.*rust module path/` for the
-  §4.2 path-collision guard.
+Covered: the empty render (header + prelude only), a `Musubi.State` entry as a
+bare struct with hoisted types sorted by name, a leaf state module that is both
+a struct and a same-named module, a `Musubi.Store` entry as its own module
+carrying marker + `Store` impl + `State`, stream/async/child-store projection,
+`Module.t()` on a store resolving to its `State` rather than the marker,
+internally tagged enums, commands (empty payload as a braced struct, empty reply
+as `musubi::NoReply`, and a declared `reply do` wired through `type Reply`),
+push events (a `<Name>Payload` struct per event implementing `Event`), and
+uploads (inert `UploadSlot` fields, plus `assert_raise ArgumentError` on a name
+colliding with a state field).
 
-The existing fixtures in `test/support/typespec_probe.ex` cover most of the
-hard cases unchanged: `stream/2` with a module item, an inline
-`AsyncResult.of(stream(...))`, a union of two discriminated maps
-(`%{type: :active} | %{type: :paused, value: integer()}` → internally tagged
-enum), `Child.state()` (→ `StoreField<...>`), `list(String.t())`, a
-single-segment alias exercising expansion, an upload fixture, a command fixture
-with an empty-payload command, and an event fixture. Two fixtures must be added:
+Bundle invariants have their own group: input order doesn't change output,
+duplicate entries for one module render once, the only `use` is the prelude
+re-export, no `crate::`-absolute paths, no container renames / strict structs /
+TS-only markers, and every atom-literal variant carries an explicit
+`#[serde(rename = "...")]` (§3.4 — there is no `rename_all` anywhere). The
+`render/2` options group pins `:root_module` and `:runtime_path` retargeting,
+and a module-path-collision group pins the §4.2 guard (two modules underscoring
+to one path, an intermediate segment colliding with another module's own
+segment, a keyword segment emitted as a raw identifier, and a keyword that
+cannot be raw ⇒ raise).
 
-- A struct with a `:type`-keyword field name and an inline nested block, to pin
-  raw-ident and hoisting output (a case Rust needs and TS does not).
-- **A command with a non-empty `reply do` block.** No current fixture declares
-  one — `TypespecProbeWithCommand` has `command :select` (payload only) and
-  `command :refresh` (neither) — so without it the golden bundle never
-  exercises `CheckoutReply` or `type Reply`, which is one of the two places
-  Rust deliberately diverges from TS (`never` vs `NoReply`).
+Two formatting assertions back §4.1's "rustfmt-stable by construction" claim:
+no emitted `pub` line exceeds rustfmt's 100-column `max_width`, and — where
+`rustfmt` is on `PATH` — the rendered bundle survives `rustfmt --edition 2024
+--check` with no diff.
 
-No fixture uses the `stream_async` macro, and none is needed:
+The fixtures in `test/support/typespec_probe.ex` carry the hard cases:
+`stream/2` with a module item, an inline `AsyncResult.of(stream(...))`, a union
+of two discriminated maps, `Child.state()`, `list(String.t())`, a single-segment
+alias exercising expansion, an upload, a `:type`-keyword field name with an
+inline nested block, and command fixtures with and without a `reply do` block —
+the last of these being one of the two places Rust deliberately diverges from TS
+(`NoReply` vs `never`).
+
+No fixture uses the `stream_async` macro and none is needed:
 `lib/musubi/dsl/schema.ex` `async_stream_type/2` expands it to the same
 `Musubi.AsyncResult.of(stream(...))` AST the existing fixture writes by hand, so
-the path is covered by AST equivalence rather than by a second fixture.
+the path is covered by AST equivalence.
 
 ### 6.3 `test/mix/tasks/compile/musubi_rust_test.exs` (`async: false`)
 
-Cloned from `test/mix/tasks/compile/musubi_ts_test.exs`, `async: false` for the
-same reason (process-dict manifest dir + app-env output path are global). Cases:
-empty-manifest `:noop` in both modes with the file not created, fresh write,
-idempotent `:noop`, stale rewrite, `--check` drift diagnostic (asserting
-`severity`, `compiler_name`, `file`, and that the stale file is untouched),
-`--check` match ⇒ `:noop`, `manifests/0`, `clean/0`.
+The Mix-task integration test: a fresh write covering every stamped module,
+`--check` drift under the `musubi_rust` compiler name (asserting `severity`,
+`compiler_name`, `file`, and that the stale file is untouched), and the
+empty-manifest guard of §2.2. The `:noop` / drift / `manifests/0` / `clean/0`
+plumbing itself lives in `Musubi.Codegen.Compiler` and is covered once, in
+`test/mix/tasks/compile/musubi_ts_test.exs`.
 
-Per the global rule on runtime config, this test does **no** `Application.put_env`
-— it reads `Application.fetch_env!(:musubi, :rust_codegen_output_path)`, whose
-value lives in `config/test.exs` (§2.4), exactly as
-`test/mix/tasks/compile/musubi_ts_test.exs` does today. The `async: false` is
-needed only for the process-dict manifest dir.
+`async: false` is required only because the manifest target dir is a process-dict
+override and the output path is app env — both global. Per the global rule on
+runtime config, neither task test calls `Application.put_env`: both read
+`Application.fetch_env!(:musubi, :<target>_codegen_output_path)`, whose value
+lives in `config/test.exs` (§2.4). **Keep it that way** — a test that mutates
+those keys makes every sibling suite order-dependent.
 
 ### 6.4 Manifest reuse test
 
-Add to `test/musubi/codegen/manifest_test.exs` (renamed from
-`type_script/manifest_test.exs`) one case proving the single-stamp design: drive
+`test/musubi/codegen/manifest_test.exs` (renamed from
+`type_script/manifest_test.exs`) carries the single-stamp regression: drive
 `__after_compile__/2` once against a tmp target, then assert that both
 `Musubi.Codegen.TypeScript.render(Manifest.list(target))` and
 `Musubi.Codegen.Rust.render(Manifest.list(target))` produce non-empty output
-from that one `state.term`. This is the regression that catches anyone
-re-introducing a per-target stamp.
+from that one `state.term`. That is what catches anyone re-introducing a
+per-target stamp.
 
-The rename otherwise leaves the manifest suite's coverage intact: idempotent
+The rename left the rest of the manifest suite's coverage intact: idempotent
 stamping, sorted `list/1`, corrupt-term skipping, missing-dir `[]` / `:ok`,
-orphan-module sweeping, both `test/` skip variants, alias expansion.
+orphan-module sweeping, both `test/` skip variants, `renderable_fields/1`, and
+alias expansion.
 
-### 6.5 Compilation smoke test (deferred, tagged)
+### 6.5 Compilation smoke test (still deferred)
 
-The strongest test is "does `cargo build` accept the bundle". Gate it behind
-`@tag :rust` excluded by default in `test_helper.exs`, requiring `cargo` and a
-`serde`/`serde_json` fixture crate. Not part of v1 CI — see open questions.
+The strongest test would be "does `cargo build` accept the bundle", against a
+fixture crate carrying `serde` / `serde_json`. It is **not** implemented: it
+would need `cargo` on the test machine, so it belongs behind a `@tag :rust`
+excluded by default in `test_helper.exs`, and it is not part of CI. The
+rustfmt check in §6.2 and the crate-side
+`crates/musubi-client/tests/generated.rs` (which exercises the re-exported
+runtime types the bundle depends on) are partial substitutes, not replacements —
+neither type-checks generated code.
 
 ---
 
@@ -1167,11 +1181,16 @@ Scope is deliberately capped at "what `:musubi_ts` does, for Rust".
 
 ---
 
-## 9. Implementation order (as landed)
+## 9. Landing order (historical)
 
-1. Rename commit: `Musubi.Plugin.Codegen`, `Musubi.Codegen.Manifest`, subdir,
-   process key, `renderable_fields/1` hoist, stale `@type entry()` fixes,
-   `AGENTS.md` codegen bullets. TS behavior unchanged; TS tests updated in place.
+The feature shipped in seven steps, recorded here only because other documents
+cite them by number (`docs/rust-gpui-example.md` §7 keys its D2 milestone to
+steps 2–6). Nothing here is outstanding.
+
+1. Rename commit (§1.2): `Musubi.Plugin.Codegen`, `Musubi.Codegen.Manifest`,
+   subdir, process key, `renderable_fields/1` hoist, stale `@type entry()`
+   fixes, `AGENTS.md` codegen bullets. TS behavior unchanged; TS tests updated
+   in place.
 2. `Musubi.Codegen.Rust.Names` + its table test.
 3. `Musubi.Codegen.Rust.TypeRenderer` + its table test (hoisting context, all
    §3 rows).

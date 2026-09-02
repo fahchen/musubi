@@ -33,9 +33,10 @@ defmodule Mix.Tasks.Compile.MusubiTs do
 
   ## Configuration
 
-  Output path defaults to `priv/codegen/ts/musubi.ts`. Override per-app:
+  Output path defaults to `priv/codegen/ts/musubi.d.ts` (the bundle is an
+  ambient declaration file). Override per-app:
 
-      config :musubi, :ts_codegen_output_path, "priv/codegen/ts/musubi.ts"
+      config :musubi, :ts_codegen_output_path, "assets/js/musubi.d.ts"
 
   ## Discovery
 
