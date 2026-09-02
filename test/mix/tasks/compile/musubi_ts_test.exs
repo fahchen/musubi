@@ -6,7 +6,7 @@ defmodule Mix.Tasks.Compile.MusubiTsTest do
   use ExUnit.Case, async: false
 
   alias Mix.Tasks.Compile.MusubiTs
-  alias Musubi.Codegen.TypeScript.Manifest
+  alias Musubi.Codegen.Manifest
   alias Musubi.TestSupport.TypespecProbe
   alias Musubi.TestSupport.TypespecProbeChild
 
@@ -18,7 +18,7 @@ defmodule Mix.Tasks.Compile.MusubiTsTest do
       )
 
     File.mkdir_p!(target)
-    Process.put(:__musubi_ts_target_dir__, target)
+    Process.put(:__musubi_codegen_target_dir__, target)
 
     output_path = Application.fetch_env!(:musubi, :ts_codegen_output_path)
     File.mkdir_p!(Path.dirname(output_path))
@@ -85,10 +85,15 @@ defmodule Mix.Tasks.Compile.MusubiTsTest do
          %{output_path: output_path} do
       File.write!(output_path, "// stale\n")
 
-      assert {:error, [diagnostic]} = MusubiTs.run(["--check"])
-      assert diagnostic.severity == :error
-      assert diagnostic.compiler_name == "musubi_ts"
-      assert diagnostic.file == output_path
+      assert {:error,
+              [
+                %Mix.Task.Compiler.Diagnostic{
+                  severity: :error,
+                  compiler_name: "musubi_ts",
+                  file: ^output_path
+                }
+              ]} = MusubiTs.run(["--check"])
+
       assert File.read!(output_path) == "// stale\n"
     end
 

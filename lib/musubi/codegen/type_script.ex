@@ -49,17 +49,17 @@ defmodule Musubi.Codegen.TypeScript do
   | `Musubi.AsyncResult.of(T)`       | `<Root>.AsyncField<T>`                  |
   """
 
+  alias Musubi.Codegen.Manifest
   alias Musubi.Codegen.TypeScript.TypeRenderer
 
   @default_root "Musubi"
 
   @typedoc """
-  An entry produced by `Musubi.Codegen.TypeScript.Manifest.list/0` and
-  consumed by `render/1`. Pre-loaded reflection data — `render/1` performs no
+  An entry produced by `Musubi.Codegen.Manifest.list/0` and consumed by
+  `render/1`. Pre-loaded reflection data — `render/1` performs no
   module-callback lookups itself.
   """
-  @type entry() ::
-          {module(), %{kind: :state | :store, fields: list(), commands: list(), uploads: list()}}
+  @type entry() :: Manifest.entry()
 
   @doc """
   Renders one TypeScript bundle covering every `{module, data}` entry in
@@ -515,14 +515,10 @@ defmodule Musubi.Codegen.TypeScript do
 
   defp render_state_fields(fields, indent, root) do
     fields
-    |> filter_renderable_fields()
+    |> Manifest.renderable_fields()
     |> Enum.map(fn %{name: field_name, type: type_ast} ->
       "#{indent}#{field_name}: #{TypeRenderer.render(type_ast, root_namespace: root)}"
     end)
-  end
-
-  defp filter_renderable_fields(fields) do
-    Enum.reject(fields, fn %{name: name} -> name in [:__streams__] end)
   end
 
   defp full_module_name(module) when is_atom(module) do

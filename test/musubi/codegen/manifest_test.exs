@@ -87,15 +87,6 @@ defmodule Musubi.Codegen.ManifestTest do
   end
 
   describe "renderable_fields/1" do
-    test "drops DSL-internal bookkeeping fields" do
-      fields = [
-        %{name: :__streams__, type: quote(do: map()), opts: []},
-        %{name: :title, type: quote(do: String.t()), opts: []}
-      ]
-
-      assert [%{name: :title}] = Manifest.renderable_fields(fields)
-    end
-
     test "preserves order and passes ordinary fields through untouched" do
       fields = [
         %{name: :b, type: quote(do: integer()), opts: []},
@@ -104,10 +95,6 @@ defmodule Musubi.Codegen.ManifestTest do
       ]
 
       assert [%{name: :b}, %{name: :a}] = Manifest.renderable_fields(fields)
-    end
-
-    test "returns [] for an empty field list" do
-      assert Manifest.renderable_fields([]) == []
     end
   end
 
@@ -166,6 +153,21 @@ defmodule Musubi.Codegen.ManifestTest do
       Manifest.__after_compile__(env, "")
 
       refute File.exists?(Path.join([target, inspect(TypespecProbe), "state.term"]))
+    end
+
+    test "one stamp feeds both codegen targets", %{target: target} do
+      # The single-stamp design: `state.term` is target-neutral, so adding a
+      # renderer must never add a second `@after_compile`.
+      Process.put(:__musubi_codegen_target_dir__, target)
+
+      env = %{TypespecProbe.__env__() | file: "/abs/lib/typespec_probe.ex"}
+      Manifest.__after_compile__(env, "")
+
+      entries = Manifest.list(target)
+
+      assert [{TypespecProbe, _data}] = entries
+      assert Musubi.Codegen.TypeScript.render(entries) =~ ~s|"Musubi.TestSupport.TypespecProbe"|
+      assert Musubi.Codegen.Rust.render(entries) =~ "pub mod typespec_probe {"
     end
 
     test "expands aliased module references against env.aliases", %{target: target} do

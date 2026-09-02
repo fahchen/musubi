@@ -4,9 +4,9 @@ defmodule Musubi.Codegen.Manifest do
   #
   # The pattern mirrors `Phoenix.LiveView.ColocatedJS`: every Musubi `state do`
   # module gets its own subdirectory under `Mix.Project.build_path()`, and each
-  # codegen Mix compiler (today `Mix.Tasks.Compile.MusubiTs`) discovers
-  # eligible modules by listing those subdirectories — no beam scan, no
-  # `:application.get_key/2` walk.
+  # codegen Mix compiler (`Mix.Tasks.Compile.MusubiTs` and
+  # `Mix.Tasks.Compile.MusubiRust`) discovers eligible modules by listing those
+  # subdirectories — no beam scan, no `:application.get_key/2` walk.
   #
   # Layout:
   #
@@ -93,6 +93,12 @@ defmodule Musubi.Codegen.Manifest do
     ArgumentError -> nil
   end
 
+  # Test/manual-only counterpart to `__after_compile__/2`: it stamps the same
+  # 7-key payload from module reflection alone, so — having no `Macro.Env` —
+  # it performs **no** alias expansion. Entries it writes can therefore carry
+  # single-segment `{:__aliases__, _, [:Child]}` nodes that the real compile
+  # path never produces. Renderers must be written against the expanded form
+  # `collect/1` emits; never against what `stamp/3` happens to persist.
   @doc false
   @spec stamp(module(), Path.t(), Path.t()) :: :ok
   def stamp(module, source_file, target) do
@@ -307,9 +313,7 @@ defmodule Musubi.Codegen.Manifest do
     ArgumentError -> nil
   end
 
-  defp eligible_source?(file) when is_binary(file) do
-    not (String.contains?(file, "/test/support/") or String.contains?(file, "/test/"))
-  end
+  defp eligible_source?(file) when is_binary(file), do: not String.contains?(file, "/test/")
 
   defp eligible_source?(_other), do: true
 end

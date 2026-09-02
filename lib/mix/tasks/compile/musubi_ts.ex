@@ -40,8 +40,8 @@ defmodule Mix.Tasks.Compile.MusubiTs do
   ## Discovery
 
   Every Musubi `state do` module ends up with a manifest entry under
-  `Mix.Project.build_path()/musubi-codegen-ts/<inspect(module)>/state.term`,
-  stamped at module-compile time by `Musubi.Plugin.TypeScript`'s injected
+  `Mix.Project.build_path()/musubi-codegen/<inspect(module)>/state.term`,
+  stamped at module-compile time by `Musubi.Plugin.Codegen`'s injected
   `@after_compile` callback. This compiler simply lists those entries —
   there is no beam scan or `:application.get_key/2` walk. Modules whose
   source lives under `test/` (e.g. `test/support/` fixtures) are skipped at
@@ -50,10 +50,9 @@ defmodule Mix.Tasks.Compile.MusubiTs do
 
   use Mix.Task.Compiler
 
+  alias Musubi.Codegen.Compiler
   alias Musubi.Codegen.TypeScript
-  alias Musubi.Codegen.TypeScript.Manifest
 
-  @compiler_name "musubi_ts"
   @default_output_path "priv/codegen/ts/musubi.d.ts"
 
   @impl Mix.Task.Compiler
@@ -63,61 +62,23 @@ defmodule Mix.Tasks.Compile.MusubiTs do
           | {:ok, [Mix.Task.Compiler.Diagnostic.t()]}
           | {:error, [Mix.Task.Compiler.Diagnostic.t()]}
   def run(argv) do
-    {opts, _rest, _invalid} = OptionParser.parse(argv, strict: [check: :boolean])
-
-    Manifest.clean_outdated()
-
-    entries = Manifest.list()
-    output_path = configured_output_path()
-    contents = TypeScript.render(entries)
-    existing = File.read(output_path)
-    check? = opts[:check] == true
-
-    cond do
-      existing == {:ok, contents} ->
-        :noop
-
-      entries == [] and existing == {:error, :enoent} ->
-        :noop
-
-      check? ->
-        {:error, [drift_diagnostic(output_path)]}
-
-      true ->
-        write_bundle!(contents, output_path)
-        {:ok, []}
-    end
+    Compiler.run(argv,
+      name: "musubi_ts",
+      label: "TypeScript",
+      renderer: TypeScript,
+      output_path: configured_output_path()
+    )
   end
 
   @impl Mix.Task.Compiler
   @spec manifests() :: [Path.t()]
-  def manifests, do: [Manifest.target_dir()]
+  defdelegate manifests(), to: Compiler
 
   @impl Mix.Task.Compiler
   @spec clean() :: :ok
-  def clean do
-    _ignore = File.rm_rf(Manifest.target_dir())
-    :ok
-  end
+  defdelegate clean(), to: Compiler
 
   defp configured_output_path do
     Application.get_env(:musubi, :ts_codegen_output_path, @default_output_path)
-  end
-
-  defp write_bundle!(contents, output_path) do
-    File.mkdir_p!(Path.dirname(output_path))
-    File.write!(output_path, contents)
-    Mix.shell().info("[musubi_ts] wrote #{output_path}")
-  end
-
-  defp drift_diagnostic(output_path) do
-    %Mix.Task.Compiler.Diagnostic{
-      compiler_name: @compiler_name,
-      file: output_path,
-      message:
-        "Musubi TypeScript bundle is out of date. Run `mix compile.musubi_ts` and commit the result.",
-      position: nil,
-      severity: :error
-    }
   end
 end

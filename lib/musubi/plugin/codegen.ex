@@ -6,14 +6,14 @@ defmodule Musubi.Plugin.Codegen do
   The plugin injects an `@after_compile` callback pointing at
   `Musubi.Codegen.Manifest`, which serializes the field, command and event
   reflection into a per-module manifest entry under
-  `Mix.Project.build_path()/musubi-codegen/`. Codegen Mix compilers (today
-  `:musubi_ts`) then discover eligible modules by listing those entries —
-  there is no beam scan or `:application.get_key/2` walk.
+  `Mix.Project.build_path()/musubi-codegen/`. The codegen Mix compilers —
+  `:musubi_ts` and `:musubi_rust` — then discover eligible modules by listing
+  those entries; there is no beam scan or `:application.get_key/2` walk.
 
   The manifest payload is target-neutral, so a single `@after_compile` stamp
-  feeds every renderer. The actual TypeScript rendering lives in
-  `Musubi.Codegen.TypeScript`. This plugin is wired into the typed_structor
-  block built by `Musubi.DSL.State.state/1`.
+  feeds every renderer: `Musubi.Codegen.TypeScript` and `Musubi.Codegen.Rust`
+  both read it. This plugin is wired into the typed_structor block built by
+  `Musubi.DSL.State.state/1`.
   """
 
   use TypedStructor.Plugin
