@@ -65,6 +65,12 @@ defmodule Musubi.MixProject do
   # so that consuming Phoenix apps can reference them via
   # `file:../deps/musubi/packages/<name>` from their JS package.json. The
   # consumer's bundler (Vite, esbuild) transpiles `.ts`/`.tsx` on demand.
+  #
+  # `crates/` rides along for the same reason (docs/rust-client.md §1.3): a
+  # consuming Rust crate path-depends on
+  # `../deps/musubi/crates/<name>`. The root `Cargo.toml` ships with it because
+  # every crate manifest inherits `version`/`edition`/dependency versions from
+  # `[workspace.package]`; without it Cargo cannot load the path dependency.
   defp package do
     [
       licenses: ["MIT"],
@@ -79,6 +85,8 @@ defmodule Musubi.MixProject do
           packages/client/package.json
           packages/react/src
           packages/react/package.json
+          crates
+          Cargo.toml
         )
     ]
   end
@@ -151,7 +159,8 @@ defmodule Musubi.MixProject do
           Musubi.Transport.Channel
         ],
         Codegen: [
-          Mix.Tasks.Compile.MusubiTs
+          Mix.Tasks.Compile.MusubiTs,
+          Mix.Tasks.Compile.MusubiRust
         ],
         Testing: [
           Musubi.Testing
@@ -178,6 +187,7 @@ defmodule Musubi.MixProject do
       Musubi.Transport.ConnectionChannel,
       Musubi.Transport.Channel,
       Mix.Tasks.Compile.MusubiTs,
+      Mix.Tasks.Compile.MusubiRust,
       Musubi.Testing
     ]
   end
@@ -193,7 +203,9 @@ defmodule Musubi.MixProject do
       "Musubi.Application",
       "Musubi.Async.Telemetry",
       "Musubi.AsyncSupervisor",
-      "Musubi.Codegen.TypeScript.Manifest",
+      "Musubi.Codegen.Compiler",
+      "Musubi.Codegen.Manifest",
+      "Musubi.Codegen.Rust",
       "Musubi.DSL.",
       "Musubi.Hooks.",
       "Musubi.Page.",
@@ -219,6 +231,7 @@ defmodule Musubi.MixProject do
         "format",
         "credo --strict",
         "compile.musubi_ts --check",
+        "compile.musubi_rust --check",
         "dialyzer",
         "test"
       ],

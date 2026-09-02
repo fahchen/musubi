@@ -5,6 +5,11 @@ import Config
 # drives the compiler end-to-end against this path. Tests own cleanup.
 config :musubi, :ts_codegen_output_path, "test/tmp/musubi_ts_bundle.ts"
 
+# Test-only Rust codegen output path. The integration test for
+# `Mix.Tasks.Compile.MusubiRust` (`test/mix/tasks/compile/musubi_rust_test.exs`)
+# drives the compiler end-to-end against this path. Tests own cleanup.
+config :musubi, :rust_codegen_output_path, "test/tmp/musubi_rust_bundle.rs"
+
 # Test-only endpoint config for the Phoenix Channel adapter test
 # (`test/musubi/transport/channel_test.exs`). The endpoint is defined inside the
 # test module so the keys here track that module's full name. `server: false`
