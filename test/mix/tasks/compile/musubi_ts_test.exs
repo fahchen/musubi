@@ -5,10 +5,16 @@ defmodule Mix.Tasks.Compile.MusubiTsTest do
   # `test/tmp/musubi_ts_bundle.ts`). Concurrent runs would race on that path.
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureIO
+
   alias Mix.Tasks.Compile.MusubiTs
   alias Musubi.Codegen.Manifest
   alias Musubi.TestSupport.TypespecProbe
   alias Musubi.TestSupport.TypespecProbeChild
+
+  # Stands in for a checked-in bundle: any content the empty render cannot
+  # produce, so "did the compiler clobber it?" is decidable by equality.
+  @committed_bundle "declare namespace Musubi { /* committed by hand */ }\n"
 
   setup do
     target =
@@ -41,6 +47,34 @@ defmodule Mix.Tasks.Compile.MusubiTsTest do
     test "returns :noop in --check mode", %{output_path: output_path} do
       assert MusubiTs.run(["--check"]) == :noop
       refute File.exists?(output_path)
+    end
+
+    test "leaves an existing bundle untouched and warns instead of emptying it",
+         %{output_path: output_path} do
+      File.write!(output_path, @committed_bundle)
+
+      warning = capture_io(:stderr, fn -> assert {:ok, []} = MusubiTs.run([]) end)
+
+      assert File.read!(output_path) == @committed_bundle
+      assert warning =~ "musubi_ts"
+      assert warning =~ output_path
+      assert warning =~ "mix compile --force"
+    end
+
+    test "--check still reports drift against an existing bundle",
+         %{output_path: output_path} do
+      File.write!(output_path, @committed_bundle)
+
+      assert {:error,
+              [
+                %Mix.Task.Compiler.Diagnostic{
+                  severity: :error,
+                  compiler_name: "musubi_ts",
+                  file: ^output_path
+                }
+              ]} = MusubiTs.run(["--check"])
+
+      assert File.read!(output_path) == @committed_bundle
     end
   end
 

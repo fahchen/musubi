@@ -114,8 +114,11 @@ What it demonstrates, beyond what the React client already shows:
 - **`desktop/src/generated.rs` is committed**, exactly like the TypeScript
   bundle, and can therefore go stale. `mix compile.musubi_rust --check` reports
   drift without writing, and `mix compile --force` regenerates it. A plain
-  `mix compile` only re-renders the bundle when a store module recompiles, so
-  do not rely on `mix server` to refresh it.
+  `mix compile` only re-renders the bundle when a store module recompiles, so do
+  not rely on `mix server` to refresh it. It will not damage it either: the
+  codegen manifest lives in `_build/`, and if it is wiped without a recompile
+  the compiler refuses to clobber a committed bundle from the resulting empty
+  manifest — it keeps the file and prints the `mix compile --force` remedy.
 - **The Musubi transport uses no tokio.** Not an empty `cargo tree -i tokio`,
   though — gpui itself depends on `gpui_http_client → zed-reqwest → hyper →
   tokio`, which this example never calls. The checkable statement is that every
