@@ -116,7 +116,10 @@ defmodule Musubi.MixProject do
         {"docs/uploads.md", filename: "uploads-reference", title: "Uploads reference"},
         {"docs/push-events.md",
          filename: "push-events-reference", title: "Push events reference"},
-        "docs/persistence-pattern.md"
+        "docs/persistence-pattern.md",
+        {"docs/rust-codegen.md", title: "Rust codegen reference"},
+        {"docs/rust-client.md", title: "Rust client reference"},
+        {"docs/rust-codegen-example.md", title: "Rust codegen example"}
       ],
       groups_for_extras: [
         Tutorials: [
@@ -133,7 +136,10 @@ defmodule Musubi.MixProject do
           "docs/streams.md",
           "docs/uploads.md",
           "docs/push-events.md",
-          "docs/persistence-pattern.md"
+          "docs/persistence-pattern.md",
+          "docs/rust-codegen.md",
+          "docs/rust-client.md",
+          "docs/rust-codegen-example.md"
         ]
       ],
       groups_for_modules: [
@@ -206,6 +212,7 @@ defmodule Musubi.MixProject do
       "Musubi.Codegen.Compiler",
       "Musubi.Codegen.Manifest",
       "Musubi.Codegen.Rust",
+      "Musubi.Codegen.TypeScript",
       "Musubi.DSL.",
       "Musubi.Hooks.",
       "Musubi.Page.",

@@ -1,10 +1,10 @@
 # gpui example client — plan
 
-Status: **plan only**. No file under `examples/` exists for this yet. The
-crates it builds on — `crates/{phoenix-channel,musubi-client,musubi-client-tokio}`
-— have shipped, as has the Rust codegen target; only the gpui app itself is
-outstanding. This document decides what to build, in what order, and what must
-land first.
+Status: **shipped**, as `examples/chat_room/desktop/` (four hand-written Rust
+files plus the committed generated bundle) and four Elixir-side edits to
+`examples/chat_room`. This document decided what to build, in what order, and
+what had to land first; sections marked "as landed" record where the D0 spike
+(§7.1) forced a deviation from the original decision.
 
 The deliverable is a native desktop client, written with
 [gpui](https://www.gpui.rs), that consumes a Musubi server through the
@@ -24,10 +24,10 @@ with `packages/client`.
 | Directory / crate name | `examples/chat_room/desktop/`, Cargo package `chat-room-desktop` |
 | Backend port | **4002** (unchanged). No new port is allocated |
 | gpui dependency form | crates.io `gpui = "0.2.2"` (published 2025-10-22, Apache-2.0), **not** a git pin on `zed-industries/zed` |
-| Widget layer | crates.io `gpui-component = "0.5.1"` for `TextInput`/`Button`/theming; gated on a smoke-compile spike (§7.1) |
+| Widget layer | crates.io `gpui-component = "0.5.1"` for `Input`/`Button`/theming. **As landed:** the spike (§7.1) passed, so the hand-rolled-input fallback was not needed; 0.5.1 spells the widget `Input` + `InputState`, not `TextInput` |
 | Cargo workspace | The example crate is **detached** from the repo-root workspace with an empty `[workspace]` table; own `Cargo.lock`, own `target/` |
 | Generated types | `mix compile.musubi_rust` writes `desktop/src/generated.rs`, **committed**, exactly as `ui/src/generated/musubi.d.ts` is committed |
-| Async runtime | **No tokio.** `musubi-client` core only (runtime-free by construction; the tokio impls live in the separate `musubi-client-tokio` crate, not depended on here); `Spawner`/`Timer` over `gpui::BackgroundExecutor`; `Connector` over `async-net` + `async-tungstenite` |
+| Async runtime | **No tokio on the Musubi path.** `musubi-client` core only (runtime-free by construction; the tokio impls live in the separate `musubi-client-tokio` crate, not depended on here); `Spawner`/`Timer` over `gpui::BackgroundExecutor`; `Connector` over `async-net` + `async-tungstenite`. **As landed:** gpui itself links tokio via `gpui_http_client`, so the invariant is checkable but not an empty `cargo tree` (§5.4) |
 | Run | `mix server` (terminal 1) + `mix desktop` (terminal 2); optionally `mix ui` (terminal 3) to demo two heterogeneous clients on one room |
 | Platform | macOS first-class. Linux best-effort. Windows out of scope for v1 |
 
@@ -108,7 +108,6 @@ examples/chat_room/
   lib/                          # UNCHANGED — no server change is required
   ui/                           # UNCHANGED
 + desktop/
-+   .gitignore                  # /target
 +   Cargo.toml
 +   Cargo.lock                  # committed (binary crate; reproducible `cargo run`)
 +   src/
@@ -119,12 +118,16 @@ examples/chat_room/
 ```
 
 Four hand-written Rust files. `app.rs` is the only one that grows with UI
-scope; `transport.rs` is fixed at roughly 120 lines and is the file other gpui
-embedders will copy.
+scope; `transport.rs` is the file other gpui embedders will copy — as landed it
+is 294 lines, about 260 of them before the unit-test module for the URL
+parser.
 
 Deliberately absent:
 
 - No `desktop/README.md` — the example has one README (`examples/chat_room/README.md`).
+- No `desktop/.gitignore` — **as landed**, `examples/chat_room/.gitignore`
+  carries `/desktop/target/` and a second file ignoring the same directory
+  would be redundant.
 - No `rust-toolchain.toml` in v1 (see open questions).
 - No `build.rs`, no `cargo fmt`/`clippy` wiring in CI — examples are not in CI
   today and this plan does not change that.
@@ -162,12 +165,17 @@ gpui-component = "0.5.1"
 
 # Transport: smol-family, no tokio reactor.
 async-net = "2"                                        # TcpStream over async-io
-async-tungstenite = { version = "0.33", default-features = false }
+# `handshake` gives `client_async`, `futures-03-sink` gives the `Sink` impl on
+# `WebSocketStream`. Spelling out the crate's own defaults pins away the
+# `tokio-runtime` / `async-std-runtime` / TLS features.
+async-tungstenite = { version = "0.35", default-features = false, features = [
+  "handshake",
+  "futures-03-sink",
+] }
 futures = "0.3"
 
 serde = { version = "1", features = ["derive"] }       # generated.rs derives
 serde_json = "1"
-anyhow = "1"
 ```
 
 Notes:
@@ -185,13 +193,24 @@ Notes:
   `gpui::Application::new().run(|cx: &mut App| ...)`. On `main` it is
   `gpui_platform::application().run(...)`. Every snippet in this document is
   the 0.2.2 form, which is also what gpui.rs still documents.
-- **gpui default features** are `["font-kit", "wayland", "x11",
-  "windows-manifest"]`. Whether macOS builds need
-  `default-features = false, features = ["font-kit"]` is a spike output (§7.1),
-  not a guess.
-- **No tokio, enforced.** `cargo tree -i tokio` in `desktop/` must print
-  "package ID specification `tokio` did not match any packages". Put that
-  command in the README as the invariant.
+- **`async-tungstenite = "0.35"`, not 0.33.** The original sketch pinned 0.33
+  because that is what zed's own workspace uses. **As landed** the crate is on
+  0.35 with `handshake` + `futures-03-sink` spelled out: the zed-pin rationale
+  bought compatibility with an executor family, and `async-net` (not zed) is
+  what supplies the stream here, so the newer release with the features named
+  explicitly is the better pin. The features are the crate's defaults; naming
+  them is what keeps `tokio-runtime` and the TLS features off across future
+  minor bumps.
+- **gpui default features.** Spike output (§7.1 question 4): **keep the
+  defaults**. `gpui-component 0.5.1` declares a plain `gpui = "0.2.2"`, so
+  cargo feature unification re-enables anything a `default-features = false`
+  here would drop. The x11/wayland features are inert on macOS.
+- **No tokio on the Musubi path.** Spike output: an empty `cargo tree -i tokio`
+  is *not* achievable, because gpui reaches tokio through
+  `gpui_http_client → zed-reqwest → hyper`. The checkable invariant, and the
+  one the README carries, is: `musubi-client-tokio` is absent from
+  `[dependencies]`, `async-tungstenite`'s runtime features are off, and every
+  path in `cargo tree -i tokio -e normal` runs through `gpui_http_client`.
 
 ### 2.3 Elixir-side edits
 
@@ -341,10 +360,13 @@ but it is no longer a blocker for D5.
 
 The bundle is committed, so it can rot. `mix compile.musubi_rust --check`
 exists for exactly this and returns a `Mix.Task.Compiler.Diagnostic` on drift.
-Examples are not in CI today and this plan does not add them; the practical
-guard is that `mix server` runs `mix compile`, which rewrites the bundle
-in place before the server boots, so a stale bundle survives at most until the
-next `mix server`. State that in the README rather than building CI for it.
+Examples are not in CI today and this plan does not add them. **As landed** the
+guard is weaker than the original sketch claimed: `mix compile` only re-renders
+the bundle when a store module actually recompiles, so a `mix server` on a warm
+`_build` leaves a stale bundle alone (and, with an emptied codegen manifest,
+can rewrite it down to the prelude). The documented refresh is
+`mix compile --force`, with `mix compile.musubi_rust --check` reporting drift
+without writing. State that in the README rather than building CI for it.
 
 ---
 
@@ -359,28 +381,41 @@ server.
 | 1 | `ChatWindow` root view | root store mount (join = mount) | `Entity<ChatWindow>` + `impl Render` |
 | 2 | Message list | `stream_async :messages` → materialized `Vec<MessageState>` | `uniform_list` |
 | 3 | History loading / failed states | `AsyncResult` `loading \| ok \| failed` | `match` on the generated enum |
-| 4 | Composer + send | `send_message` command, reply `{queued}` | `gpui-component` `TextInput` + `cx.spawn` |
+| 4 | Composer + send | `send_message` command, reply `{queued}` | `gpui-component` `Input` + `cx.spawn` |
 | 5 | Delivery receipt | `last_send_status` tagged union (`start_async`/`handle_async`) | `match` on `ChatRoomStoreLastSendStatus` |
-| 6 | Identity + rename | `set_name` command, reply `{ok, name}` | `TextInput` + `Button` |
+| 6 | Identity + rename | `set_name` command, reply `{ok, name}` | `Input` + `Button` |
 | 7 | Online panel | `assign_async :online_users` + PubSub | `AsyncResult` `match` + plain column |
 | 8 | Connection pill | reconnect (BDR-0015), version 0 window | derived flag on the view |
 
 ### 4.1 `ChatWindow`
 
+**As landed** (the plan's sketch had a non-optional `mounted`, which the
+window-first startup in §5.3 made impossible):
+
 ```rust
 use generated::chat_room::stores::chat_room_store::{self as store, ChatRoomStore};
 
 struct ChatWindow {
-    mounted: Mounted<ChatRoomStore>,        // ChatRoomStore is the ZST marker
+    url: SharedString,                      // for the "connecting to ..." line
+    mount_error: Option<SharedString>,      // a rejected join is a rendered panel
     snapshot: Option<Arc<store::State>>,    // last good; never cleared on reconnect
     stale: bool,                            // true between disconnect and next patch
+    mounted: Option<Mounted<ChatRoomStore>>, // None until the join succeeds
     feedback: SharedString,
+    busy: bool,                             // one command at a time
     composer: Entity<InputState>,           // gpui-component
     name_input: Entity<InputState>,
     _updates: Task<()>,                     // held: dropping cancels the subscription
     _in_flight: Option<Task<()>>,           // held: one command at a time
+    _subscriptions: Vec<Subscription>,      // held: Enter-to-submit on both inputs
 }
 ```
+
+`mounted` is an `Option` because the window opens before the join resolves:
+commands are refused until it is `Some`, and `mount_error` is what the message
+pane renders instead of a list. There is no separate connection-state enum —
+the pill (§4.6) reads these fields directly, because any enum over them would
+store nothing the fields do not already say.
 
 `_updates` and `_in_flight` are held rather than `.detach()`ed so that closing
 the window cancels both — dropping a gpui `Task` cancels it, and a detached
@@ -462,11 +497,11 @@ No `command_and_wait_for_patch` helper is used or wanted (`docs/rust-client.md`
 
 Text input is the one thing gpui does not provide: `crates/gpui/examples/input.rs`
 is a ~400-line from-scratch single-line field. `gpui-component` supplies
-`TextInput`/`InputState` and is the reason it is a dependency at all. If the
-crates.io combination fails to compile (§7.1), the documented fallback is a
-send button with a canned body and no free-text entry — the command path, the
-reply handling, and every other component still demo correctly; only `set_name`
-and free-text `send_message` degrade.
+`Input`/`InputState` and is the reason it is a dependency at all. The planned
+fallback — a send button with a canned body and no free-text entry — was
+specified in case the crates.io combination failed to compile (§7.1); **as
+landed it was not needed**. The widget is `gpui_component::input::Input` over an
+`Entity<InputState>`; 0.5.1 has no type called `TextInput`.
 
 ### 4.5 Delivery receipt
 
@@ -491,17 +526,24 @@ command → reply → patch → async-completion → patch sequence in one scree
 
 ### 4.6 Connection pill, and the gap behind it
 
-`Mounted::snapshot()` returns `None` before the initial patch **and** while
-`version == 0` mid-reconnect. That single `Option` conflates "never loaded"
-with "reconnecting, last-good state still valid", and BDR-0015 requires the
-client to keep rendering the last good tree across a reconnect.
+`Mounted::snapshot()` returns `None` before the initial patch and **is never
+cleared afterwards** — not by a reconnect either (`crates/musubi-client/src/mounted.rs`
+clears the cell only on teardown, deliberately, because BDR-0015 requires the
+client to keep rendering the last good tree). So the crate exposes no signal at
+all for "the socket went away": the `Option` says "have I ever loaded", and
+nothing says "am I current".
 
 v1 works around it in the view: `snapshot` is only ever assigned `Some`, never
 cleared, and `stale` is set when a command fails with `NotConnected` /
-`Disconnected` and cleared on the next update. That is enough for a pill, and
-wrong in one case (a socket that drops while the app is idle shows "live" until
-the next command). The correct fix is a `MountStatus` on the crate; see open
-questions.
+`Disconnected` / `Transport` and cleared on the next update. That is enough for
+a pill, and wrong in one case — a socket that drops while the app is idle shows
+"live" until the next command is attempted, which is why the README's reconnect
+demo (§6.3) tells the reader to press Send. The correct fix is a `MountStatus`
+on the crate; see open questions.
+
+**As landed** the pill is five ordered conditions read straight off the view,
+with no intermediate enum: `mount_error` → offline, `mounted.is_none()` →
+connecting, `stale` → reconnecting, `snapshot.is_some()` → live, else joining.
 
 ---
 
@@ -565,12 +607,17 @@ impl musubi_client::Connector for SmolConnector {
 `async-net` is `async-io`-backed (the smol family), so the returned future is
 driven by whatever executor polls it — gpui's background executor — and needs
 no runtime feature flag on `async-tungstenite` (hence `default-features = false`).
-`async-tungstenite = "0.33"` matches the pin in zed's own workspace, so it is
-known-compatible with this executor family.
+**As landed** the pin is `async-tungstenite = "0.35"` with `handshake` +
+`futures-03-sink` named explicitly (§2.2), not the 0.33 zed uses: `async-net`
+supplies the stream, so zed's pin was never the compatibility constraint.
 
 The example dials plain `ws://127.0.0.1:4002/socket/websocket?vsn=2.0.0`, so
-**no TLS stack is linked at all** — no rustls, no native-tls, no certificate
-verifier. A production client adds `async-tls`/`rustls` here and nowhere else.
+**this connector links no TLS stack** — no rustls, no native-tls and no
+certificate verifier is reachable from the Musubi path, and `authority` rejects
+`wss://` rather than downgrading silently. That is a claim about the transport,
+not about the binary: gpui's own HTTP client pulls rustls in through
+`gpui_http_client`, exactly as it pulls in tokio (§5.4). A production client
+adds `async-tls`/`rustls` here and nowhere else.
 
 `WsSocket` is a newtype implementing `Sink<Frame>` and
 `Stream<Item = Result<Frame, TransportError>>` by mapping
@@ -613,11 +660,16 @@ Rules this encodes, all of which are load-bearing:
 - The returned `Task<()>` is stored in the view (`_updates`); dropping it
   cancels the loop, which is the desired teardown when the window closes.
 
-Mount happens before the window exists, in the `Application::run` closure, via
+**As landed the order is inverted:** `main.rs` builds the `Connection` and
+opens the window unconditionally, and the mount runs inside `ChatWindow::new`
+as the head of the same `cx.spawn` shown above. The plan had the mount happen
+first, in the `Application::run` closure, via
 `cx.background_executor().block(...)` or an `AsyncApp` spawn that opens the
-window on success — mirroring `main.tsx`'s top-level `await connect(socket)` +
-"Connect failed" panel. On failure the app opens a window containing the error
-rather than exiting silently.
+window on success. Window-first is strictly better and is why `mounted` is an
+`Option` (§4.1): a rejected join is *always* a rendered panel, with no path on
+which the app can block the main thread or exit before anything is drawn. It
+mirrors `main.tsx`'s "Connect failed" panel without mirroring its top-level
+`await`.
 
 **The mount carries params.** `ChatRoom.Stores.ChatRoomStore` declares
 `attr(:room_id, String.t(), required: true)` and its `mount/2` does
@@ -634,19 +686,28 @@ let mounted = connection
 
 ### 5.4 The no-tokio invariant
 
-Stated once, checked mechanically:
+The plan stated this as an empty `cargo tree -i tokio`. **That is not
+achievable and the shipped example does not claim it**: gpui 0.2.2 depends on
+`gpui_http_client → zed-reqwest → hyper → tokio`, so tokio is in the binary
+whatever the Musubi side does. The invariant is about the *Musubi path*, and it
+is checked as three statements:
 
 ```sh
-cd examples/chat_room/desktop && cargo tree -i tokio    # must match nothing
+cd examples/chat_room/desktop
+cargo tree -i tokio -e normal   # every path runs through gpui_http_client
+grep musubi-client-tokio Cargo.toml   # absent
 ```
 
-The two ways tokio could sneak in are depending on `musubi-client-tokio`
-(not depended on — the core `musubi-client` crate is runtime-free by
-construction) and `async-tungstenite`'s
-`tokio-runtime` feature (not enabled; `default-features = false`). Zed's own
-answer for unavoidable tokio dependencies is the unpublished `gpui_tokio`
-crate, which stands up a second runtime as a gpui `Global`. This example does
-not need it and should not vendor it.
+- `musubi-client-tokio` is not a dependency — the core `musubi-client` crate is
+  runtime-free by construction.
+- `async-tungstenite` is `default-features = false` with only `handshake` and
+  `futures-03-sink`, so its `tokio-runtime` feature is off.
+- Every remaining path to tokio in `cargo tree -i tokio -e normal` goes through
+  `gpui_http_client`, which nothing in this example calls.
+
+Zed's own answer for unavoidable tokio dependencies is the unpublished
+`gpui_tokio` crate, which stands up a second runtime as a gpui `Global`. This
+example does not need it and should not vendor it.
 
 ---
 
@@ -690,7 +751,7 @@ The desktop client takes the server URL from `MUSUBI_URL`, defaulting to
 
 | Platform | Status | Requirement |
 | :-- | :-- | :-- |
-| macOS | **Primary.** Metal backend, first-class in gpui | Full Xcode (not just CLT), `xcode-select --install`, `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer` |
+| macOS | **Primary.** Metal backend, first-class in gpui | Xcode plus the **Metal Toolchain**, which Xcode 26 unbundles: `xcodebuild -downloadComponent MetalToolchain` (~690 MB, no sudo), verified with `xcrun -sdk macosx metal --version`. **As landed** this, not `xcode-select`, is the blocker the first build hits — gpui's build script fails with `cannot execute tool 'metal' due to missing Metal Toolchain`, which reads like a problem with the pin |
 | Linux | Best-effort, untested by the author | X11 and/or Wayland; both features are on by default in gpui 0.2.2 |
 | Windows | **Out of scope for v1** | Supported on zed `main` (Win32 + DirectWrite) but the published 0.2.2 README says "macOS or Linux". Requires the git path |
 
@@ -700,11 +761,14 @@ versions"), so the README should say the example is pinned to
 
 ### 6.3 Reconnect demo
 
-Stop `mix server`, watch the connection pill flip and the message list stay
-rendered (BDR-0015: keep last-good, no resync), restart it, watch the client
-rejoin, receive a `replace ""` at `version: 1`, and flip `messages` back through
-`loading → ok` with the 1.5 s seed delay. That sequence is the whole recovery
-contract in one observable loop and belongs in the README.
+Stop `mix server` and watch the message list stay rendered (BDR-0015: keep
+last-good, no resync). The pill still says "live" at this point — see §4.6:
+nothing tells the view the socket is gone until it tries to use it — so press
+**Send**, watch the command fail with `Disconnected` and the pill flip to
+"reconnecting". Restart the server, watch the client rejoin, receive a
+`replace ""` at `version: 1`, and flip `messages` back through `loading → ok`
+with the 1.5 s seed delay. That sequence is the whole recovery contract in one
+observable loop and belongs in the README.
 
 ---
 
@@ -744,6 +808,16 @@ reachable right now with about 200 lines of untyped glue, because the server,
 the channel, the envelopes, and the room already exist and are running. The
 spike is not committed; it de-risks D1–D5 and produces the `transport.rs` that
 ships.
+
+**Outcomes.** All four questions came back green, with four corrections that
+the sections above now carry:
+
+| # | Question | Answer |
+| :-- | :-- | :-- |
+| 1 | Does `gpui 0.2.2` + `gpui-component 0.5.1` compile and open a window on macOS? What feature flags? | Yes. **Keep gpui's default features** — `gpui-component` declares a plain `gpui = "0.2.2"`, so feature unification re-enables anything `default-features = false` would drop, and the x11/wayland features are inert on macOS (§2.2). The one environment requirement the plan got wrong is the unbundled **Metal Toolchain**, not Xcode selection (§6.2) |
+| 2 | Does the widget layer work on the 0.2.2 API, or must the example hand-roll `input.rs`? | It works; the canned-body fallback was not needed. The widget is `Input` over `Entity<InputState>`, not `TextInput` (§4.4). `gpui_component::init(cx)` must be the first call inside `Application::run`, and the window's first-level view must be a `Root` |
+| 3 | Do the three seams compile and pump frames over `BackgroundExecutor`? | Yes, on `async-tungstenite 0.35` rather than the sketched 0.33 (§5.2). `Socket` needs no manual impl — `phoenix-channel`'s blanket impl covers any `Sink<Frame>` + `Stream<Item = Result<Frame, _>>` |
+| 4 | End-to-end against the running 4002 server | Yes. It also produced the correction in §5.4: an empty `cargo tree -i tokio` is unreachable because gpui itself links tokio |
 
 ### 7.2 Dependency chain
 
@@ -809,28 +883,33 @@ deliberately routes around both.
 
 ## Open questions
 
-1. **Mid-reconnect mount status.** `Mounted::snapshot() -> Option<_>` conflates
-   "not yet loaded" with "reconnecting, last-good still valid", but BDR-0015
-   requires clients to keep rendering the last good tree. Every non-React client
-   will re-derive the §4.6 workaround. Proposal: add
+1. **Mid-reconnect mount status.** `Mounted::snapshot() -> Option<_>` answers
+   "have I ever loaded" and nothing else — it is never cleared on reconnect,
+   because BDR-0015 requires clients to keep rendering the last good tree — so
+   a client has no way to observe a socket that dropped while it was idle.
+   Every non-React client will re-derive the §4.6 workaround (a `stale` flag set
+   by the first command that fails). **Still open**, and it is the one visible
+   rough edge in the shipped example: the connection pill reads "live" until the
+   user tries to send. Proposal: add
    `MountStatus { Connecting, Live, Reconnecting, Unmounted }` plus a status
    stream to `musubi-client` in client milestone R4, and state the client-side
    rendering obligation in `docs/client-contract.md`. **Needs BDR** — it adds an
    observable contract statement about reconnect rendering that currently only
    exists implicitly in the TS client.
-2. **Directory name.** `desktop/` names the artifact rather than the toolkit, so
-   swapping toolkits later does not rename the directory, and it is not matched
-   by the `examples/*/ui` pnpm glob. Alternatives considered: `ui-gpui/`
-   (symmetric with `ui/`, more discoverable, ties the name to a pre-1.0
-   dependency), `gpui/` (reads as a vendored copy of the framework). Cheap to
-   change before D6, expensive after.
-3. **`gpui-component` viability on the crates.io pin.** Its README documents the
-   git install; only its published metadata says `gpui ^0.2.2`. D0 question 2
-   decides between it and a hand-rolled input; the fallback (canned-body send
-   button) is specified in §4.4 so the example is not blocked either way.
-4. **gpui feature flags on macOS.** Defaults are
-   `["font-kit", "wayland", "x11", "windows-manifest"]`. Whether the x11/wayland
-   features are inert on macOS or must be disabled is a D0 output.
+2. ~~**Directory name.**~~ Resolved: `desktop/`. It names the artifact rather
+   than the toolkit, so swapping toolkits later does not rename the directory,
+   and it is not matched by the `examples/*/ui` pnpm glob. Alternatives
+   considered and rejected: `ui-gpui/` (symmetric with `ui/`, but ties the name
+   to a pre-1.0 dependency), `gpui/` (reads as a vendored copy of the
+   framework).
+3. ~~**`gpui-component` viability on the crates.io pin.**~~ Resolved by D0
+   question 2: viable. `gpui-component 0.5.1` compiles and runs against
+   crates.io `gpui 0.2.2`, so the canned-body fallback in §4.4 was not built.
+   Its widget is `Input`/`InputState`; there is no `TextInput` on 0.5.1.
+4. ~~**gpui feature flags on macOS.**~~ Resolved by D0 question 1: **keep the
+   defaults**. `gpui-component` declares a plain `gpui = "0.2.2"`, so cargo
+   feature unification re-enables anything `default-features = false` would
+   drop; the x11/wayland features are inert on macOS. See §2.2.
 5. **Toolchain pinning.** No `rust-toolchain.toml` is planned, on the theory
    that examples should build with whatever recent stable the reader has. gpui
    0.2.2's README asks for "the latest version of stable Rust", which is not a
@@ -846,10 +925,10 @@ deliberately routes around both.
 7. **Committing `Cargo.lock`.** Planned yes (binary crate, reproducible
    `cargo run` for readers). The cost is a large lockfile in the repo (gpui
    pulls a wide tree) and dependabot-style churn on a file nothing in CI reads.
-8. **`mix desktop` ergonomics.** `cargo run` on a cold cache builds gpui from
-   source and takes minutes with no output for the first minute. Whether the
-   alias should print a warning first, or run `cargo build` then `cargo run`,
-   is a taste call to make when writing it.
+8. ~~**`mix desktop` ergonomics.**~~ Resolved: the alias prints a one-line
+   `Mix.shell().info` warning about the cold-cache gpui build and then runs
+   `cargo run`. A `cargo build` + `cargo run` pair was rejected as two
+   resolutions for one outcome.
 9. ~~Where the reference gpui adapter lives.~~ Resolved: the only copy is this
    example's `examples/chat_room/desktop/src/transport.rs`; `docs/rust-client.md`
    §2.3 links here rather than shipping a crate-side `gpui_adapter.rs`.

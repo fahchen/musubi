@@ -5,11 +5,91 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The Elixir package (`musubi`) and the JS packages (`@musubi/client`,
-`@musubi/react`) share this changelog. Per-package version numbers are
+The Elixir package (`musubi`), the JS packages (`@musubi/client`,
+`@musubi/react`) and the Rust crates (`musubi-client`, `musubi-client-tokio`,
+`phoenix-channel`) share this changelog. Per-package version numbers are
 not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
+
+### Added
+
+- **`musubi`** — **Rust codegen target.** A second codegen target,
+  `:musubi_rust` (`Mix.Tasks.Compile.MusubiRust`), renders one `.rs` bundle of
+  typed store, state, command and event definitions from the same per-module
+  compile-time manifest `:musubi_ts` already consumes. Consumers add it to
+  `compilers:` and point `config :musubi, :rust_codegen_output_path` at the
+  destination; `mix compile.musubi_rust --check` fails the build when the
+  committed bundle drifts from the declarations, exactly as the TypeScript
+  target does. Because Rust is nominal where TypeScript is structural, the
+  renderer (`Musubi.Codegen.Rust`) hoists every anonymous map into a named
+  `struct` and every union into a named `enum` — `Option<T>` for `T | nil`,
+  C-like enums for atom literals, internally tagged enums for maps sharing a
+  discriminant — escapes Rust keywords as raw idents, and emits
+  `super::`-chained cross-module paths so the bundle can be included anywhere
+  in a consumer crate. Output is rustfmt-stable by construction, so
+  `cargo fmt --check` and `compile.musubi_rust --check` cannot fight each
+  other. Two further keys tune the emission: `:rust_codegen_root_module`
+  (default `"musubi"`, the prelude module holding the runtime re-exports) and
+  `:rust_codegen_runtime_path` (default `"musubi_client"`). `docs/rust-codegen.md`
+  is the normative specification; `docs/rust-codegen-example.md` walks one app
+  that exercises every feature reaching the wire types.
+- **`musubi-client` (new, Rust)** — **A Rust client for the Musubi wire
+  contract**, shipped as three crates under `crates/`: `phoenix-channel`
+  (Phoenix Channel serializer v2 over a pluggable socket, not Musubi-aware),
+  `musubi-client` (the runtime-agnostic core), and `musubi-client-tokio`
+  (`TokioSpawner`, `TokioTimer`, a tokio-tungstenite `Connector`, and a
+  `builder/1` that pre-fills all three). The core implements the client
+  contract as a peer of `@musubi/client`, not a port of it: the RFC 6902 patch
+  engine over a shadow `serde_json::Value` document, with the
+  add/remove/replace op allowlist (BDR-0014) and gapless version discipline;
+  client-owned stream materialization (upsert-then-position, `at`/`limit`
+  trimming, prune on owner disappearance); `AsyncResult<T>` carrying the wire
+  `result`/`reason` names; typed commands whose reply type is inferred from the
+  payload's `Command<S>` impl, with reply-before-patch ordering (BDR-0009)
+  documented at the call site; push events (BDR-0032) as typed `Stream`s keyed
+  by `(store_id, name)`; and reconnect-only recovery (BDR-0015) over the
+  phoenix.js backoff ladder. Mounting is refcounted and unmounting is `Drop`.
+  Uploads are **not** implemented — `upload_ops` are parsed and discarded, and
+  an upload field deserializes into an inert `UploadSlot` — deferred to R8
+  along with the stale-while-revalidate cache. The nine runtime types the
+  generated bundle re-exports (`Store`, `Command<S>`, `Event<S>`,
+  `AsyncResult`, `AsyncError`, `StoreField`, `StoreId`, `NoReply`,
+  `UploadSlot`) are owned by `musubi_client::generated`, so
+  `Connection::mount::<CartStore>()` type-checks against one trait rather than
+  a bundle-local copy. No `tokio` type appears in any `musubi-client`
+  signature: a non-tokio embedder implements the `Connector`, `Spawner` and
+  `Timer` seams and omits `musubi-client-tokio` entirely. Edition 2024, MSRV
+  1.85, MIT, versioned in lockstep with the Hex package. See
+  `docs/rust-client.md`.
+- **`musubi`** — The Hex package now ships `crates/`, alongside the workspace
+  root `Cargo.toml` the crate manifests inherit their version and dependency
+  pins from. This mirrors how `packages/client/src` and `packages/react/src`
+  already ride along for JS consumers: a consuming Rust crate path-depends on
+  `musubi-client = { path = "../deps/musubi/crates/musubi-client" }`. Nothing
+  is published to crates.io yet, so the Hex tarball is the only distribution
+  channel and the crate version cannot skew from the server's.
+- **`examples/chat_room`** — A native desktop client under `desktop/`, built on
+  gpui and the Rust crates, alongside the existing React client in `ui/`. It is
+  the reference non-tokio embedder: it depends on `musubi-client` alone and
+  implements the `Spawner`, `Timer` and `Connector` seams over gpui's own
+  executor. Detached from the repo-root Cargo workspace on purpose, and not
+  built in CI.
+
+### Changed
+
+- **`musubi`** — **Internal: the codegen manifest is now target-neutral.**
+  `Musubi.Plugin.TypeScript` became `Musubi.Plugin.Codegen`,
+  `Musubi.Codegen.TypeScript.Manifest` became `Musubi.Codegen.Manifest`, and
+  the compile-time stamp moved from `_build/<env>/musubi-codegen-ts/` to
+  `_build/<env>/musubi-codegen/`, so one `@after_compile` callback now feeds
+  every renderer instead of one stamp per target. Both modules are internal and
+  excluded from the published docs, so no consumer code changes; the only
+  visible effect is that the old `musubi-codegen-ts/` directory becomes an
+  orphan that `mix clean` no longer removes and that survives until the next
+  `_build` wipe. The `:__streams__` field filter moved up to
+  `Musubi.Codegen.Manifest.renderable_fields/1` so both renderers share one
+  copy of a target-agnostic policy.
 
 ## [0.13.1] — 2026-08-09
 

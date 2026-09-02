@@ -42,7 +42,7 @@ Decision: a **Cargo workspace at the repo root** with three crates under
 /crates/phoenix-channel/               # Phoenix Channel protocol, not Musubi-aware (§3)
 /crates/musubi-client/                 # runtime-agnostic Musubi core
 /crates/musubi-client/LICENSE          # copy of /LICENSE (each crate carries its own)
-/crates/musubi-client/tests/fixtures/*.json
+/crates/musubi-client/tests/fixtures/*.json  # wire fixtures — deferred to R9 (§12)
 /crates/musubi-client-tokio/           # tokio Spawner/Timer/Connector impls (§2.3)
 ```
 
@@ -208,10 +208,10 @@ the gpui example (`docs/rust-gpui-example.md`).
 The connection is a **single owned task**:
 
 ```
-ConnectionActor {
-    socket: Box<dyn Socket>,
-    roots: HashMap<RootId, RootState>,     // one entry per mounted root
-    inbox: mpsc::Receiver<ActorMsg>,        // futures-channel, runtime agnostic
+Actor {
+    socket: PhoenixSocket,             // phoenix-channel owns the `Box<dyn Socket>`
+    roots: HashMap<Arc<str>, Root>,    // one entry per mounted root, keyed by root id
+    rx: UnboundedReceiver<ActorMsg>,   // futures-channel, runtime agnostic
     ...
 }
 ```
@@ -238,20 +238,25 @@ State delivery to the embedder is **not** through the actor's inbox. Each
 mounted root owns a snapshot cell:
 
 ```rust
-pub struct Snapshot<S: Store>(Arc<Mutex<Arc<S::State>>>);
+pub(crate) struct RootCell<St: Store> {
+    snapshot: Mutex<Option<Arc<St::State>>>,
+    ...
+}
 ```
 
-`std::sync::Mutex<Arc<_>>`, not `arc-swap`: a snapshot read happens once per
-render, not in a hot loop, and the write happens once per accepted envelope, so
-the uncontended-mutex cost is irrelevant and it drops a dependency. Swapping in
-`ArcSwap` later is a private change if profiling ever asks for it.
+`std::sync::Mutex<Option<Arc<_>>>`, not `arc-swap`: a snapshot read happens once
+per render, not in a hot loop, and the write happens once per accepted envelope,
+so the uncontended-mutex cost is irrelevant and it drops a dependency. The
+`Option` is the pre-initial-patch / mid-reconnect hole `snapshot()` surfaces
+(§7). Swapping in `ArcSwap` later is a private change if profiling ever asks
+for it.
 
 plus, per `updates()`/`events()` subscription, a `futures_channel::mpsc`
-sender held by the actor. There is **no callback registry**: the only
-subscription surface is `Stream`s (§7), each backed by one sender; a closed
-receiver (dropped stream) is pruned at the next send. Sends happen on the
-actor task; embedders that need thread affinity (gpui) hop inside their own
-consuming task (`cx.spawn` + `while let`). No `tokio::sync::watch`.
+sender on the same cell, driven from the actor task. There is **no callback
+registry**: the only subscription surface is `Stream`s (§7), each backed by one
+sender; a closed receiver (dropped stream) is pruned at the next send. Sends
+happen on the actor task; embedders that need thread affinity (gpui) hop inside
+their own consuming task (`cx.spawn` + `while let`). No `tokio::sync::watch`.
 
 ---
 
@@ -822,7 +827,7 @@ Notes on the shape:
   source of truth for it: params are declared with `attr/3` and reflected via
   `__musubi__(:attrs)`, which the shared manifest does not carry
   (`{module, kind, fields, commands, events, uploads, source}` — see
-  `Musubi.Codegen.TypeScript.Manifest.collect/1`). `mount` therefore takes
+  `Musubi.Codegen.Manifest.collect/1`). `mount` therefore takes
   `impl Serialize` (validated to be a JSON object at runtime), matching the TS
   target, which has no params typing either
   (`StoreDef<Module, Shape, Commands, Events>`). Adding `:attrs` to the manifest
@@ -898,7 +903,7 @@ is already **fully target-agnostic** (raw Musubi reflection with quoted Elixir
 type ASTs; no TS strings, no marker names, no output path). Only the naming is
 TS-coupled.
 
-Before adding a Rust renderer, hoist:
+This landed ahead of the Rust renderer, hoisting:
 
 | From | To |
 |---|---|
@@ -908,12 +913,12 @@ Before adding a Rust renderer, hoist:
 | `:__musubi_ts_target_dir__` process key | `:__musubi_codegen_target_dir__` |
 | `@after_compile {TypeScript.Manifest, ...}` | the shared manifest — **one** `@after_compile`, N renderers |
 
-One stamp, two renderers. Adding a second `@after_compile` per target is
-explicitly rejected: it doubles compile-time IO for identical data. While
-moving, fix the stale `@type entry()` definitions (both omit `:events`) and
-hoist the `:__streams__` field filter (`filter_renderable_fields/1`) to the
-shared layer so Rust does not re-derive a target-agnostic policy. The full
-file-by-file checklist is `docs/rust-codegen.md` §1.2.
+One stamp, two renderers. Adding a second `@after_compile` per target was
+explicitly rejected: it doubles compile-time IO for identical data. The same
+commit fixed the stale `@type entry()` definitions (both omitted `:events`) and
+hoisted the `:__streams__` field filter to `Manifest.renderable_fields/1` so
+Rust does not re-derive a target-agnostic policy. The full file-by-file
+checklist is `docs/rust-codegen.md` §1.2.
 
 Note what this refactor does **not** add: `:attrs`. Mount params therefore stay
 untyped in v1 (§7).
@@ -1215,15 +1220,16 @@ correct and are what this design implements:
    design assumes the four-parameter form (`docs/rust-codegen.md` §4.6), so this
    one must be fixed with the rest.
 
-Also stale, worth fixing while doing §8.1: `AGENTS.md` still describes the
-pre-`StoreDef` TS output shape and `priv/codegen/ts/musubi.ts`; the
-`Mix.Tasks.Compile.MusubiTs` moduledoc says `musubi.ts` while
-`@default_output_path` is `musubi.d.ts`; both
-`Manifest.@type entry()` and `TypeScript.@type entry()` omit `:events`.
+One smaller item is still open: the `Mix.Tasks.Compile.MusubiTs` moduledoc
+documents a default output path of `musubi.ts` while `@default_output_path` is
+`musubi.d.ts`. (`AGENTS.md` and the two `@type entry()` definitions were listed
+here as well and were fixed with the §8.1 refactor.)
 
 ---
 
 ## 15. Milestones
+
+R0–R7 have landed. R8 and R9 are post-v1 and unimplemented.
 
 | M | Contents | Exit criterion |
 |---|---|---|
