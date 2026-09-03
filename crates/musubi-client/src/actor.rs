@@ -762,7 +762,7 @@ impl Actor {
             return;
         };
 
-        let pending: Vec<_> = root.pending_mounts.drain(..).collect();
+        let pending = std::mem::take(&mut root.pending_mounts);
 
         if pending.is_empty() {
             return;
