@@ -196,7 +196,7 @@ defmodule Musubi.Page.PatchEnvelopeTest do
 
     test "build returns nil only when ops, stream_ops, upload_ops, and events are all empty" do
       assert PatchEnvelope.build(3, [], [], [], []) == nil
-      refute PatchEnvelope.build(3, [], [], [], [%{name: "e", payload: %{}}]) == nil
+      assert %PatchEnvelope{} = PatchEnvelope.build(3, [], [], [], [%{name: "e", payload: %{}}])
     end
 
     test "to_wire carries events" do
