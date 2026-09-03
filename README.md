@@ -263,7 +263,10 @@ mix docs
 The repository includes standalone Phoenix examples under `examples/`:
 
 - `examples/cart_page` - cart UI with nested stores and persistence hooks
+  ([demo](examples/cart_page/demo.gif))
 - `examples/chat_room` - PubSub-backed chat room, with React and gpui clients
+  ([demo](examples/chat_room/demo.gif))
 - `examples/poll_app` - multi-root polling application with streams and async
+  ([demo](examples/poll_app/demo.gif))
 
 Each example depends on Musubi with `path: "../.."`.

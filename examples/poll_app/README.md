@@ -4,6 +4,11 @@ A real-time live polling app built with Musubi. Demonstrates multi-page
 architecture with typed render state, streamed options, async vote casting,
 PubSub-driven cross-user updates, and polling status gating.
 
+![poll_app demo](demo.gif)
+
+Browse the dashboard, cast and change a vote, then watch two tabs stay in sync
+as one votes and the other closes the poll.
+
 ## Pages
 
 | Page | Root Store | Child Stores | Key features |

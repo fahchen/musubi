@@ -9,6 +9,12 @@ application-owned Elixir agents; each room stores and streams only the latest
 history seed so the `loading → ok` `AsyncResult` transition is visible
 client-side.
 
+![chat_room demo — React and gpui clients on one room](demo.gif)
+
+*Left: the React client in a browser. Right: the native gpui client. One `mix
+server`, one store, one room — every rename and every message crosses between
+them without either client knowing the other exists.*
+
 ## Store tree
 
 ```text
