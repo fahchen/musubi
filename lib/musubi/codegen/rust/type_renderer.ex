@@ -81,10 +81,11 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
   `nil`), its rendered type, and the `///` doc lines above it.
   """
   @type field_spec() :: %{
-          ident: String.t(),
-          rename: String.t() | nil,
-          type: String.t(),
-          docs: [String.t()]
+          :ident => String.t(),
+          :rename => String.t() | nil,
+          :type => String.t(),
+          :docs => [String.t()],
+          optional(:skip_none) => boolean()
         }
 
   @typedoc """
@@ -497,7 +498,8 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
   # declaration: one indent level per enclosing `pub mod`.
   defp offset(ctx), do: ctx.depth * String.length(@indent)
 
-  defp attributed?(spec), do: spec.rename != nil or spec.docs != []
+  defp attributed?(spec),
+    do: spec.rename != nil or spec.docs != [] or Map.get(spec, :skip_none, false)
 
   # Every field descends from the *enclosing* prefix, so a sibling field never
   # leaks into the next one's hoisted name; only `:claimed` and `:hoists` carry
@@ -518,8 +520,16 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
 
   defp field_line(spec, indent, visibility, offset) do
     doc_lines(spec.docs, indent) <>
-      rename_line(spec.rename, indent) <> declaration(spec, indent, visibility, offset)
+      rename_line(spec.rename, indent) <>
+      skip_none_line(spec, indent) <> declaration(spec, indent, visibility, offset)
   end
+
+  # `Musubi.Codegen.Rust`'s optional mount attrs must serialize as an absent
+  # key rather than an explicit `null`.
+  defp skip_none_line(%{skip_none: true}, indent),
+    do: "#{indent}#[serde(skip_serializing_if = \"Option::is_none\")]\n"
+
+  defp skip_none_line(_spec, _indent), do: ""
 
   # rustfmt's three shapes for one field, in the order it tries them: all on one
   # line; the type alone on the next line at `indent + 4`; the outermost generic

@@ -201,3 +201,38 @@ defmodule Musubi.TestSupport.TypespecProbeWithReply do
   @doc false
   def __env__, do: @captured_env
 end
+
+defmodule Musubi.TestSupport.TypespecProbeWithAttrs do
+  @moduledoc false
+  # Rust-specific fixture: `attr/3` declarations reach the manifest as `:attrs`
+  # and generate the store's `Params` struct — a required attr as a plain
+  # field, an optional one as `Option<T>`, an already-nilable one left alone,
+  # and an anonymous shape hoisted under the `<Store>Params` prefix. The
+  # `TypespecProbeChild.t()` attr also pins alias expansion: `collect/1` has to
+  # resolve it exactly as it resolves a state field's type.
+
+  use Musubi.Store, root: true
+
+  alias Musubi.TestSupport.TypespecProbeChild
+
+  attr :room_id, String.t(), required: true
+  attr :child, TypespecProbeChild.t(), required: true
+  attr :locale, String.t(), default: "en"
+  attr :since, integer() | nil
+  attr :filter, %{tag: String.t()}
+
+  state do
+    field :title, String.t()
+  end
+
+  @impl Musubi.Store
+  def mount(socket), do: {:ok, socket}
+  @impl Musubi.Store
+  def render(socket), do: %{title: Map.get(socket.assigns, :title, "")}
+  @impl Musubi.Store
+  def handle_command(_name, _payload, socket), do: {:noreply, socket}
+
+  @captured_env __ENV__
+  @doc false
+  def __env__, do: @captured_env
+end

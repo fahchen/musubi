@@ -4,6 +4,7 @@ defmodule Musubi.Codegen.ManifestTest do
   alias Musubi.Codegen.Manifest
   alias Musubi.TestSupport.TypespecProbe
   alias Musubi.TestSupport.TypespecProbeChild
+  alias Musubi.TestSupport.TypespecProbeWithAttrs
 
   setup do
     target =
@@ -66,6 +67,24 @@ defmodule Musubi.Codegen.ManifestTest do
 
       assert [%{name: :ping}, %{name: :toast, payload_fields: payload_fields}] = data.events
       assert [%{name: :msg}, %{name: :level}] = payload_fields
+    end
+
+    test "carries declared attrs through the stamp/read round-trip", %{target: target} do
+      Manifest.stamp(TypespecProbeWithAttrs, "lib/a.ex", target)
+
+      assert [{TypespecProbeWithAttrs, data}] = Manifest.list(target)
+
+      assert [
+               %{name: :room_id, required: true},
+               %{name: :child, required: true},
+               %{name: :locale, required: false, default: "en"},
+               %{name: :since, required: false, default: no_default},
+               %{name: :filter, required: false}
+             ] = data.attrs
+
+      # `attr/3` stores the absent `default:` as a sentinel, so `nil` stays a
+      # legal declared default. It has to survive `term_to_binary/1`.
+      assert no_default == Musubi.DSL.Attr.no_default()
     end
 
     test "returns [] for missing target dir", %{target: target} do
@@ -191,6 +210,24 @@ defmodule Musubi.Codegen.ManifestTest do
 
       assert {:__aliases__, _inner_alias_meta, [:Musubi, :TestSupport, :TypespecProbeChild]} =
                inner_alias
+    end
+
+    test "expands aliased module references inside attr types too", %{target: target} do
+      Process.put(:__musubi_codegen_target_dir__, target)
+
+      env = %{TypespecProbeWithAttrs.__env__() | file: "/abs/lib/probe_with_attrs.ex"}
+      Manifest.__after_compile__(env, "")
+
+      [{TypespecProbeWithAttrs, %{attrs: attrs}}] = Manifest.list(target)
+
+      child_attr = Enum.find(attrs, fn %{name: name} -> name == :child end)
+
+      # `attr :child, TypespecProbeChild.t()` — a single-segment alias in the
+      # source, fully qualified after expansion, exactly like a state field.
+      assert {{:., _dot_meta, [alias_node, :t]}, _call_meta, []} = child_attr.type
+
+      assert {:__aliases__, _alias_meta, [:Musubi, :TestSupport, :TypespecProbeChild]} =
+               alias_node
     end
   end
 end

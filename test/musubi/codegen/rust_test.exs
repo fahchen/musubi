@@ -6,6 +6,7 @@ defmodule Musubi.Codegen.RustTest do
   alias Musubi.TestSupport.TypespecProbe
   alias Musubi.TestSupport.TypespecProbeChild
   alias Musubi.TestSupport.TypespecProbeNestedState
+  alias Musubi.TestSupport.TypespecProbeWithAttrs
   alias Musubi.TestSupport.TypespecProbeWithCommand
   alias Musubi.TestSupport.TypespecProbeWithEvents
   alias Musubi.TestSupport.TypespecProbeWithReply
@@ -125,6 +126,7 @@ defmodule Musubi.Codegen.RustTest do
       impl super::super::super::musubi::Store for TypespecProbeChild {
       const MODULE: &'static str = "Musubi.TestSupport.TypespecProbeChild";
       type State = State;
+      type Params = Params;
       }
 
       /// The store's rendered shape: state fields plus one `UploadSlot` per
@@ -133,6 +135,13 @@ defmodule Musubi.Codegen.RustTest do
       pub struct State {
       pub amount: i64,
       }
+
+      /// The mount params object, one field per `attr/3` declaration: required
+      /// attrs are plain fields, optional ones `Option` that serialize to an
+      /// absent key rather than an explicit `null`. A store declaring no `attr`
+      /// gets an empty struct, which serializes to `{}`.
+      #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+      pub struct Params {}
       }
       }
       }
@@ -346,6 +355,34 @@ defmodule Musubi.Codegen.RustTest do
     end
   end
 
+  describe "render/1 — mount params" do
+    test "attrs become a Params struct, required plain and optional a skipped Option" do
+      rendered = Rust.render([entry(TypespecProbeWithAttrs), entry(TypespecProbeChild)])
+      child = "super::super::super::musubi::test_support::typespec_probe_child::State"
+
+      assert normalize(rendered) =~
+               normalize("""
+               pub struct Params {
+                   pub room_id: String,
+                   pub child: #{child},
+                   #[serde(skip_serializing_if = "Option::is_none")]
+                   pub locale: Option<String>,
+                   #[serde(skip_serializing_if = "Option::is_none")]
+                   pub since: Option<i64>,
+                   #[serde(skip_serializing_if = "Option::is_none")]
+                   pub filter: Option<TypespecProbeWithAttrsParamsFilter>,
+               }
+               """)
+
+      assert normalize(rendered) =~
+               normalize("""
+               pub struct TypespecProbeWithAttrsParamsFilter {
+                   pub tag: String,
+               }
+               """)
+    end
+  end
+
   describe "render/1 — bundle invariants" do
     setup do
       {:ok, rendered: Rust.render(Enum.map(all_probes(), &entry/1))}
@@ -449,6 +486,7 @@ defmodule Musubi.Codegen.RustTest do
       TypespecProbe,
       TypespecProbeChild,
       TypespecProbeNestedState,
+      TypespecProbeWithAttrs,
       TypespecProbeWithCommand,
       TypespecProbeWithEvents,
       TypespecProbeWithReply,
@@ -458,11 +496,11 @@ defmodule Musubi.Codegen.RustTest do
 
   defp entry(module) do
     data = Manifest.collect(module.__env__())
-    {data.module, Map.take(data, [:kind, :fields, :commands, :events, :uploads])}
+    {data.module, Map.take(data, [:kind, :fields, :commands, :events, :attrs, :uploads])}
   end
 
   defp empty_state,
-    do: %{kind: :state, fields: [], commands: [], events: [], uploads: []}
+    do: %{kind: :state, fields: [], commands: [], events: [], attrs: [], uploads: []}
 
   defp store_entry, do: %{empty_state() | kind: :store}
 

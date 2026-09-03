@@ -13,8 +13,8 @@ defmodule Musubi.Codegen.Manifest do
   #     <build>/musubi-codegen/<inspect(module)>/state.term
   #
   # Each `state.term` is `:erlang.term_to_binary(%{module, kind, fields,
-  # commands, events, uploads, source})`. The payload is target-neutral — raw
-  # Musubi reflection with quoted Elixir type ASTs, no renderer strings — so
+  # commands, events, attrs, uploads, source})`. The payload is target-neutral
+  # — raw Musubi reflection with quoted Elixir type ASTs, no renderer strings — so
   # one stamp feeds N renderers. The `module` atom inside the term is the
   # canonical reference; the directory name is purely organizational so
   # consumers can `mix clean`.
@@ -38,6 +38,7 @@ defmodule Musubi.Codegen.Manifest do
              fields: list(),
              commands: list(),
              events: list(),
+             attrs: list(),
              uploads: list()
            }}
 
@@ -66,6 +67,7 @@ defmodule Musubi.Codegen.Manifest do
             fields: list(),
             commands: list(),
             events: list(),
+            attrs: list(),
             uploads: list()
           }
   def collect(%Macro.Env{module: module} = env) do
@@ -75,6 +77,7 @@ defmodule Musubi.Codegen.Manifest do
       fields: expand_field_aliases(List.wrap(module.__musubi__(:fields)), env),
       commands: expand_command_aliases(List.wrap(module.__musubi__(:commands)), env),
       events: expand_event_aliases(List.wrap(module.__musubi__(:events)), env),
+      attrs: expand_field_aliases(List.wrap(module.__musubi__(:attrs)), env),
       uploads: read_uploads(module)
     }
   end
@@ -94,7 +97,7 @@ defmodule Musubi.Codegen.Manifest do
   end
 
   # Test/manual-only counterpart to `__after_compile__/2`: it stamps the same
-  # 7-key payload from module reflection alone, so — having no `Macro.Env` —
+  # 8-key payload from module reflection alone, so — having no `Macro.Env` —
   # it performs **no** alias expansion. Entries it writes can therefore carry
   # single-segment `{:__aliases__, _, [:Child]}` nodes that the real compile
   # path never produces. Renderers must be written against the expanded form
@@ -111,6 +114,7 @@ defmodule Musubi.Codegen.Manifest do
       fields: List.wrap(module.__musubi__(:fields)),
       commands: List.wrap(module.__musubi__(:commands)),
       events: List.wrap(module.__musubi__(:events)),
+      attrs: List.wrap(module.__musubi__(:attrs)),
       uploads: read_uploads(module)
     }
 
@@ -184,8 +188,8 @@ defmodule Musubi.Codegen.Manifest do
 
   @doc """
   Lists every stamped module's `{module, %{kind, fields, commands, events,
-  uploads}}` entry under `target`. Skips entries whose module no longer loads
-  (e.g. a `state do` module deleted from source between compiles — its dir
+  attrs, uploads}}` entry under `target`. Skips entries whose module no longer
+  loads (e.g. a `state do` module deleted from source between compiles — its dir
   lingers until `clean_outdated/1` or `mix clean`).
   """
   @spec list(Path.t()) :: [entry()]
@@ -278,6 +282,7 @@ defmodule Musubi.Codegen.Manifest do
       kind = Map.get(data, :kind) || module_kind(module)
       uploads = List.wrap(Map.get(data, :uploads, []))
       events = List.wrap(Map.get(data, :events, []))
+      attrs = List.wrap(Map.get(data, :attrs, []))
 
       [
         {module,
@@ -286,6 +291,7 @@ defmodule Musubi.Codegen.Manifest do
            fields: data.fields,
            commands: data.commands,
            events: events,
+           attrs: attrs,
            uploads: uploads
          }}
       ]

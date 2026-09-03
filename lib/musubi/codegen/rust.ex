@@ -18,9 +18,9 @@ defmodule Musubi.Codegen.Rust do
     * the module tree, sorted by Elixir module segment. A `kind: :state`
       module becomes a `pub struct` in its parent `pub mod`; a `kind: :store`
       module always gets its own `pub mod` holding the zero-sized marker
-      struct, its `Store` impl, the `State` shape struct, one struct per
-      command payload / reply, one payload struct per push event, and every
-      type hoisted out of those
+      struct, its `Store` impl, the `State` shape struct, the `Params` mount
+      struct, one struct per command payload / reply, one payload struct per
+      push event, and every type hoisted out of those
 
   Rust is nominal, so anonymous maps and non-trivial unions cannot be written
   inline: `Musubi.Codegen.Rust.TypeRenderer` hoists them into named `struct` /
@@ -203,6 +203,7 @@ defmodule Musubi.Codegen.Rust do
       fields: data |> Map.get(:fields, []) |> List.wrap() |> Manifest.renderable_fields(),
       commands: data |> Map.get(:commands, []) |> List.wrap(),
       events: data |> Map.get(:events, []) |> List.wrap(),
+      attrs: data |> Map.get(:attrs, []) |> List.wrap(),
       uploads: data |> Map.get(:uploads, []) |> List.wrap()
     }
   end
@@ -356,13 +357,16 @@ defmodule Musubi.Codegen.Rust do
 
     claimed =
       MapSet.new(
-        [marker, "State"] ++
+        [marker, "State", "Params"] ++
           Enum.flat_map(data.commands, &command_names/1) ++
           Enum.map(data.events, &event_name/1)
       )
 
     {specs, hoists, claimed} = render_fields(data.fields, marker, claimed, opts)
     upload_specs = Enum.map(data.uploads, &upload_spec(&1, prelude))
+
+    {param_specs, param_hoists, claimed} =
+      render_attrs(data.attrs, marker <> "Params", claimed, opts)
 
     {commands, claimed} =
       Enum.flat_map_reduce(data.commands, claimed, &command_blocks(&1, marker, prelude, opts, &2))
@@ -372,8 +376,8 @@ defmodule Musubi.Codegen.Rust do
 
     blocks =
       [marker_block(marker), store_impl_block(module, marker, prelude)] ++
-        [state_block(marker, specs ++ upload_specs, depth)] ++
-        hoisted_blocks(hoists) ++ commands ++ events
+        [state_block(marker, specs ++ upload_specs, depth), params_block(param_specs, depth)] ++
+        hoisted_blocks(hoists ++ param_hoists) ++ commands ++ events
 
     {blocks, claimed}
   end
@@ -411,6 +415,7 @@ defmodule Musubi.Codegen.Rust do
     impl #{prelude}::Store for #{marker} {
     #{@indent}const MODULE: &'static str = "#{full_module_name(module)}";
     #{@indent}type State = State;
+    #{@indent}type Params = Params;
     }
     """
   end
@@ -421,6 +426,45 @@ defmodule Musubi.Codegen.Rust do
     /// declared upload. Reached as `<#{marker} as Store>::State`.
     """ <> TypeRenderer.struct_block("State", specs, depth)
   end
+
+  defp params_block(specs, depth) do
+    """
+    /// The mount params object, one field per `attr/3` declaration: required
+    /// attrs are plain fields, optional ones `Option` that serialize to an
+    /// absent key rather than an explicit `null`. A store declaring no `attr`
+    /// gets an empty struct, which serializes to `{}`.
+    """ <> TypeRenderer.struct_block("Params", specs, depth)
+  end
+
+  # `attr/3` metadata is field-shaped (`%{name, type, required, default}`) but
+  # carries no `:opts`, so it renders through `render_fields/4` unchanged; only
+  # the optionality wrapper is attr-specific. Declared defaults stay
+  # server-side (`Musubi.Reconciler.normalize_assigns/2` applies them), so an
+  # optional attr is `Option<T>` whether or not it declared one.
+  defp render_attrs(attrs, item_name, claimed, opts) do
+    {specs, hoists, claimed} = render_fields(attrs, item_name, claimed, opts)
+
+    {Enum.zip_with(attrs, specs, &optional_spec/2), hoists, claimed}
+  end
+
+  # An unset optional attr must serialize to an *absent* key, the way the
+  # TypeScript client omits it: `normalize_assigns/2` gates a declared default
+  # on `Map.has_key?/2`, so a present-but-nil key would suppress the default,
+  # and `Musubi.Codegen.Rust`'s params also feed `cache_key/3`, which has to
+  # agree byte-for-byte with `storeCacheKey`.
+  defp optional_spec(%{required: true}, spec), do: spec
+
+  defp optional_spec(_attr, spec) do
+    spec
+    |> Map.put(:type, optionalize(spec.type))
+    |> Map.put(:skip_none, true)
+  end
+
+  # `String.t() | nil` already renders as `Option<String>`; wrapping again
+  # would emit `Option<Option<String>>`, which serde only accepts a doubly
+  # nested null for.
+  defp optionalize("Option<" <> _rest = type), do: type
+  defp optionalize(type), do: "Option<" <> type <> ">"
 
   defp upload_spec(%{name: name}, prelude) do
     {ident, rename} = Names.field_ident(name)
