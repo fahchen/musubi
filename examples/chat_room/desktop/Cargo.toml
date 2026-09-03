@@ -40,3 +40,11 @@ futures = "0.3"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Tests only. The same crates.io `gpui`, with its in-process test platform and
+# `TestAppContext` turned on; `cargo build` links neither the feature nor the
+# extra dependencies it pulls. `phoenix-channel` stays absent here too — the
+# rig in `app.rs` spells the serializer-v2 five-tuple out by hand rather than
+# name the transport crate an embedder is not supposed to depend on.
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }

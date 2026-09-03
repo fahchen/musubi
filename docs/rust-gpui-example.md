@@ -379,7 +379,7 @@ server.
 | # | Component | Musubi feature | gpui construct |
 | :-- | :-- | :-- | :-- |
 | 1 | `ChatWindow` root view | root store mount (join = mount) | `Entity<ChatWindow>` + `impl Render` |
-| 2 | Message list | `stream_async :messages` → materialized `Vec<MessageState>` | `uniform_list` |
+| 2 | Message list | `stream_async :messages` → materialized `Vec<MessageState>` | `gpui::list` + `ListState` |
 | 3 | History loading / failed states | `AsyncResult` `loading \| ok \| failed` | `match` on the generated enum |
 | 4 | Composer + send | `send_message` command, reply `{queued}` | `gpui-component` `Input` + `cx.spawn` |
 | 5 | Delivery receipt | `last_send_status` tagged union (`start_async`/`handle_async`) | `match` on `ChatRoomStoreLastSendStatus` |
@@ -421,28 +421,25 @@ store nothing the fields do not already say.
 the window cancels both — dropping a gpui `Task` cancels it, and a detached
 update loop would keep a `Mounted` alive past the view.
 
-### 4.2 Message list — `uniform_list`
+### 4.2 Message list — `gpui::list`
 
 The stream materializes to an ordinary `Vec<MessageState>` on the snapshot
 (`docs/rust-client.md` §4.6), so the list is a plain slice render:
 
 ```rust
-uniform_list("messages", messages.len(), cx.processor(|this, range: Range<usize>, _w, _cx| {
-    range.map(|ix| this.message_row(ix)).collect::<Vec<_>>()
-})).h_full()
+list(self.messages.clone(), move |ix, _window, _cx| message_row(&state, ix, dimmed)).flex_1()
 ```
 
 Two ordering facts carry over from the server: the store inserts with
 `at: 0` and `limit: -100`, so index 0 is the **newest** message and the client
 never holds more than 100. The view renders newest-first (no reversal, no
-scroll-to-bottom bookkeeping), which is also the cheapest thing to do with a
-fixed-height virtualized list.
+scroll-to-bottom bookkeeping), matching the browser client.
 
-`uniform_list` requires a fixed row height. v1 pins 44 px and truncates long
-bodies with `text_ellipsis`. If wrapping bodies become a requirement, the
-upgrade is `gpui::list` + `ListState` (the variable-height, bottom-aligned
-variant; see zed `crates/gpui/examples/list_example.rs`) — a swap of one
-element, not a redesign.
+Rows are message bubbles whose bodies wrap, so there is no single height to
+measure once and `uniform_list` does not apply; `gpui::list` virtualizes over
+variable heights instead. The price is one piece of view state: `ListState`
+caches a height per row, so the view has to call `reset(count)` whenever the
+stream's length changes.
 
 ### 4.3 Async states
 
@@ -454,7 +451,7 @@ every start and every reconnect.
 ```rust
 match &snapshot.messages {
     AsyncResult::Loading { result, .. } => /* skeleton, or stale rows if result is Some */,
-    AsyncResult::Ok { result, .. }      => /* uniform_list */,
+    AsyncResult::Ok { result, .. }      => /* the virtualized list */,
     AsyncResult::Failed { reason, .. }  => /* "Could not load history" + reason */,
 }
 ```
@@ -509,11 +506,14 @@ landed it was not needed**. The widget is `gpui_component::input::Input` over an
 use store::ChatRoomStoreLastSendStatus as SendStatus;
 
 match &snapshot.last_send_status {
-    SendStatus::Idle => pill("idle", NEUTRAL),
-    SendStatus::Ok { id } => pill(format!("delivered {id}"), GREEN),
-    SendStatus::Failed { reason } => pill(format!("failed: {reason}"), RED),
+    SendStatus::Idle => "idle".into(),
+    SendStatus::Ok { id } => format!("ok ({id})").into(),
+    SendStatus::Failed { reason } => format!("failed ({reason})").into(),
 }
 ```
+
+The last command reply, when there is one, takes precedence over this line —
+the same `feedback || renderSendStatus(...)` the browser client uses.
 
 The arms bind inline struct-variant fields directly, which is why
 `docs/rust-codegen.md` §3.4 case 5 inlines struct variants rather than wrapping
@@ -876,8 +876,9 @@ deliberately routes around both.
 - **Packaging.** No `.app` bundle, no code signing, no installer. `cargo run`.
 - **Windows and web (`gpui_web`).** Both require the git path.
 - **A shared Rust UI toolkit.** `app.rs` is one file of straight-line render
-  code. No component library, no theme abstraction, no state-management layer
-  on top of `Mounted`.
+  code and `theme.rs` is a flat list of the colors `ui/src/App.css` already
+  hard-codes. No component library, no design-token pipeline, no
+  state-management layer on top of `Mounted`.
 
 ---
 
