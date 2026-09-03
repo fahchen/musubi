@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! let connection = musubi_client_tokio::builder("wss://example.test/socket").build()?;
-//! let cart: Mounted<CartStore> = connection.mount("cart:page", json!({})).await?;
+//! let cart: Mounted<CartStore> = connection.mount("cart:page", Params {}).await?;
 //! ```
 //!
 //! Choosing a runtime is a crate choice, not a feature flag: depending on

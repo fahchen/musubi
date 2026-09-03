@@ -62,6 +62,10 @@ pub enum MusubiError {
     /// A dispatched command did not succeed.
     #[error(transparent)]
     Command(#[from] CommandError),
+    /// An upload's control plane failed: preflight, chunk transfer, or an
+    /// external uploader (`docs/rust-client.md` §10.2).
+    #[error(transparent)]
+    Transfer(#[from] TransferError),
 }
 
 /// Why applying an envelope's `ops` failed.
@@ -130,5 +134,58 @@ pub enum CommandError {
         command: &'static str,
         /// The store the command was dispatched on.
         store_id: StoreId,
+    },
+}
+
+/// Why an upload's control plane could not finish (§10.2).
+///
+/// Everything an upload shares with the rest of the client — a rejected join, a
+/// timeout, a dropped socket — stays on [`MusubiError`]; only the
+/// upload-specific failures live here. Server-driven entry failures are **not**
+/// errors: they arrive as `{op: error}` on
+/// [`UploadEntry::errors`](crate::UploadEntry::errors).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum TransferError {
+    /// A main-channel upload push was answered with `status: "error"`.
+    #[error("upload push {event} was rejected: {reason}")]
+    Rejected {
+        /// The pushed event: `allow_upload`, `cancel_upload`, ….
+        event: &'static str,
+        /// The server's reason string, verbatim.
+        reason: String,
+    },
+    /// The chunk sub-channel rejected a chunk and stopped; the matching
+    /// `{op: error}` carries the machine-readable code.
+    #[error("chunk of entry {entry_ref} was rejected: {reason}")]
+    Chunk {
+        /// The entry whose transfer failed.
+        entry_ref: String,
+        /// The server's reason string, verbatim.
+        reason: String,
+    },
+    /// The transfer was cancelled while it was running.
+    #[error("transfer of entry {entry_ref} was cancelled")]
+    Cancelled {
+        /// The entry whose transfer was cancelled.
+        entry_ref: String,
+    },
+    /// The server picked an external uploader this client did not register
+    /// (BDR-0027).
+    #[error("no uploader registered as {uploader:?}, which entry {entry_ref} needs")]
+    NoUploader {
+        /// The uploader name the server chose.
+        uploader: String,
+        /// The entry that needed it.
+        entry_ref: String,
+    },
+    /// A registered external uploader reported a failure; the server has been
+    /// told, as `code: "external_failed"`.
+    #[error("uploader failed for entry {entry_ref}: {message}")]
+    Uploader {
+        /// The entry whose transfer failed.
+        entry_ref: String,
+        /// The uploader's own message.
+        message: String,
     },
 }

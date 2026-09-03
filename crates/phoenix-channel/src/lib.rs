@@ -31,6 +31,10 @@
 //! }
 //! ```
 //!
+//! Pushes are JSON by default; [`Channel::push_binary`] sends a raw payload in
+//! a serializer v2 binary frame ([`BinaryPush`]) instead, which is how Phoenix
+//! carries upload chunks. Its reply is an ordinary text `phx_reply`.
+//!
 //! # Recovery
 //!
 //! The socket reconnects on its own with the `phoenix.js` backoff ladder plus
@@ -52,6 +56,6 @@ mod url;
 
 pub use crate::channel::{Channel, ChannelErrorReason, ChannelEvent, ChannelEvents};
 pub use crate::error::{BuildError, PushError, SocketClosed, TransportError};
-pub use crate::frame::{Frame, Message, Reply, ReplyStatus};
+pub use crate::frame::{BinaryFrameError, BinaryPush, Frame, Message, Reply, ReplyStatus};
 pub use crate::seams::{Connector, Socket, Spawner, Timer};
 pub use crate::socket::{PhoenixSocket, SocketBuilder};

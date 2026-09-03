@@ -11,8 +11,10 @@
 //!
 //! Every item in that list lives here, because a bundle-local `trait Store`
 //! would be a *different* trait from the one [`Connection::mount`] is generic
-//! over. [`AsyncErrorKind`] is reachable through [`AsyncError`] and is exported
-//! too, though no generated item names it directly.
+//! over. The generated `Params` struct is *not* in that list: it is per-store,
+//! so the bundle declares it rather than re-exporting it. [`AsyncErrorKind`]
+//! is reachable through [`AsyncError`] and is exported too, though no generated
+//! item names it directly.
 //!
 //! [`Connection::mount`]: https://github.com/fahchen/musubi/blob/main/docs/rust-client.md
 
@@ -82,8 +84,9 @@ pub struct StoreField<S> {
 
 /// An upload slot. The wire node is `{"__musubi_upload__": "<name>"}`.
 ///
-/// Inert in v1: the upload engine is deferred (`docs/rust-client.md` §10), so
-/// only the declared name reaches the generated types.
+/// Inert by design: the live upload state is not part of the state tree. The
+/// slot carries the declared name, which is the key the handle is reached by —
+/// `mounted.upload(&store_id, &slot.name)` (`docs/rust-client.md` §10).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UploadSlot {
     /// The declared upload name.
@@ -198,6 +201,10 @@ pub trait Store: Send + Sync + 'static {
     const MODULE: &'static str;
     /// The store's rendered shape.
     type State: DeserializeOwned + Send + Sync + 'static;
+    /// The mount params object: one field per `attr/3` declaration, required
+    /// attrs plain and optional ones `Option`. A store declaring no `attr`
+    /// gets an empty struct, which serializes to `{}`.
+    type Params: Serialize + Send + 'static;
 }
 
 /// A command payload, generic over the owning store so that

@@ -19,6 +19,10 @@ let (channel, mut events) = socket.channel("room:lobby", json!({})).await?;
 let reply = channel.push("new_msg", json!({"body": "hi"})).await?;
 ```
 
+A payload that is not JSON goes out as a serializer v2 binary frame —
+`channel.push_binary("chunk", bytes)` — and is answered with an ordinary text
+`phx_reply`, like any other push.
+
 ## Using it
 
 The crate is unpublished: it ships inside the Hex `musubi` package, so a

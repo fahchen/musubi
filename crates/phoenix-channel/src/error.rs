@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::frame::BinaryFrameError;
+
 /// A failure at the socket/IO level.
 ///
 /// This is the error type of the [`Socket`](crate::Socket) seam: transport
@@ -112,4 +114,8 @@ pub enum PushError {
     /// The socket actor is no longer running.
     #[error(transparent)]
     SocketClosed(#[from] SocketClosed),
+    /// A binary push could not be framed; see
+    /// [`BinaryPush`](crate::BinaryPush).
+    #[error(transparent)]
+    Unframable(#[from] BinaryFrameError),
 }

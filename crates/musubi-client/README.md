@@ -17,7 +17,7 @@ let connection = Connection::builder()
     .timer(timer)
     .build()?;
 
-let cart: Mounted<CartStore> = connection.mount("cart:page", json!({})).await?;
+let cart: Mounted<CartStore> = connection.mount("cart:page", Params {}).await?;
 let state = cart.snapshot();
 let reply = cart.command(AddItem { sku: "ABC".into() }).await?;
 ```
@@ -60,8 +60,22 @@ branch.
 
 ## Scope of v1
 
-Uploads are parsed but not driven (`UploadSlot` is inert), and reconnect is
-reconnect-only: a version gap or a rejoin keeps the last-good rendering and
-waits for a fresh initial envelope. See `docs/rust-client.md` §9–§10 in the
-Musubi repository for the full contract, and `docs/rust-codegen.md` for the
-generated bundle.
+Uploads are both observed and driven. `upload_ops` are folded into per-store
+handles you read with `Mounted::upload(&store_id, name)` — `snapshot()` and
+`updates()`, same as state — and the same handle carries `select()`, `start()`,
+`cancel()` and `reset()`. The state slot itself stays the inert `UploadSlot`,
+which carries the handle's name. The crate reads no files: you hand it an
+`UploadFile` (bytes plus name and content type), and an external destination is
+your own `Uploader` registered on the builder. Reconnect is reconnect-only: a
+version gap or a rejoin keeps the last-good rendering and waits for a fresh
+initial envelope, and an upload in flight fails rather than resuming. See
+Mounts can be stale-while-revalidate. `ConnectionBuilder::cache` takes a
+`CacheStore` — `MemoryCacheStore` ships here, a durable one is yours — and every
+mount then publishes the last-known wire tree for its `(module, id, params)`
+while the live join revalidates in the background; the real initial patch
+replaces the seed in one whole-root op. Writes are throttled, entries carry a
+`buster` you set to your build version, and a seeded root queues command
+dispatches behind its in-flight initial patch instead of rejecting them.
+
+See `docs/rust-client.md` §6.4 and §9–§10 in the Musubi repository for the full
+contract, and `docs/rust-codegen.md` for the generated bundle.

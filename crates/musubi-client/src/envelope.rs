@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::error::{MusubiError, PatchError, Result};
 use crate::generated::StoreId;
+use crate::uploads::UploadOp;
 
 /// The envelope discriminator every `"patch"` push carries.
 const ENVELOPE_TYPE: &str = "patch";
@@ -33,7 +34,8 @@ pub struct PatchEnvelope {
     pub ops: Vec<PatchOp>,
     /// The stream deltas, in flush order (parent store first).
     pub stream_ops: Vec<StreamOp>,
-    /// The upload deltas. Parsed and discarded in v1 (`docs/rust-client.md` §10).
+    /// The upload deltas, in flush order. Folded into the root's upload
+    /// registry (`docs/rust-client.md` §10), never into the tree.
     pub upload_ops: Vec<UploadOp>,
     /// The transient push events (BDR-0032) dispatched after state is applied.
     pub events: Vec<PushEvent>,
@@ -124,7 +126,7 @@ struct RawEnvelope {
     ops: Vec<RawOp>,
     #[serde(default)]
     stream_ops: Vec<StreamOp>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy_upload_ops")]
     upload_ops: Vec<UploadOp>,
     #[serde(default)]
     events: Vec<PushEvent>,
@@ -141,6 +143,34 @@ struct RawOp {
     path: String,
     #[serde(default, deserialize_with = "present_value")]
     value: Option<Value>,
+}
+
+/// Decodes `upload_ops` element by element, skipping the ones this build does
+/// not understand.
+///
+/// One unrecognised `op` tag — or an unrecognised `entry.status` inside an
+/// `add` — must not take the whole envelope with it: the state `ops`, the
+/// `stream_ops` and the `events` travelling alongside are unrelated, and
+/// failing the envelope would gap the root's version over an upload delta.
+/// `applyOps` in `packages/client/src/uploads.ts` is a `switch` with no
+/// `default`, so it already ignores exactly these ops and applies the rest.
+fn lossy_upload_ops<'de, D>(deserializer: D) -> std::result::Result<Vec<UploadOp>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Vec::<Value>::deserialize(deserializer)?;
+
+    Ok(raw
+        .into_iter()
+        .filter_map(|op| match serde_json::from_value(op.clone()) {
+            Ok(op) => Some(op),
+            Err(error) => {
+                tracing::warn!(%error, %op, "skipping an upload op this build cannot decode");
+
+                None
+            }
+        })
+        .collect())
 }
 
 /// Reads a present `value` key, `null` included.
@@ -239,22 +269,6 @@ pub enum StreamOp {
         /// The item's identity within the stream.
         item_key: String,
     },
-}
-
-/// One upload delta (BDR-0025).
-///
-/// v1 parses uploads only far enough to keep change notification correct
-/// (`docs/rust-client.md` §10): the op is otherwise discarded, so only the
-/// fields every variant shares are modelled.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct UploadOp {
-    /// The op name (`config`, `add`, `progress`, `complete`, `error`,
-    /// `cancel`, `reset`).
-    pub op: String,
-    /// The declared upload name.
-    pub upload: String,
-    /// The owning store's path.
-    pub store_id: StoreId,
 }
 
 /// One transient push event (BDR-0032), dispatched per `(store_id, name)`.

@@ -7,6 +7,7 @@
 //! copy into `Arc<S::State>`.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -15,18 +16,20 @@ use crate::error::{MusubiError, Result};
 use crate::generated::StoreId;
 use crate::index::{StoreIndex, build_store_index};
 use crate::streams::StreamStore;
+use crate::uploads::Uploads;
 use crate::{hydrate, patch};
 
 /// The message an out-of-sequence initial envelope produces.
 const INITIAL_VERSION_MESSAGE: &str = "Initial patch envelope must start at version 1";
 
-/// One root's shadow document, store index, streams and version.
+/// One root's shadow document, store index, streams, uploads and version.
 #[derive(Debug)]
 pub struct PatchEngine {
     version: u64,
     document: Value,
     index: StoreIndex,
     streams: StreamStore,
+    uploads: Arc<Uploads>,
 }
 
 impl PatchEngine {
@@ -38,12 +41,36 @@ impl PatchEngine {
     /// assert_eq!(PatchEngine::new().version(), 0);
     /// ```
     pub fn new() -> Self {
+        Self::with_uploads(Arc::new(Uploads::default()))
+    }
+
+    /// The engine a mounted root gets: same as [`new`](Self::new), except the
+    /// upload registry is the one its [`Mounted`](crate::Mounted) hands out
+    /// handles from, so folded `upload_ops` and observed handles are the same
+    /// objects.
+    pub(crate) fn with_uploads(uploads: Arc<Uploads>) -> Self {
         Self {
             version: 0,
             document: Value::Null,
             index: StoreIndex::new(),
             streams: StreamStore::default(),
+            uploads,
         }
+    }
+
+    /// The root's upload handles, keyed by `(store_id, name)`.
+    ///
+    /// ```
+    /// use musubi_client::PatchEngine;
+    /// use musubi_client::generated::StoreId;
+    ///
+    /// let engine = PatchEngine::new();
+    /// let avatar = engine.uploads().handle(&StoreId::root(), "avatar");
+    ///
+    /// assert!(avatar.snapshot().is_idle());
+    /// ```
+    pub fn uploads(&self) -> &Uploads {
+        &self.uploads
     }
 
     /// The last accepted envelope's `version`; `0` means "awaiting the initial
@@ -85,7 +112,8 @@ impl PatchEngine {
         &self.document
     }
 
-    /// Forgets the version while keeping the tree, index and streams (§9).
+    /// Forgets the version while keeping the tree, index, streams and uploads
+    /// (§9).
     ///
     /// Every recovery path — a rejoin, a version gap, a transport drop — leaves
     /// the last-good rendering in place and waits for a fresh initial envelope
@@ -116,8 +144,67 @@ impl PatchEngine {
         self.version = 0;
     }
 
+    /// Adopts a cached wire tree as the current document, without touching the
+    /// version (`docs/rust-client.md` §6.4).
+    ///
+    /// The engine stays at `0`, so the live initial envelope is still required
+    /// to be `base_version: 0, version: 1` and still swaps the whole tree out
+    /// in one `replace ""`. Streams are **not** seeded — `stream_ops` are not
+    /// part of the cached tree — so a seeded stream slot hydrates to `[]` until
+    /// the live envelope refills it, exactly as in the TypeScript client.
+    ///
+    /// ```
+    /// use musubi_client::PatchEngine;
+    /// use serde_json::json;
+    ///
+    /// let mut engine = PatchEngine::new();
+    /// let state = engine.seed(json!({"__musubi_store_id__": [], "title": "Cart"}));
+    ///
+    /// assert_eq!(state["title"], json!("Cart"));
+    /// assert_eq!(engine.version(), 0);
+    /// ```
+    pub fn seed(&mut self, document: Value) -> Value {
+        self.document = document;
+        self.index = build_store_index(&self.document);
+
+        let live_store_ids: HashSet<StoreId> = self.index.keys().cloned().collect();
+
+        self.streams.prune(&live_store_ids);
+        self.uploads.prune(&live_store_ids);
+
+        hydrate::hydrate(&self.document, &self.streams)
+    }
+
+    /// Undoes a [`seed`](Self::seed) whose tree did not match the generated
+    /// types, putting the engine back where a cold mount would have left it.
+    ///
+    /// A cached tree written by an older build can be a shape this binary can
+    /// no longer deserialize; dropping it is always safe, because the live
+    /// initial patch replaces the whole tree anyway.
+    ///
+    /// ```
+    /// use musubi_client::PatchEngine;
+    /// use serde_json::json;
+    ///
+    /// let mut engine = PatchEngine::new();
+    ///
+    /// engine.seed(json!({"title": "Cart"}));
+    /// engine.discard_seed();
+    ///
+    /// assert!(engine.document().is_null());
+    /// ```
+    pub fn discard_seed(&mut self) {
+        self.document = Value::Null;
+        self.index = StoreIndex::new();
+    }
+
     /// Applies one envelope in the order §4.3 fixes: validate, patch, stream
-    /// ops, upload ops, rebuild the index, hydrate.
+    /// ops, upload ops, rebuild the index, prune, hydrate.
+    ///
+    /// Upload ops are folded into the registry rather than into the tree: an
+    /// upload slot stays the inert `{"__musubi_upload__": name}` marker on the
+    /// hydrated state, and its live state is read through
+    /// [`uploads`](Self::uploads) (§10).
     ///
     /// Nothing is mutated unless every step succeeds — `json_patch::patch` is
     /// atomic, the op allowlist already ran at decode, and the version check
@@ -157,19 +244,14 @@ impl PatchEngine {
 
         self.streams.apply_ops(&envelope.stream_ops);
 
-        if !envelope.upload_ops.is_empty() {
-            // Uploads are deferred wholesale (§10).
-            tracing::debug!(
-                count = envelope.upload_ops.len(),
-                "discarding upload ops: the upload engine is not implemented"
-            );
-        }
+        self.uploads.apply_ops(&envelope.upload_ops);
 
         self.index = build_store_index(&self.document);
 
         let live_store_ids: HashSet<StoreId> = self.index.keys().cloned().collect();
 
         self.streams.prune(&live_store_ids);
+        self.uploads.prune(&live_store_ids);
 
         self.version = envelope.version;
 

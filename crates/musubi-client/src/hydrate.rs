@@ -11,7 +11,8 @@
 //!
 //! * Upload slots (`{"__musubi_upload__": name}`) — the generated field type
 //!   is the inert [`UploadSlot`](crate::generated::UploadSlot), which
-//!   deserializes from the marker as-is (§10).
+//!   deserializes from the marker as-is. Live upload state is folded into the
+//!   root's upload registry instead of into the tree (§10).
 //! * Async nodes — [`AsyncResult`](crate::generated::AsyncResult) is an
 //!   internally-tagged enum that deserializes the wire shape directly, so the
 //!   node needs no rewriting. Markers *inside* its `result` are still

@@ -9,7 +9,7 @@
 //! the actor task as §2.4 requires.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::{self, UnboundedSender};
 use futures_channel::oneshot;
@@ -23,6 +23,9 @@ use serde_json::Value;
 use crate::actor::{ActorMsg, CommandRequest, ConnectionInner};
 use crate::error::{MusubiError, Result};
 use crate::generated::{Command, Event, Store, StoreId};
+use crate::lock;
+use crate::transfer::UploadControl;
+use crate::uploads::{Upload, Uploads};
 
 /// Push-event subscribers, keyed the way BDR-0032 dispatches: `(store_id, name)`.
 type EventRegistry = HashMap<(StoreId, String), Vec<UnboundedSender<Value>>>;
@@ -37,6 +40,11 @@ pub(crate) trait RootSink: Send + Sync + 'static {
     /// `(store_id, name)`. An event with no subscriber is dropped silently.
     fn dispatch_event(&self, store_id: &StoreId, name: &str, payload: &Value);
 
+    /// The root's upload registry, which the actor hands to its
+    /// [`PatchEngine`](crate::PatchEngine) so the folded `upload_ops` land in
+    /// the same handles [`Mounted::upload`] reads.
+    fn uploads(&self) -> Arc<Uploads>;
+
     /// Drops the snapshot and every subscription, ending their streams. Called
     /// once, when the root leaves the registry.
     fn clear(&self);
@@ -47,15 +55,24 @@ pub(crate) struct RootCell<St: Store> {
     snapshot: Mutex<Option<Arc<St::State>>>,
     updates: Mutex<Vec<UnboundedSender<Arc<St::State>>>>,
     events: Mutex<EventRegistry>,
+    // Not behind the outer `Mutex`es: the registry has its own interior
+    // locking, because the actor folds ops into it while the embedder reads
+    // handles out of it.
+    uploads: Arc<Uploads>,
 }
 
 impl<St: Store> RootCell<St> {
-    /// An empty cell: no snapshot yet, no subscribers.
-    pub(crate) fn new() -> Self {
+    /// An empty cell: no snapshot yet, no subscribers, no upload handles.
+    ///
+    /// `control` is how the upload handles this cell hands out reach the
+    /// server; it is built by the mount call, which is the only place that
+    /// knows the root id.
+    pub(crate) fn new(control: Arc<UploadControl>) -> Self {
         Self {
             snapshot: Mutex::new(None),
             updates: Mutex::new(Vec::new()),
             events: Mutex::new(EventRegistry::new()),
+            uploads: Arc::new(Uploads::new(control)),
         }
     }
 }
@@ -88,10 +105,15 @@ impl<St: Store> RootSink for RootCell<St> {
         }
     }
 
+    fn uploads(&self) -> Arc<Uploads> {
+        Arc::clone(&self.uploads)
+    }
+
     fn clear(&self) {
         *lock(&self.snapshot) = None;
         lock(&self.updates).clear();
         lock(&self.events).clear();
+        self.uploads.clear();
     }
 }
 
@@ -102,7 +124,7 @@ impl<St: Store> RootSink for RootCell<St> {
 /// leaves the channel, which stops the server-side root via `terminate/2`.
 ///
 /// ```text
-/// let cart: Mounted<CartStore> = connection.mount("cart:page", json!({})).await?;
+/// let cart: Mounted<CartStore> = connection.mount("cart:page", Params {}).await?;
 ///
 /// let mut updates = cart.updates();
 /// let reply = cart.command(Checkout { coupon: None }).await?;
@@ -237,6 +259,32 @@ impl<St: Store> Mounted<St> {
         })
     }
 
+    /// One upload of one store, as a handle over its live state.
+    ///
+    /// Uploads are singletons per store (BDR-0028), so `(store_id, name)`
+    /// addresses exactly one handle; `name` is the declared upload name, which
+    /// arrives on the snapshot as [`UploadSlot::name`](crate::generated::UploadSlot).
+    /// A handle exists from the first call — before any op has landed it reads
+    /// as idle with the framework defaults — and the same key always resolves
+    /// to the same handle, so it can be taken as soon as the marker appears.
+    ///
+    /// The handle carries the server-driven state *and* the control plane:
+    /// [`select`](Upload::select), [`start`](Upload::start),
+    /// [`cancel`](Upload::cancel) and [`reset`](Upload::reset) are on it
+    /// (`docs/rust-client.md` §10.2).
+    ///
+    /// ```text
+    /// let avatar = cart.upload(&StoreId::root(), &cart.snapshot()?.avatar.name);
+    /// let mut updates = avatar.updates();
+    ///
+    /// while let Some(handle) = updates.next().await {
+    ///     render(handle.progress());
+    /// }
+    /// ```
+    pub fn upload(&self, store_id: &StoreId, name: &str) -> Upload {
+        self.cell.uploads.handle(store_id, name)
+    }
+
     /// Builds the handle. Called by the mount path once the actor has the root
     /// registered, so the refcount this handle owns is already counted.
     pub(crate) fn new(
@@ -305,15 +353,4 @@ impl<St: Store> Drop for Mounted<St> {
             root_id: Arc::clone(&self.root_id),
         });
     }
-}
-
-/// Locks a cell, ignoring poisoning.
-///
-/// A panic in a subscriber's `Drop` must not take the whole connection down
-/// with it: the data behind these locks is plain state with no invariant a
-/// half-finished write could break.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

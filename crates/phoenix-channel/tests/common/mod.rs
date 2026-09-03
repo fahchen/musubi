@@ -22,7 +22,7 @@ use futures_executor::LocalPool;
 use futures_util::task::{LocalSpawnExt, noop_waker};
 use futures_util::{Sink, Stream, StreamExt};
 use phoenix_channel::{
-    Connector, Frame, Message, ReplyStatus, Socket, Spawner, Timer, TransportError,
+    BinaryPush, Connector, Frame, Message, ReplyStatus, Socket, Spawner, Timer, TransportError,
 };
 use serde_json::{Value, json};
 
@@ -99,6 +99,7 @@ impl<T> Harness<T> {
         ServerEnd {
             to_client: Some(to_client),
             from_client,
+            pending: Vec::new(),
         }
     }
 
@@ -190,22 +191,60 @@ impl<T> Pump for Harness<T> {
 pub struct ServerEnd {
     to_client: Option<UnboundedSender<Result<Frame, TransportError>>>,
     from_client: UnboundedReceiver<Frame>,
+    /// Frames read off the socket but not yet claimed. Text and binary frames
+    /// are claimed by different assertions (`sent` vs `sent_binary`), so a
+    /// frame of the other kind must not be dropped — or consumed out of order.
+    pending: Vec<Frame>,
 }
 
 impl ServerEnd {
-    /// Everything the client wrote since the last call, decoded.
+    /// Every text frame the client wrote since the last call, decoded.
     pub fn sent(&mut self, harness: &mut impl Pump) -> Vec<Message> {
+        self.claim(harness, |frame| match frame {
+            Frame::Text(text) => {
+                Ok(Message::decode(&text).expect("client text frames are five-tuples"))
+            }
+            other => Err(other),
+        })
+    }
+
+    /// Every binary frame the client wrote since the last call, decoded.
+    pub fn sent_binary(&mut self, harness: &mut impl Pump) -> Vec<BinaryPush> {
+        self.claim(harness, |frame| match frame {
+            Frame::Binary(bytes) => {
+                Ok(BinaryPush::decode(&bytes).expect("client binary frames are pushes"))
+            }
+            other => Err(other),
+        })
+    }
+
+    /// Reads everything outstanding, keeping whatever `take` does not claim.
+    fn claim<T>(
+        &mut self,
+        harness: &mut impl Pump,
+        take: impl Fn(Frame) -> Result<T, Frame>,
+    ) -> Vec<T> {
         harness.pump();
 
-        let mut messages = Vec::new();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        while let Poll::Ready(Some(Frame::Text(text))) = self.from_client.poll_next_unpin(&mut cx) {
-            messages.push(Message::decode(&text).expect("client frames are five-tuples"));
+        while let Poll::Ready(Some(frame)) = self.from_client.poll_next_unpin(&mut cx) {
+            self.pending.push(frame);
         }
 
-        messages
+        let mut claimed = Vec::new();
+        let mut kept = Vec::new();
+
+        for frame in std::mem::take(&mut self.pending) {
+            match take(frame) {
+                Ok(value) => claimed.push(value),
+                Err(frame) => kept.push(frame),
+            }
+        }
+
+        self.pending = kept;
+        claimed
     }
 
     pub fn push(&self, message: Message) {
@@ -223,6 +262,22 @@ impl ServerEnd {
             event: event.to_owned(),
             payload,
         });
+    }
+
+    /// Replies to a binary push. Phoenix answers one with an ordinary text
+    /// `phx_reply`, never with a binary frame.
+    pub fn reply_binary(&self, to: &BinaryPush, status: ReplyStatus, response: Value) {
+        self.reply(
+            &Message {
+                join_ref: Some(to.join_ref.clone()),
+                msg_ref: Some(to.msg_ref.clone()),
+                topic: to.topic.clone(),
+                event: to.event.clone(),
+                payload: Value::Null,
+            },
+            status,
+            response,
+        );
     }
 
     pub fn reply(&self, to: &Message, status: ReplyStatus, response: Value) {

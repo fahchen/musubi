@@ -11,20 +11,24 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
 use futures_util::StreamExt;
 use phoenix_channel::{
     Channel, ChannelEvent, ChannelEvents, PhoenixSocket, PushError, Reply, ReplyStatus, Spawner,
+    Timer,
 };
 use serde_json::{Value, json};
 
+use crate::cache::{CACHE_WRITE_THROTTLE, CacheEntry, CacheStore, cache_key, now_ms};
 use crate::engine::PatchEngine;
 use crate::envelope::PatchEnvelope;
 use crate::error::{CommandError, MusubiError, Result};
 use crate::generated::StoreId;
 use crate::mounted::RootSink;
+use crate::transfer;
 
 /// The push event a patch envelope arrives under.
 const EVENT_PATCH: &str = "patch";
@@ -33,6 +37,13 @@ const EVENT_COMMAND: &str = "command";
 /// The error-response fields a command's `code` is read from, in priority
 /// order; the first **string-valued** one wins (§6.2).
 const CODE_FIELDS: [&str; 3] = ["code", "error", "reason"];
+/// How many dispatches one cache-seeded root may hold while its live initial
+/// patch is still in flight (§6.2).
+///
+/// The queue exists so a seeded root can be interacted with before `version`
+/// reaches `1`; it is not a retry buffer, so it is small and overflowing it
+/// rejects rather than grows.
+const MAX_QUEUED_DISPATCHES: usize = 32;
 
 /// The typed cell of a mounted root, as the actor sees it: opaque, and handed
 /// back to the mount caller to downcast.
@@ -72,6 +83,48 @@ pub(crate) enum ActorMsg {
         generation: u64,
         /// The event itself.
         event: ChannelEvent,
+    },
+    /// Push one upload control-plane event on a root's main channel
+    /// (`docs/rust-client.md` §10.2).
+    ///
+    /// Routed through the actor rather than pushed from the handle because the
+    /// current channel incarnation is the actor's to know: a recovery replaces
+    /// it, and a handle holding the old one would push into a stale channel.
+    UploadPush {
+        /// The root whose channel carries the push.
+        root_id: Arc<str>,
+        /// The event: `allow_upload`, `cancel_upload`, `upload_progress` or
+        /// `upload_error`.
+        event: &'static str,
+        /// The already-built payload.
+        payload: Value,
+        /// Where the reply goes; `None` for the fire-and-forget relays.
+        reply: Option<oneshot::Sender<Result<Value>>>,
+    },
+    /// A cache read produced a usable entry for a root still awaiting its
+    /// initial patch (`docs/rust-client.md` §6.4).
+    CacheSeed {
+        /// The root to seed.
+        root_id: Arc<str>,
+        /// The slot the read was issued for. A root is addressed by
+        /// `"<module>:<id>"` but its cache slot also keys on the mount params,
+        /// so a read that outlives its own mount is identified — and dropped —
+        /// by this.
+        key: Arc<str>,
+        /// The entry, already checked against the buster and the gc window.
+        entry: CacheEntry,
+    },
+    /// One cache slot's write throttle elapsed.
+    CacheFlush {
+        /// The slot to write.
+        key: Arc<str>,
+    },
+    /// One cache slot's gc window elapsed after its root was torn down.
+    CacheEvict {
+        /// The slot to drop.
+        key: Arc<str>,
+        /// Which arming this fire belongs to; a re-mount invalidates it.
+        epoch: u64,
     },
     /// Tear everything down; the socket is closed for good.
     Disconnect {
@@ -150,11 +203,47 @@ pub(crate) struct Actor {
     socket: PhoenixSocket,
     base_topic: String,
     spawner: Arc<dyn Spawner>,
+    timer: Arc<dyn Timer>,
+    cache: Option<CacheConfig>,
     tx: UnboundedSender<ActorMsg>,
     rx: UnboundedReceiver<ActorMsg>,
     roots: HashMap<Arc<str>, Root>,
+    /// Throttled writes in flight, keyed by cache slot.
+    cache_writes: HashMap<Arc<str>, CacheWriter>,
+    /// Armed evictions, keyed by cache slot; the value is the only epoch whose
+    /// [`ActorMsg::CacheEvict`] still counts.
+    cache_evictions: HashMap<Arc<str>, u64>,
+    next_eviction_epoch: u64,
     next_command_id: u64,
     closed: bool,
+}
+
+/// The connection-wide cache settings (`docs/rust-client.md` §6.4).
+#[derive(Clone)]
+pub(crate) struct CacheConfig {
+    pub(crate) store: Arc<dyn CacheStore>,
+    pub(crate) buster: Arc<str>,
+    pub(crate) gc_time: Duration,
+}
+
+impl CacheConfig {
+    fn gc_ms(&self) -> u64 {
+        u64::try_from(self.gc_time.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether an entry has aged out of the gc window, or was written under a
+    /// different shape token.
+    fn is_usable(&self, entry: &CacheEntry) -> bool {
+        entry.buster == *self.buster && now_ms().saturating_sub(entry.updated_at) <= self.gc_ms()
+    }
+}
+
+/// One cache slot's trailing throttle: the latest tree, and whether a flush is
+/// already armed.
+#[derive(Default)]
+struct CacheWriter {
+    pending: Option<CacheEntry>,
+    armed: bool,
 }
 
 impl Actor {
@@ -163,6 +252,8 @@ impl Actor {
         socket: PhoenixSocket,
         base_topic: String,
         spawner: Arc<dyn Spawner>,
+        timer: Arc<dyn Timer>,
+        cache: Option<CacheConfig>,
         tx: UnboundedSender<ActorMsg>,
         rx: UnboundedReceiver<ActorMsg>,
     ) -> Self {
@@ -170,9 +261,14 @@ impl Actor {
             socket,
             base_topic,
             spawner,
+            timer,
+            cache,
             tx,
             rx,
             roots: HashMap::new(),
+            cache_writes: HashMap::new(),
+            cache_evictions: HashMap::new(),
+            next_eviction_epoch: 0,
             next_command_id: 0,
             closed: false,
         }
@@ -205,6 +301,19 @@ impl Actor {
                 generation,
                 event,
             } => self.channel_event(&root_id, generation, event).await,
+            ActorMsg::UploadPush {
+                root_id,
+                event,
+                payload,
+                reply,
+            } => self.upload_push(&root_id, event, payload, reply),
+            ActorMsg::CacheSeed {
+                root_id,
+                key,
+                entry,
+            } => self.cache_seed(&root_id, &key, entry),
+            ActorMsg::CacheFlush { key } => self.cache_flush(&key),
+            ActorMsg::CacheEvict { key, epoch } => self.cache_evict(&key, epoch),
             ActorMsg::Disconnect { ack } => self.disconnect(ack).await,
             // Handled by the loop so it can break.
             ActorMsg::Shutdown => {}
@@ -230,6 +339,12 @@ impl Actor {
         }
 
         let topic: Arc<str> = Arc::from(format!("{}:{}", self.base_topic, root_id));
+        // The slot this mount reads and writes. `None` when the connection has
+        // no cache store, which is what makes every cache path below a no-op.
+        let key: Option<Arc<str>> = self
+            .cache
+            .as_ref()
+            .map(|_| Arc::from(cache_key(request.module, &request.id, &request.params)));
 
         self.roots.insert(
             Arc::clone(&root_id),
@@ -238,18 +353,29 @@ impl Actor {
                 id: request.id,
                 topic,
                 params: request.params,
+                cache_key: key.clone(),
+                seeded: false,
                 refcount: 1,
                 generation: 0,
                 channel: None,
-                engine: PatchEngine::new(),
+                engine: PatchEngine::with_uploads(request.sink.uploads()),
                 sink: request.sink,
                 cell: request.cell,
                 published: false,
                 recovering: false,
                 pending_mounts: vec![request.reply],
                 pending_commands: HashMap::new(),
+                pending_dispatches: Vec::new(),
             },
         );
+
+        if let Some(key) = key {
+            // A re-mount cancels the eviction its own unmount armed.
+            self.cache_evictions.remove(&key);
+            // Spawned rather than awaited: the read races the join below, so a
+            // slow store delays the seed, never the revalidation (§6.4).
+            self.read_cache(&root_id, key);
+        }
 
         self.attach_and_join(&root_id).await;
     }
@@ -377,9 +503,24 @@ impl Actor {
         };
 
         // No channel, or `version == 0` (mid-reconnect): a dispatch is either
-        // sendable now or rejected.
+        // sendable now or rejected — *unless* a cache seed already made this
+        // root renderable, in which case the caller is looking at state and the
+        // dispatch queues behind the live initial patch (§6.2, §6.4).
         if root.engine.version() == 0 {
-            let _ = request.reply.send(Err(MusubiError::NotConnected));
+            if !root.seeded {
+                let _ = request.reply.send(Err(MusubiError::NotConnected));
+                return;
+            }
+
+            // The queue is a bridge across one revalidation, not a retry
+            // buffer: past its bound the honest answer is the same one an
+            // unseeded root gives.
+            if root.pending_dispatches.len() >= MAX_QUEUED_DISPATCHES {
+                let _ = request.reply.send(Err(MusubiError::NotConnected));
+                return;
+            }
+
+            root.pending_dispatches.push(request);
             return;
         }
 
@@ -471,6 +612,50 @@ impl Actor {
         };
 
         let _ = pending.reply.send(result);
+    }
+
+    /// Pushes one upload control-plane event on a root's channel.
+    ///
+    /// Unlike a command there is no version gate: preflight and cancellation
+    /// are about the upload's own state, which the initial patch says nothing
+    /// about. A channel that is not joined still rejects the push.
+    fn upload_push(
+        &mut self,
+        root_id: &Arc<str>,
+        event: &'static str,
+        payload: Value,
+        reply: Option<oneshot::Sender<Result<Value>>>,
+    ) {
+        let channel = self
+            .roots
+            .get(root_id)
+            .ok_or(MusubiError::Unmounted)
+            .and_then(|root| root.channel.clone().ok_or(MusubiError::NotConnected));
+
+        let channel = match channel {
+            Ok(channel) => channel,
+            Err(error) => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(error));
+                }
+
+                return;
+            }
+        };
+
+        self.spawner.spawn(Box::pin(async move {
+            let outcome = channel.push(event, payload).await;
+
+            // Dropped for a detached push, which is what makes it detached.
+            let Some(reply) = reply else {
+                return;
+            };
+
+            let _ = reply.send(match outcome {
+                Ok(received) => transfer::upload_reply(event, received),
+                Err(error) => Err(transfer::push_error(error)),
+            });
+        }));
     }
 
     /// Routes one channel event, dropping anything from a superseded channel
@@ -674,10 +859,23 @@ impl Actor {
                 .dispatch_event(&event.store_id, &event.name, &event.payload);
         }
 
-        let cell = Arc::clone(&root.cell);
+        self.resolve_mounts(root_id);
+        self.flush_dispatches(root_id);
+        self.schedule_cache_write(root_id);
 
-        // A mount whose future was dropped never receives the cell, so the hold
-        // it took at mount time has to be given back here — nothing else will.
+        Ok(())
+    }
+
+    /// Hands the root's cell to every mount waiting on it.
+    ///
+    /// A mount whose future was dropped never receives the cell, so the hold it
+    /// took at mount time has to be given back here — nothing else will.
+    fn resolve_mounts(&mut self, root_id: &Arc<str>) {
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return;
+        };
+
+        let cell = Arc::clone(&root.cell);
         let mut abandoned = 0;
 
         for reply in root.pending_mounts.drain(..) {
@@ -689,8 +887,25 @@ impl Actor {
         for _ in 0..abandoned {
             self.release(root_id);
         }
+    }
 
-        Ok(())
+    /// Dispatches everything a cache-seeded root queued, in the order it was
+    /// queued (§6.2).
+    ///
+    /// Called once the live initial patch has been published, so the version
+    /// gate each of these re-enters is now open.
+    fn flush_dispatches(&mut self, root_id: &Arc<str>) {
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return;
+        };
+
+        root.seeded = false;
+
+        let queued = std::mem::take(&mut root.pending_dispatches);
+
+        for request in queued {
+            self.command(request);
+        }
     }
 
     /// Fails every pending mount of one root, handing `error` itself to the
@@ -788,6 +1003,10 @@ impl Actor {
 
         reject_commands(&mut root, &reason);
 
+        if let Some(key) = root.cache_key.take() {
+            self.cache_teardown(key);
+        }
+
         for reply in root.pending_mounts.drain(..) {
             let _ = reply.send(Err(reason()));
         }
@@ -811,6 +1030,235 @@ impl Actor {
         let _ = self.socket.disconnect().await;
         let _ = ack.send(());
     }
+
+    // -- Cache (`docs/rust-client.md` §6.4) ---------------------------------
+
+    /// Reads one root's cache slot off the actor task.
+    ///
+    /// Staleness is decided here rather than in [`cache_seed`](Self::cache_seed)
+    /// so that dropping an unusable entry costs the actor nothing, and so the
+    /// entry that reaches the actor is already the one it may seed.
+    fn read_cache(&self, root_id: &Arc<str>, key: Arc<str>) {
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+        let root_id = Arc::clone(root_id);
+        let tx = self.tx.clone();
+
+        self.spawner.spawn(Box::pin(async move {
+            let Some(entry) = cache.store.get(&key).await else {
+                return;
+            };
+
+            if !cache.is_usable(&entry) {
+                cache.store.evict(&key).await;
+                return;
+            }
+
+            let _ = tx.unbounded_send(ActorMsg::CacheSeed {
+                root_id,
+                key,
+                entry,
+            });
+        }));
+    }
+
+    /// Seeds one root from its cache entry: the shadow document is adopted and
+    /// published, and every mount waiting on the root resolves against it —
+    /// before the live initial patch, which then swaps the whole tree out
+    /// atomically.
+    ///
+    /// A cache read can suspend past the live initial patch, so a root that has
+    /// already published keeps what the server sent; the stale seed is dropped.
+    ///
+    /// It can also suspend past the *mount* it was issued for — a failed join
+    /// tears the root down and the caller re-mounts `(module, id)` with
+    /// different params — so a seed whose slot is no longer the root's is
+    /// dropped too: it holds another slot's tree.
+    fn cache_seed(&mut self, root_id: &Arc<str>, key: &Arc<str>, entry: CacheEntry) {
+        let Some(root) = self.roots.get_mut(root_id) else {
+            return;
+        };
+
+        if root.published || root.engine.version() != 0 {
+            return;
+        }
+
+        if root.cache_key.as_deref() != Some(key.as_ref()) {
+            return;
+        }
+
+        let state = root.engine.seed(entry.data);
+
+        if let Err(error) = root.sink.publish(&state) {
+            // A tree written by an older build can be a shape this binary no
+            // longer deserializes. That is not a protocol failure — the live
+            // patch is still coming — so the seed is dropped, the slot is
+            // evicted, and the mount goes on waiting for the cold path.
+            tracing::warn!(
+                root_id = %root_id,
+                %error,
+                "dropping a cache entry whose tree did not match the generated types"
+            );
+            root.engine.discard_seed();
+
+            if let Some(key) = root.cache_key.clone() {
+                self.evict_now(key);
+            }
+
+            return;
+        }
+
+        root.published = true;
+        root.seeded = true;
+
+        self.resolve_mounts(root_id);
+    }
+
+    /// Queues one root's tree for persistence, at most one write per
+    /// [`CACHE_WRITE_THROTTLE`] per slot, always the latest tree.
+    ///
+    /// The *wire* tree is what is stored: seeding is then the same marker
+    /// substitution the engine already does, with no second decoding path.
+    fn schedule_cache_write(&mut self, root_id: &Arc<str>) {
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+        let Some(root) = self.roots.get(root_id) else {
+            return;
+        };
+        let Some(key) = root.cache_key.clone() else {
+            return;
+        };
+        let entry = CacheEntry {
+            data: root.engine.document().clone(),
+            updated_at: now_ms(),
+            buster: cache.buster.to_string(),
+        };
+
+        let writer = self.cache_writes.entry(Arc::clone(&key)).or_default();
+
+        writer.pending = Some(entry);
+
+        if writer.armed {
+            return;
+        }
+
+        writer.armed = true;
+
+        let timer = Arc::clone(&self.timer);
+        let tx = self.tx.clone();
+
+        self.spawner.spawn(Box::pin(async move {
+            timer.sleep(CACHE_WRITE_THROTTLE).await;
+
+            let _ = tx.unbounded_send(ActorMsg::CacheFlush { key });
+        }));
+    }
+
+    /// Writes one slot's latest tree, ending its throttle window.
+    fn cache_flush(&mut self, key: &Arc<str>) {
+        let Some(writer) = self.cache_writes.get_mut(key) else {
+            return;
+        };
+
+        writer.armed = false;
+
+        let Some(entry) = writer.pending.take() else {
+            // Nothing accumulated during the window: the slot is idle, so it
+            // stops costing a map entry.
+            self.cache_writes.remove(key);
+            return;
+        };
+
+        self.write_now(Arc::clone(key), entry);
+    }
+
+    /// Flushes and arms the gc timer for a slot whose root has been torn down.
+    ///
+    /// The remaining window is measured from the entry's own `updated_at`, so
+    /// an entry that was already half-expired when the root unmounted is not
+    /// given a fresh full lifetime.
+    fn cache_teardown(&mut self, key: Arc<str>) {
+        let pending = self
+            .cache_writes
+            .remove(&key)
+            .and_then(|writer| writer.pending);
+
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+
+        // A disconnect keeps whatever was flushed: the entry ages out on its
+        // own, and a reconnecting app can seed from it again.
+        if self.closed {
+            if let Some(entry) = pending {
+                self.write_now(key, entry);
+            }
+
+            return;
+        }
+
+        self.next_eviction_epoch += 1;
+        let epoch = self.next_eviction_epoch;
+
+        self.cache_evictions.insert(Arc::clone(&key), epoch);
+
+        let timer = Arc::clone(&self.timer);
+        let tx = self.tx.clone();
+        let gc_ms = cache.gc_ms();
+
+        self.spawner.spawn(Box::pin(async move {
+            if let Some(entry) = pending {
+                cache.store.put(&key, entry).await;
+            }
+
+            let age = cache
+                .store
+                .get(&key)
+                .await
+                .map_or(0, |entry| now_ms().saturating_sub(entry.updated_at));
+
+            timer
+                .sleep(Duration::from_millis(gc_ms.saturating_sub(age)))
+                .await;
+
+            let _ = tx.unbounded_send(ActorMsg::CacheEvict { key, epoch });
+        }));
+    }
+
+    /// Drops a slot whose gc window elapsed with no root holding it.
+    fn cache_evict(&mut self, key: &Arc<str>, epoch: u64) {
+        // A re-mount of the same slot dropped the epoch, which is how it
+        // cancels the eviction its own unmount armed.
+        if self.cache_evictions.get(key) != Some(&epoch) {
+            return;
+        }
+
+        self.cache_evictions.remove(key);
+        self.evict_now(Arc::clone(key));
+    }
+
+    /// Fire-and-forget write. Failures are the store's to swallow (§6.4), so
+    /// nothing here can throw into the patch path.
+    fn write_now(&self, key: Arc<str>, entry: CacheEntry) {
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+
+        self.spawner
+            .spawn(Box::pin(async move { cache.store.put(&key, entry).await }));
+    }
+
+    /// Fire-and-forget removal.
+    fn evict_now(&self, key: Arc<str>) {
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+
+        self.spawner
+            .spawn(Box::pin(async move { cache.store.evict(&key).await }));
+    }
 }
 
 /// One mounted root: its channel incarnation, its patch engine, and everything
@@ -822,6 +1270,12 @@ struct Root {
     /// allocation.
     topic: Arc<str>,
     params: Value,
+    /// The cache slot `(module, id, params)` addresses; `None` when the
+    /// connection has no cache store (§6.4).
+    cache_key: Option<Arc<str>>,
+    /// Whether a cache entry made this root renderable before its live initial
+    /// patch. Cleared when that patch lands, and by every bulk rejection.
+    seeded: bool,
     /// Live [`Mounted`](crate::Mounted) handles **plus** mounts still awaiting
     /// their initial patch.
     refcount: usize,
@@ -838,6 +1292,8 @@ struct Root {
     recovering: bool,
     pending_mounts: Vec<oneshot::Sender<Result<AnyCell>>>,
     pending_commands: HashMap<u64, PendingCommand>,
+    /// Dispatches held behind a seeded root's in-flight initial patch (§6.2).
+    pending_dispatches: Vec<CommandRequest>,
 }
 
 /// A command whose push has not resolved yet.
@@ -847,14 +1303,24 @@ struct PendingCommand {
     reply: oneshot::Sender<Result<Value>>,
 }
 
-/// Rejects every in-flight command of one root.
+/// Rejects every in-flight command of one root, and everything a cache seed
+/// let it queue.
 ///
 /// The bulk-rejection sets of §6.2: `Disconnected` on channel close/error,
 /// `Unmounted` on teardown, `VersionMismatch` on recovery, and the join failure
-/// reason on a failed (re)join.
+/// reason on a failed (re)join. Clearing `seeded` with them is what stops the
+/// next dispatch from queueing behind a revalidation that is not coming: after
+/// any of these the root is back to the plain `NotConnected` contract until a
+/// fresh initial patch lands.
 fn reject_commands(root: &mut Root, reason: &impl Fn() -> MusubiError) {
+    root.seeded = false;
+
     for (_, pending) in root.pending_commands.drain() {
         let _ = pending.reply.send(Err(reason()));
+    }
+
+    for request in root.pending_dispatches.drain(..) {
+        let _ = request.reply.send(Err(reason()));
     }
 }
 

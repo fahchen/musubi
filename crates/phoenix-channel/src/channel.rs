@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::error::{PushError, SocketClosed};
 use crate::frame::Reply;
-use crate::socket::{ActorMsg, SocketInner};
+use crate::socket::{ActorMsg, PushPayload, SocketInner};
 
 /// Why a channel reported an error rather than a clean close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +174,34 @@ impl Channel {
     /// // reply.is_ok() //=> true
     /// ```
     pub async fn push(&self, event: impl Into<String>, payload: Value) -> Result<Reply, PushError> {
+        self.push_payload(event, PushPayload::Json(payload)).await
+    }
+
+    /// Pushes an event whose payload is raw bytes, in a serializer v2 binary
+    /// frame ([`BinaryPush`](crate::BinaryPush)).
+    ///
+    /// Phoenix delivers it to `handle_in/3` as a binary rather than a map —
+    /// which is how Musubi's upload chunks travel (BDR-0026). The reply comes
+    /// back as an ordinary text `phx_reply`, so it is a plain [`Reply`] like
+    /// any other push's.
+    ///
+    /// ```text
+    /// let reply = channel.push_binary("chunk", slice.to_vec()).await?;
+    /// // reply.response["progress"] //=> 33
+    /// ```
+    pub async fn push_binary(
+        &self,
+        event: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<Reply, PushError> {
+        self.push_payload(event, PushPayload::Binary(payload)).await
+    }
+
+    async fn push_payload(
+        &self,
+        event: impl Into<String>,
+        payload: PushPayload,
+    ) -> Result<Reply, PushError> {
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.send(ActorMsg::Push {

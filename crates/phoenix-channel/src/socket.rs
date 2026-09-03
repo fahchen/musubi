@@ -15,8 +15,8 @@ use crate::backoff::Backoff;
 use crate::channel::{Channel, ChannelErrorReason, ChannelEvent, ChannelEvents};
 use crate::error::{BuildError, PushError, SocketClosed, TransportError};
 use crate::frame::{
-    EVENT_CLOSE, EVENT_ERROR, EVENT_HEARTBEAT, EVENT_JOIN, EVENT_LEAVE, EVENT_REPLY, Frame,
-    Message, Reply, ReplyStatus, TOPIC_PHOENIX,
+    BinaryPush, EVENT_CLOSE, EVENT_ERROR, EVENT_HEARTBEAT, EVENT_JOIN, EVENT_LEAVE, EVENT_REPLY,
+    Frame, Message, Reply, ReplyStatus, TOPIC_PHOENIX,
 };
 use crate::seams::{Connector, Socket, Spawner, Timer};
 use crate::url::endpoint_url;
@@ -47,7 +47,7 @@ pub(crate) enum ActorMsg {
         topic: Arc<str>,
         generation: u64,
         event: String,
-        payload: Value,
+        payload: PushPayload,
         reply: oneshot::Sender<Result<Reply, PushError>>,
     },
     Rejoin {
@@ -64,6 +64,13 @@ pub(crate) enum ActorMsg {
         ack: oneshot::Sender<()>,
     },
     Shutdown,
+}
+
+/// What a push carries: a JSON payload in the serializer v2 five-tuple, or raw
+/// bytes in a binary frame (upload chunks, BDR-0026).
+pub(crate) enum PushPayload {
+    Json(Value),
+    Binary(Vec<u8>),
 }
 
 /// The shared sender. Dropping the last handle (socket or channel) shuts the
@@ -531,7 +538,7 @@ impl Actor {
         topic: Arc<str>,
         generation: u64,
         event: String,
-        payload: Value,
+        payload: PushPayload,
         reply: oneshot::Sender<Result<Reply, PushError>>,
     ) {
         let connected = self.socket.is_some();
@@ -550,17 +557,41 @@ impl Actor {
         }
         let join_ref = state.join_ref.clone();
         let msg_ref = self.next_ref();
+        let ref_str = msg_ref.to_string();
+
+        // Framed before anything is registered: a payload that cannot be
+        // encoded must not leave a timeout armed on a ref nothing will answer.
+        let frame = match payload {
+            PushPayload::Json(payload) => Message {
+                join_ref,
+                msg_ref: Some(ref_str),
+                topic: topic.to_string(),
+                event,
+                payload,
+            }
+            .encode(),
+            PushPayload::Binary(payload) => {
+                let push = BinaryPush {
+                    join_ref: join_ref.unwrap_or_default(),
+                    msg_ref: ref_str,
+                    topic: topic.to_string(),
+                    event,
+                    payload,
+                };
+
+                match push.encode() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ = reply.send(Err(error.into()));
+                        return;
+                    }
+                }
+            }
+        };
 
         self.inflight.insert(msg_ref, Inflight::Push { reply });
         self.spawn_timeout(msg_ref, self.push_timeout);
-        self.send_frame(Message {
-            join_ref,
-            msg_ref: Some(msg_ref.to_string()),
-            topic: topic.to_string(),
-            event,
-            payload,
-        })
-        .await;
+        self.send_encoded(frame).await;
     }
 
     async fn connected(&mut self, result: Result<Box<dyn Socket>, TransportError>) {
@@ -790,8 +821,10 @@ impl Actor {
     }
 
     async fn send_frame(&mut self, message: Message) {
-        let frame = message.encode();
+        self.send_encoded(message.encode()).await;
+    }
 
+    async fn send_encoded(&mut self, frame: Frame) {
         let result = match self.socket.as_mut() {
             Some(socket) => socket.send(frame).await,
             None => return,

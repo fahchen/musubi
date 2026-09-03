@@ -2,8 +2,10 @@
 //! decoding and the op allowlist, version discipline, `json-patch` error
 //! mapping and atomicity, hydration, and the §5 change set.
 
-use musubi_client::generated::{AsyncResult, StoreField, UploadSlot};
-use musubi_client::{MusubiError, PatchEngine, PatchEnvelope, PatchError};
+use musubi_client::generated::{AsyncResult, StoreField, StoreId, UploadSlot};
+use musubi_client::{
+    EntryStatus, MusubiError, PatchEngine, PatchEnvelope, PatchError, UploadEntry, UploadOp,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -82,10 +84,40 @@ fn decode_reads_stream_upload_and_event_arrays() {
     .unwrap();
 
     assert_eq!(envelope.stream_ops.len(), 1);
-    assert_eq!(envelope.upload_ops.len(), 1);
+    assert!(matches!(
+        envelope.upload_ops.as_slice(),
+        [UploadOp::Progress { upload, r#ref, progress: 10, .. }]
+            if upload == "avatar" && r#ref == "e"
+    ));
     assert!(matches!(
         envelope.events.as_slice(),
         [event] if event.name == "toast" && event.payload["message"] == json!("hi")
+    ));
+}
+
+#[test]
+fn an_upload_op_this_build_cannot_decode_is_skipped_rather_than_failing_the_envelope() {
+    let envelope = PatchEnvelope::decode(json!({
+        "type": "patch",
+        "root_id": ROOT_ID,
+        "base_version": 1,
+        "version": 2,
+        "ops": [{"op": "replace", "path": "/title", "value": "Cart"}],
+        "upload_ops": [
+            {"op": "teleport", "upload": "avatar", "store_id": [], "ref": "e"},
+            {"op": "progress", "upload": "avatar", "store_id": [], "ref": "e", "progress": 10}
+        ]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        envelope.ops.len(),
+        1,
+        "the state ops travel with the envelope and must survive it"
+    );
+    assert!(matches!(
+        envelope.upload_ops.as_slice(),
+        [UploadOp::Progress { r#ref, progress: 10, .. }] if r#ref == "e"
     ));
 }
 
@@ -342,7 +374,7 @@ fn a_vanished_store_loses_its_streams() {
 }
 
 #[test]
-fn an_upload_op_is_discarded_and_leaves_its_marker_in_place() {
+fn an_upload_op_reaches_the_registry_and_leaves_its_marker_in_place() {
     let mut engine = mounted();
 
     let envelope = PatchEnvelope::decode(json!({
@@ -351,15 +383,90 @@ fn an_upload_op_is_discarded_and_leaves_its_marker_in_place() {
         "base_version": 1,
         "version": 2,
         "ops": [],
-        "upload_ops": [{
-            "op": "progress", "upload": "avatar", "store_id": ["panel"],
-            "ref": "entry-1", "progress": 42
-        }]
+        "upload_ops": [
+            {
+                "op": "add", "upload": "avatar", "store_id": ["panel"], "ref": "entry-1",
+                "entry": {
+                    "ref": "entry-1", "client_name": "me.png", "client_size": 1234,
+                    "client_type": "image/png", "progress": 0, "status": "pending",
+                    "errors": []
+                }
+            },
+            {
+                "op": "progress", "upload": "avatar", "store_id": ["panel"],
+                "ref": "entry-1", "progress": 42
+            }
+        ]
     }))
     .unwrap();
     let state = engine.apply(&envelope).unwrap();
 
+    // The slot on the state stays inert; the live state is the handle.
     assert_eq!(state["avatar"], json!({"__musubi_upload__": "avatar"}));
+
+    let handle = engine
+        .uploads()
+        .handle(&store_id(&["panel"]), "avatar")
+        .snapshot();
+
+    assert!(matches!(
+        handle.entry("entry-1"),
+        Some(UploadEntry {
+            progress: 42,
+            status: EntryStatus::Uploading,
+            ..
+        })
+    ));
+    assert_eq!(handle.progress(), 42);
+}
+
+#[test]
+fn a_vanished_store_loses_its_uploads() {
+    let mut engine = mounted();
+
+    engine
+        .apply(
+            &PatchEnvelope::decode(json!({
+                "type": "patch",
+                "root_id": ROOT_ID,
+                "base_version": 1,
+                "version": 2,
+                "ops": [],
+                "upload_ops": [{
+                    "op": "error", "upload": "avatar", "store_id": ["panel"],
+                    "error": {"code": "too_large", "message": "too big"}
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .uploads()
+            .handle(&store_id(&["panel"]), "avatar")
+            .snapshot()
+            .errors
+            .len(),
+        1
+    );
+
+    engine
+        .apply(&envelope(
+            2,
+            3,
+            vec![json!({"op": "remove", "path": "/panel"})],
+        ))
+        .unwrap();
+
+    assert!(
+        engine
+            .uploads()
+            .handle(&store_id(&["panel"]), "avatar")
+            .snapshot()
+            .errors
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +555,10 @@ fn stream_envelope_with_ops(
         "stream_ops": stream_ops
     }))
     .expect("fixture envelope decodes")
+}
+
+fn store_id(segments: &[&str]) -> StoreId {
+    serde_json::from_value(json!(segments)).expect("store id is a string array")
 }
 
 fn insert_op(store_id: &[&str], item_key: &str, at: i64) -> Value {

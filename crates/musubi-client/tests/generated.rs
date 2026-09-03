@@ -194,6 +194,15 @@ fn the_generated_impls_carry_the_wire_names() {
     assert_eq!(<Checkout as Command<CartStore>>::NAME, "checkout");
     assert_eq!(<ToastPayload as Event<CartStore>>::NAME, "toast");
     assert_eq!(
+        serde_json::to_value(CartParams {
+            room_id: "lobby".to_owned(),
+            currency: None,
+        })
+        .unwrap(),
+        json!({"room_id": "lobby"}),
+        "an unset optional attr is an absent key, not an explicit null"
+    );
+    assert_eq!(
         serde_json::to_value(Checkout { coupon: None }).unwrap(),
         json!({"coupon": null})
     );
@@ -209,6 +218,18 @@ struct CartStore;
 impl Store for CartStore {
     const MODULE: &'static str = "MyApp.Stores.CartStore";
     type State = FeedState;
+    type Params = CartParams;
+}
+
+/// The generated mount-params struct: `attr :room_id, String.t(), required:
+/// true` is a plain field, an optional attr an `Option` that serializes to an
+/// absent key — `normalize_assigns/2` gates a declared default on the key
+/// being absent, and `cache_key/3` has to agree with `storeCacheKey`.
+#[derive(Debug, Serialize)]
+struct CartParams {
+    room_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
