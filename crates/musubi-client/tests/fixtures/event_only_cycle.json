@@ -1,0 +1,92 @@
+{
+  "expected_state": {
+    "__musubi_store_id__": [],
+    "title": "events"
+  },
+  "frames": [
+    {
+      "dir": "out",
+      "event": "phx_join",
+      "payload": {
+        "id": "event-1",
+        "module": "Musubi.WireCapture.Stores.EventRootStore",
+        "params": {}
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "root_id": "Musubi.WireCapture.Stores.EventRootStore:event-1"
+        },
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 0,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "",
+            "value": {
+              "__musubi_store_id__": [],
+              "title": "events"
+            }
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.EventRootStore:event-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 1
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "notify",
+        "payload": {
+          "msg": "saved"
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 1,
+        "events": [
+          {
+            "name": "toast",
+            "payload": {
+              "msg": "saved"
+            },
+            "store_id": []
+          }
+        ],
+        "ops": [],
+        "root_id": "Musubi.WireCapture.Stores.EventRootStore:event-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 2
+      }
+    }
+  ],
+  "scenario": "event_only_cycle"
+}

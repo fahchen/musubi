@@ -1,0 +1,77 @@
+{
+  "expected_state": {
+    "__musubi_store_id__": [],
+    "current_user": "connect-user",
+    "label": "secondary"
+  },
+  "frames": [
+    {
+      "dir": "out",
+      "event": "phx_join",
+      "payload": {
+        "id": "beta-1",
+        "module": "Musubi.WireCapture.Stores.BetaRootStore",
+        "params": {
+          "label": "secondary"
+        }
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "root_id": "Musubi.WireCapture.Stores.BetaRootStore:beta-1"
+        },
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 0,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "",
+            "value": {
+              "__musubi_store_id__": [],
+              "current_user": "connect-user",
+              "label": "secondary"
+            }
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.BetaRootStore:beta-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 1
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "echo",
+        "payload": {
+          "label": "hello"
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "label": "hello",
+          "ok": true
+        },
+        "status": "ok"
+      }
+    }
+  ],
+  "scenario": "command_reply_no_patch"
+}

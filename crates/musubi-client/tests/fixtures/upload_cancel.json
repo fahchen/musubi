@@ -1,0 +1,184 @@
+{
+  "expected_state": {
+    "__musubi_store_id__": [],
+    "avatar": {
+      "__musubi_upload__": "avatar"
+    },
+    "title": "uploads"
+  },
+  "frames": [
+    {
+      "dir": "out",
+      "event": "phx_join",
+      "payload": {
+        "id": "upload-1",
+        "module": "Musubi.WireCapture.Stores.UploadRootStore",
+        "params": {}
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "root_id": "Musubi.WireCapture.Stores.UploadRootStore:upload-1"
+        },
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 0,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "",
+            "value": {
+              "__musubi_store_id__": [],
+              "avatar": {
+                "__musubi_upload__": "avatar"
+              },
+              "title": "uploads"
+            }
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.UploadRootStore:upload-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [
+          {
+            "config": {
+              "accept": [
+                ".png"
+              ],
+              "chunk_size": 1024,
+              "max_entries": 2,
+              "max_file_size": 1000000
+            },
+            "op": "config",
+            "store_id": [],
+            "upload": "avatar"
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "dir": "out",
+      "event": "allow_upload",
+      "payload": {
+        "entries": [
+          {
+            "client_ref": "0",
+            "name": "a.png",
+            "size": 2048,
+            "type": "image/png"
+          }
+        ],
+        "name": "avatar",
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "config": {
+            "accept": [
+              ".png"
+            ],
+            "chunk_size": 1024,
+            "max_entries": 2,
+            "max_file_size": 1000000
+          },
+          "entries": {
+            "0": {
+              "entry_ref": "u_0001",
+              "meta": {
+                "url": "https://uploads.example.test/a.png"
+              },
+              "type": "external",
+              "uploader": "s3"
+            }
+          },
+          "errors": [],
+          "ref": "avatar"
+        },
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 1,
+        "events": [],
+        "ops": [],
+        "root_id": "Musubi.WireCapture.Stores.UploadRootStore:upload-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [
+          {
+            "entry": {
+              "client_name": "a.png",
+              "client_size": 2048,
+              "client_type": "image/png",
+              "errors": [],
+              "progress": 0,
+              "ref": "u_0001",
+              "status": "pending"
+            },
+            "op": "add",
+            "ref": "u_0001",
+            "store_id": [],
+            "upload": "avatar"
+          }
+        ],
+        "version": 2
+      }
+    },
+    {
+      "dir": "out",
+      "event": "cancel_upload",
+      "payload": {
+        "name": "avatar",
+        "ref": "u_0001",
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 2,
+        "events": [],
+        "ops": [],
+        "root_id": "Musubi.WireCapture.Stores.UploadRootStore:upload-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [
+          {
+            "op": "cancel",
+            "ref": "u_0001",
+            "store_id": [],
+            "upload": "avatar"
+          }
+        ],
+        "version": 3
+      }
+    }
+  ],
+  "scenario": "upload_cancel"
+}

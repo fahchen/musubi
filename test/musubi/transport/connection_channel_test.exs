@@ -1,157 +1,25 @@
 defmodule Musubi.Transport.ConnectionChannelTest do
   use ExUnit.Case, async: true
 
-  defmodule TestEndpoint do
-    @moduledoc false
-    use Phoenix.Endpoint, otp_app: :musubi
-
-    socket("/musubi", Musubi.Transport.ConnectionChannelTest.MusubiSocket,
-      websocket: false,
-      longpoll: false
-    )
-  end
-
-  defmodule ChildStore do
-    @moduledoc false
-    use Musubi.Store
-
-    state do
-      field :label, String.t()
-    end
-
-    @impl Musubi.Store
-    def init(socket) do
-      socket
-      |> Musubi.Socket.session()
-      |> Map.fetch!("test_pid")
-      |> send({:child_init, Musubi.Socket.session(socket), Musubi.Socket.connect_info(socket)})
-
-      {:ok, socket}
-    end
-
-    @impl Musubi.Store
-    def render(socket), do: %{label: socket.assigns.label}
-
-    @impl Musubi.Store
-    def handle_command(_name, _payload, socket), do: {:noreply, socket}
-  end
-
-  defmodule AlphaRootStore do
-    @moduledoc false
-    use Musubi.Store, root: true
-
-    attr :room_id, String.t(), required: true
-
-    state do
-      field :room_id, String.t()
-      field :current_user, String.t()
-      field :child, ChildStore.state()
-    end
-
-    @impl Musubi.Store
-    def mount(params, socket) do
-      session = Musubi.Socket.session(socket)
-      test_pid = Map.fetch!(session, "test_pid")
-
-      send(test_pid, {:alpha_mount, self(), params, socket.assigns.current_user})
-
-      socket = Musubi.Socket.assign(socket, :room_id, Map.fetch!(params, "room_id"))
-
-      {:ok, socket}
-    end
-
-    @impl Musubi.Store
-    def init(socket) do
-      test_pid = Map.fetch!(Musubi.Socket.session(socket), "test_pid")
-      send(test_pid, {:alpha_init, socket.assigns.room_id})
-      {:ok, socket}
-    end
-
-    @impl Musubi.Store
-    def render(socket) do
-      %{
-        room_id: socket.assigns.room_id,
-        current_user: socket.assigns.current_user,
-        child: child(ChildStore, id: "child", label: socket.assigns.room_id)
-      }
-    end
-
-    command :rename do
-      payload do
-        field :room_id, String.t()
-      end
-    end
-
-    @impl Musubi.Store
-    def handle_command(:rename, %{"room_id" => room_id}, socket) do
-      {:noreply, Musubi.Socket.assign(socket, :room_id, room_id)}
-    end
-  end
-
-  defmodule BetaRootStore do
-    @moduledoc false
-    use Musubi.Store, root: true
-
-    state do
-      field :label, String.t()
-      field :current_user, String.t()
-    end
-
-    @impl Musubi.Store
-    def mount(params, socket) do
-      test_pid = Map.fetch!(Musubi.Socket.session(socket), "test_pid")
-      send(test_pid, {:beta_mount, self(), params, socket.assigns.current_user})
-      {:ok, Musubi.Socket.assign(socket, :label, Map.fetch!(params, "label"))}
-    end
-
-    @impl Musubi.Store
-    def render(socket) do
-      %{label: socket.assigns.label, current_user: socket.assigns.current_user}
-    end
-
-    command :rename do
-      payload do
-        field :label, String.t()
-      end
-    end
-
-    @impl Musubi.Store
-    def handle_command(:rename, %{"label" => label}, socket) do
-      {:noreply, Musubi.Socket.assign(socket, :label, label)}
-    end
-  end
-
-  defmodule MusubiSocket do
-    @moduledoc false
-    use Musubi.Socket,
-      roots: [
-        Musubi.Transport.ConnectionChannelTest.AlphaRootStore,
-        Musubi.Transport.ConnectionChannelTest.BetaRootStore
-      ]
-
-    @impl Musubi.Socket
-    def handle_connect(%{"current_user" => current_user}, socket) do
-      {:ok, Musubi.Socket.assign(socket, :current_user, current_user)}
-    end
-
-    @impl Musubi.Socket
-    def handle_join(params, socket) do
-      test_pid = socket |> Musubi.Socket.session() |> Map.fetch!("test_pid")
-      send(test_pid, {:connection_join, params, socket.assigns.current_user})
-
-      {:ok, socket}
-    end
-  end
+  # The endpoint, socket and root stores live in `test/support/wire_capture/`
+  # rather than in this file: `mix musubi.capture_wire` drives the same harness
+  # to record the Rust client's wire fixtures, and a Mix task cannot reach
+  # modules defined in a `.exs` (docs/rust-client.md §12 — one mechanism, not
+  # two).
+  alias Musubi.WireCapture.Endpoint
+  alias Musubi.WireCapture.Socket, as: MusubiSocket
+  alias Musubi.WireCapture.Stores.AlphaRootStore
+  alias Musubi.WireCapture.Stores.BetaRootStore
 
   import Phoenix.ChannelTest
 
-  @endpoint TestEndpoint
-  @alpha_module_str "Musubi.Transport.ConnectionChannelTest.AlphaRootStore"
-  @beta_module_str "Musubi.Transport.ConnectionChannelTest.BetaRootStore"
+  @endpoint Endpoint
+  @alpha_module_str inspect(AlphaRootStore)
+  @beta_module_str inspect(BetaRootStore)
 
   setup_all do
-    start_supervised!({Phoenix.PubSub, name: Musubi.Transport.ConnectionChannelTest.PubSub})
-    start_supervised!(TestEndpoint)
+    start_supervised!({Phoenix.PubSub, name: Musubi.WireCapture.PubSub})
+    start_supervised!(Endpoint)
     :ok
   end
 

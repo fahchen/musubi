@@ -108,6 +108,21 @@ jobs:
       - name: Run tests
         run: mix test
 
+      # docs/rust-client.md §12.4: re-record the Rust client's wire fixtures
+      # and fail if a server-side change made the checked-in ones stale. This
+      # is a step of the Elixir job rather than a job of its own because it
+      # needs the BEAM, and this one already has it.
+      #
+      # `--intent-to-add` first: a brand-new scenario writes an untracked file,
+      # which a plain `git diff` would not see — and the Rust replay suite
+      # cannot see it either, since it never reached the repository.
+      - name: Wire fixture drift
+        if: ${{ matrix.lint }}
+        run: |
+          mix musubi.capture_wire
+          git add --intent-to-add crates/musubi-client/tests/fixtures
+          git diff --exit-code crates/musubi-client/tests/fixtures
+
   rust:
     name: Rust (${{ matrix.toolchain }})
     runs-on: ubuntu-latest

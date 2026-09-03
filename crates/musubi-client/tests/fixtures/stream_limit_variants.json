@@ -1,0 +1,289 @@
+{
+  "expected_state": {
+    "__musubi_store_id__": [],
+    "items": {
+      "__musubi_stream__": "items"
+    },
+    "title": "stream"
+  },
+  "frames": [
+    {
+      "dir": "out",
+      "event": "phx_join",
+      "payload": {
+        "id": "stream-1",
+        "module": "Musubi.WireCapture.Stores.StreamRootStore",
+        "params": {}
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "root_id": "Musubi.WireCapture.Stores.StreamRootStore:stream-1"
+        },
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 0,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "",
+            "value": {
+              "__musubi_store_id__": [],
+              "items": {
+                "__musubi_stream__": "items"
+              },
+              "title": "stream"
+            }
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.StreamRootStore:stream-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 1
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "seed",
+        "payload": {
+          "count": 4
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 1,
+        "events": [],
+        "ops": [],
+        "root_id": "Musubi.WireCapture.Stores.StreamRootStore:stream-1",
+        "stream_ops": [
+          {
+            "op": "reset",
+            "ref": "0",
+            "store_id": [],
+            "stream": "items"
+          },
+          {
+            "at": -1,
+            "item": {
+              "id": "1"
+            },
+            "item_key": "item-1",
+            "limit": null,
+            "op": "insert",
+            "ref": "0",
+            "store_id": [],
+            "stream": "items"
+          },
+          {
+            "at": -1,
+            "item": {
+              "id": "2"
+            },
+            "item_key": "item-2",
+            "limit": null,
+            "op": "insert",
+            "ref": "0",
+            "store_id": [],
+            "stream": "items"
+          },
+          {
+            "at": -1,
+            "item": {
+              "id": "3"
+            },
+            "item_key": "item-3",
+            "limit": null,
+            "op": "insert",
+            "ref": "0",
+            "store_id": [],
+            "stream": "items"
+          },
+          {
+            "at": -1,
+            "item": {
+              "id": "4"
+            },
+            "item_key": "item-4",
+            "limit": null,
+            "op": "insert",
+            "ref": "0",
+            "store_id": [],
+            "stream": "items"
+          }
+        ],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 2
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "insert",
+        "payload": {
+          "at": -1,
+          "id": "5",
+          "limit": 3
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 2,
+        "events": [],
+        "ops": [],
+        "root_id": "Musubi.WireCapture.Stores.StreamRootStore:stream-1",
+        "stream_ops": [
+          {
+            "at": -1,
+            "item": {
+              "id": "5"
+            },
+            "item_key": "item-5",
+            "limit": 3,
+            "op": "insert",
+            "ref": "0",
+            "store_id": [],
+            "stream": "items"
+          }
+        ],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 3
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "insert",
+        "payload": {
+          "at": 0,
+          "id": "6",
+          "limit": -2
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 3,
+        "events": [],
+        "ops": [],
+        "root_id": "Musubi.WireCapture.Stores.StreamRootStore:stream-1",
+        "stream_ops": [
+          {
+            "at": 0,
+            "item": {
+              "id": "6"
+            },
+            "item_key": "item-6",
+            "limit": -2,
+            "op": "insert",
+            "ref": "0",
+            "store_id": [],
+            "stream": "items"
+          }
+        ],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 4
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "insert",
+        "payload": {
+          "at": -1,
+          "id": "7",
+          "limit": 0
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 4,
+        "events": [],
+        "ops": [],
+        "root_id": "Musubi.WireCapture.Stores.StreamRootStore:stream-1",
+        "stream_ops": [
+          {
+            "at": -1,
+            "item": {
+              "id": "7"
+            },
+            "item_key": "item-7",
+            "limit": 0,
+            "op": "insert",
+            "ref": "0",
+            "store_id": [],
+            "stream": "items"
+          }
+        ],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 5
+      }
+    }
+  ],
+  "scenario": "stream_limit_variants"
+}
