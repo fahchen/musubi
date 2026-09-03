@@ -224,9 +224,8 @@ defmodule Musubi.WireCapture.Recorder do
   # envelope to the channel before returning, and the channel, which is what
   # actually `push/3`es it into our mailbox. Once both return, every envelope
   # this frame caused has been delivered and the drain window only has to cover
-  # work that is genuinely off the command path.
-  defp sync(%__MODULE__{page_pid: nil} = recorder), do: recorder
-
+  # work that is genuinely off the command path. Only called from the
+  # `drain/2` clause guarded by `is_pid(page_pid)`, so no nil clause is needed.
   defp sync(%__MODULE__{page_pid: pid, socket: socket} = recorder) do
     barrier(pid)
     barrier(channel_pid(socket))
