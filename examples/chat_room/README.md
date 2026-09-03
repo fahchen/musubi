@@ -25,7 +25,15 @@ ChatRoom.Stores.ChatRoomStore (root)
     current_user      ChatRoom.OnlineUser
     online_users      AsyncResult<list(ChatRoom.OnlineUser)>         # assign_async
     last_send_status  idle | ok | failed                             # start_async
+  uploads:
+    attachment        UploadHandle                                   # upload :attachment
 ```
+
+`attachment` is declared *outside* `state do` and is not state: the framework
+injects the `{"__musubi_upload__": "attachment"}` marker into the render output
+and drives the handle over a separate `upload_ops` stream. Each
+`ChatRoom.MessageState` carries `attachment: ChatRoom.AttachmentState | nil` —
+`nil` for a typed message, and set on the row the `attach` command appends.
 
 ## Commands
 
@@ -33,6 +41,7 @@ ChatRoom.Stores.ChatRoomStore (root)
 | :-- | :-- | :-- | :-- |
 | `set_name` | `{ name: string }` | `{ ok: boolean, name: string }` | Updates the current user's display name and broadcasts the room's online-user list. |
 | `send_message` | `{ body: string }` | `{ queued: boolean }` | Queues message delivery and updates `last_send_status` when the async task completes. |
+| `attach` | `{}` | `{ attached: boolean, name: string \| null }` | Consumes the completed upload entry, moves the bytes into `ChatRoom.Attachments`, and appends a chat message referencing them. |
 
 ## Start the example
 
@@ -55,6 +64,59 @@ mix desktop  # cargo run (in desktop/)
 
 Open http://localhost:4102 for the React client; `mix desktop` opens a native
 window. Both are optional and both can run at once — see below.
+
+## Attachments
+
+The room accepts one file per upload, in **channel mode** (no external
+uploader), declared on the store:
+
+```elixir
+upload(:attachment,
+  accept: ~w(.png .jpg .jpeg .gif .txt .md),
+  max_entries: 1,
+  max_file_size: 2_000_000
+)
+```
+
+Both clients run the same three steps (`docs/uploads.md`):
+
+1. `select(files)` — preflight. The server validates the extension and size
+   against the declaration and signs one token per accepted entry.
+2. `start()` — join `musubi_upload:<entry_ref>` and push the bytes as binary
+   frames. Progress arrives back as `upload_ops`, not as state.
+3. `dispatchCommand("attach", {})` — the entry is *not* consumed until a
+   command asks for it: `consume_uploaded_entries/3` may only run inside a
+   command handler, and the temp file the runtime hands over is deleted as soon
+   as that handler returns.
+
+Step 3 moves the bytes into `ChatRoom.Attachments` (an Agent, capped at the
+newest 20 blobs) and calls `ChatRoom.Chat.send_message/4` with the resulting
+`ChatRoom.AttachmentState`. The row therefore reaches *every* client — the
+uploader included — over the ordinary PubSub broadcast and the `messages`
+stream, one envelope after the reply (BDR-0009). Nothing about the file is read
+out of the command reply.
+
+`ChatRoomWeb.Router` serves the stored bytes at `/attachments/:id`, which is
+what `AttachmentState.url` points at, so an uploaded image renders in the
+browser client. `ui/vite.config.ts` proxies that path to port 4002 alongside
+`/socket`.
+
+### In the browser
+
+Press **Attach file** in the composer dock and pick a file. The row's chip
+shows an `<img>` preview for an image and the name plus size for anything else.
+
+Note the one wrinkle the example has to work around: `upload_ops` notify the
+store's subscribers, but they change no state node, so `proxy.snapshot()` keeps
+its identity and `useSyncExternalStore` bails out of the re-render. `App.tsx`
+subscribes to the proxy directly and bumps a counter, which is what makes the
+progress line repaint.
+
+### In the desktop client
+
+Press **Attach file** and the native macOS open panel appears
+(`App::prompt_for_paths`). The app reads the bytes itself — `musubi-client`
+never touches a filesystem — and hands them to the crate's `Upload` handle.
 
 ## Desktop client
 
@@ -86,6 +148,11 @@ What it demonstrates, beyond what the React client already shows:
   lets the row arrive one envelope later; the delivery pill flips on a second,
   independent patch when the `start_async` task settles. No state is ever read
   out of a command reply.
+- **The upload data plane.** `upload :attachment` is the one feature that is not
+  state: the snapshot carries an inert `UploadSlot`, and the live handle comes
+  from `mounted.upload(&StoreId::root(), &slot.name)` with its own `updates()`
+  stream. Progress repaints the composer dock without the message list
+  re-rendering, because an upload op marks no `socket.assigns` key changed.
 - **A runtime-free client.** `musubi-client` has no executor of its own, so
   `desktop/src/transport.rs` supplies the four seams over gpui's executor:
   `Spawner`/`Timer` on `BackgroundExecutor`, and a `Connector`/`Socket` pair

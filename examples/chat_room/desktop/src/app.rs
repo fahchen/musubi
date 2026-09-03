@@ -14,6 +14,7 @@
 //! | Delivery receipt | `last_send_status`, a three-arm tagged union |
 //! | Identity + rename | `set_name`, reply `{ok, name}` |
 //! | Online panel | `assign_async :online_users` + PubSub |
+//! | Attach button | `upload :attachment` in channel mode + `attach` |
 //! | Connection pill | reconnect (BDR-0015) |
 //!
 //! The one rule the whole file is organized around: **state renders from
@@ -31,14 +32,15 @@
 //! the one piece of chrome the browser client has no equivalent for — it
 //! reports the reconnect state described in §4.6.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use gpui::{
-    AnyElement, AppContext, Context, Div, Entity, FontWeight, InteractiveElement, IntoElement,
-    ListAlignment, ListState, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, div, linear_color_stop, linear_gradient, list, px,
-    relative,
+    AnyElement, AppContext, AsyncWindowContext, Context, Div, Entity, FontWeight,
+    InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement, PathPromptOptions,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div,
+    linear_color_stop, linear_gradient, list, px, relative,
 };
 // `when` — the conditional-builder combinator gpui blanket-implements for
 // every element.
@@ -46,14 +48,16 @@ use gpui::prelude::FluentBuilder;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Disableable, Sizable};
-use musubi_client::{Connection, Mounted, MusubiError};
-use serde_json::json;
+use musubi_client::{
+    Connection, Mounted, MusubiError, Upload, UploadAccept, UploadEntry, UploadFile, UploadHandle,
+};
 
 use crate::generated::chat_room::stores::chat_room_store::{
-    ChatRoomStore, ChatRoomStoreLastSendStatus as SendStatus, SendMessage, SetName, State,
+    Attach, AttachReply, ChatRoomStore, ChatRoomStoreLastSendStatus as SendStatus, Params,
+    SendMessage, SetName, State,
 };
-use crate::generated::chat_room::{MessageState, OnlineUser};
-use crate::generated::musubi::{AsyncError, AsyncResult, Command};
+use crate::generated::chat_room::{AttachmentState, MessageState, OnlineUser};
+use crate::generated::musubi::{AsyncError, AsyncResult, Command, StoreId};
 use crate::theme::{
     BORDER_CARD, BORDER_SOFT, BORDER_STRONG, BUBBLE, CANVAS, CARD, DOCK, EMPTY, EYEBROW,
     FONT_FAMILY, GOLD, INK, MUTED, ON_TEAL_MUTED, PAPER, RADIUS, ROW, RUST, SAND, SAND_WASH, STAT,
@@ -144,6 +148,9 @@ const MARK: f32 = 48.0;
 /// `.bubble p { line-height: 1.45 }`.
 const BODY_LINE_HEIGHT: f32 = TEXT_BODY * 1.45;
 
+/// `.attach-button { min-height: 34px }` — the composer's secondary control.
+const ATTACH_H: f32 = 34.0;
+
 /// `button, input { min-height: 44px }` — the stylesheet's one control height.
 ///
 /// gpui-component's `Size::Large` gives `Input` exactly this (`input_h` maps
@@ -155,12 +162,21 @@ const BODY_LINE_HEIGHT: f32 = TEXT_BODY * 1.45;
 /// sizing, so this overrides `h_8` rather than being overridden by it.
 const CONTROL_H: f32 = 44.0;
 
+/// Sent as `client_type` when the extension is not one of the declared ones.
+///
+/// `accept` is enforced against the **extension** at preflight and never
+/// against the MIME type (BDR-0026), so a wrong guess here cannot reject a
+/// file — it only shows up in `Content-Type` when the example serves the blob
+/// back.
+const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+
 /// Which command is in flight. The window allows one at a time, so the button
 /// labels ("Sending" / "Saving", as in `App.tsx`) need to know which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
     Send,
     Rename,
+    Attach,
 }
 
 /// The single `Render` entity.
@@ -193,10 +209,20 @@ pub struct ChatWindow {
     /// Row heights for the message list. `list` measures lazily and caches, so
     /// the count has to be pushed in whenever the stream changes length.
     messages: ListState,
+    /// The upload's control plane, taken once the first snapshot names the
+    /// slot. `None` until then, which is what refuses an attach before mount.
+    upload: Option<Upload>,
+    /// The last handle the upload's own updates stream produced. Upload state
+    /// is *not* part of the state tree (BDR-0028) — it arrives on a separate
+    /// `upload_ops` channel and lands here, so progress repaints without the
+    /// message list re-rendering.
+    attachment: Option<UploadHandle>,
     /// Held rather than detached: dropping the task cancels the update loop,
     /// which is the right teardown when the window closes. A detached loop
     /// would keep the `Mounted` — and so the server-side page — alive.
     _updates: Task<()>,
+    /// Held: the upload handle's update loop, started with the first snapshot.
+    _upload_updates: Option<Task<()>>,
     /// Held: one command at a time, cancelled with the window.
     _in_flight: Option<Task<()>>,
     /// Held: dropping a `Subscription` unsubscribes.
@@ -239,11 +265,16 @@ impl ChatWindow {
         // `!Send` and never cross; the `WeakEntity` + `AsyncApp` this hands out
         // are what may.
         let updates = cx.spawn_in(window, async move |this, cx| {
-            // The store declares `attr(:room_id, String.t(), required: true)`
-            // and its `mount/2` does `Map.fetch!(params, "room_id")`, so
-            // joining with `{}` is rejected server-side.
+            // `attr(:room_id, String.t(), required: true)` on the store is
+            // generated as a plain `Params` field, so the required param
+            // cannot be forgotten here.
             let mounted = match connection
-                .mount::<ChatRoomStore>(ROOM_ID, json!({ "room_id": ROOM_ID }))
+                .mount::<ChatRoomStore>(
+                    ROOM_ID,
+                    Params {
+                        room_id: ROOM_ID.to_owned(),
+                    },
+                )
                 .await
             {
                 Ok(mounted) => mounted,
@@ -268,6 +299,7 @@ impl ChatWindow {
                 .update_in(cx, |view, window, cx| {
                     view.adopt(initial, window, cx);
                     view.mounted = Some(mounted);
+                    view.watch_upload(window, cx);
                     cx.notify();
                 })
                 .is_err()
@@ -279,6 +311,7 @@ impl ChatWindow {
                 // A closed window is a normal exit, not an error.
                 let alive = this.update_in(cx, |view, window, cx| {
                     view.adopt(Some(snapshot), window, cx);
+                    view.watch_upload(window, cx);
                     view.stale = false;
                     // `cx.notify()` is the only thing that schedules a repaint;
                     // mutating the view without it renders nothing.
@@ -297,6 +330,8 @@ impl ChatWindow {
             snapshot: None,
             stale: false,
             mounted: None,
+            upload: None,
+            attachment: None,
             feedback: "".into(),
             busy: None,
             composer,
@@ -305,6 +340,7 @@ impl ChatWindow {
             // this list is its head, not its tail.
             messages: ListState::new(0, ListAlignment::Top, px(200.0)),
             _updates: updates,
+            _upload_updates: None,
             _in_flight: None,
             _subscriptions: subscriptions,
         }
@@ -385,6 +421,117 @@ impl ChatWindow {
             |name| SetName { name },
             |reply| format!("Name updated to {}.", reply.name).into(),
         );
+    }
+
+    /// Subscribes to the upload handle, once the first snapshot names it.
+    ///
+    /// Idempotent: called on every snapshot, it does its work exactly once.
+    /// `State::attachment` is an inert [`UploadSlot`](musubi_client::generated::UploadSlot) —
+    /// the framework injects it into the render output and it carries only the
+    /// declared name, which is the key the live handle is reached by
+    /// (`docs/rust-client.md` §10).
+    fn watch_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.upload.is_some() {
+            return;
+        }
+
+        let (Some(mounted), Some(state)) = (self.mounted.clone(), self.snapshot.clone()) else {
+            return;
+        };
+
+        let upload = mounted.upload(&StoreId::root(), &state.attachment.name);
+        // Subscribe before snapshotting, for the same reason the mount path
+        // does: `updates()` does not replay.
+        let mut updates = upload.updates();
+
+        self.attachment = Some(upload.snapshot());
+        self.upload = Some(upload);
+
+        self._upload_updates = Some(cx.spawn_in(window, async move |this, cx| {
+            while let Some(handle) = updates.next().await {
+                let alive = this.update(cx, |view, cx| {
+                    view.attachment = Some(handle);
+                    cx.notify();
+                });
+
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The whole channel-mode upload, end to end.
+    ///
+    /// `path` is `None` for the button — the native dialog supplies one — and
+    /// `Some` when a caller already has the file, which is how the tests drive
+    /// this without a modal on screen.
+    ///
+    /// The three steps after the file is read are the flow `docs/uploads.md`
+    /// specifies: [`Upload::select`] preflights and the server signs one token
+    /// per accepted entry, [`Upload::start`] joins `musubi_upload:<ref>` and
+    /// pushes the bytes as binary frames, and the `attach` command is what
+    /// consumes the finished entry server-side. The message row that announces
+    /// it arrives afterwards on the ordinary stream — never out of the reply.
+    fn attach(&mut self, path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mounted) = self.mounted.clone() else {
+            return self.reject("not connected yet", cx);
+        };
+
+        let Some(upload) = self.upload.clone() else {
+            return self.reject("the upload slot has not arrived yet", cx);
+        };
+
+        if self.busy.is_some() {
+            return;
+        }
+
+        self.busy = Some(Pending::Attach);
+        cx.notify();
+
+        self._in_flight = Some(cx.spawn_in(window, async move |this, cx| {
+            let picked = match path {
+                Some(path) => Some(path),
+                None => pick_file(cx).await,
+            };
+
+            let Some(path) = picked else {
+                this.update(cx, |view, cx| {
+                    view.busy = None;
+                    view.feedback = "Attachment cancelled.".into();
+                    cx.notify();
+                })
+                .ok();
+
+                return;
+            };
+
+            // `musubi-client` never touches a filesystem — the embedder reads
+            // the file and hands the bytes over — so the read happens here, off
+            // the UI thread.
+            let read = path.clone();
+            let bytes = cx
+                .background_executor()
+                .spawn(async move { std::fs::read(read) })
+                .await;
+
+            let outcome = match bytes {
+                Ok(bytes) => transfer(&upload, &mounted, &path, bytes).await,
+                Err(error) => Err(format!("could not read {}: {error}", path.display())),
+            };
+
+            this.update(cx, |view, cx| {
+                view.busy = None;
+
+                view.feedback = match outcome {
+                    Ok(feedback) => feedback,
+                    Err(reason) => format!("Attachment failed: {reason}").into(),
+                };
+
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// The body both commands share: refuse when unmounted or busy, trim the
@@ -745,6 +892,16 @@ impl ChatWindow {
             .into_any_element()
     }
 
+    /// The upload's one entry, while there is one.
+    ///
+    /// `max_entries` is 1, so the handle never holds more; a `reset` (which
+    /// consuming the entry emits) empties it again.
+    pub fn attach_entry(&self) -> Option<&UploadEntry> {
+        self.attachment
+            .as_ref()
+            .and_then(|handle| handle.entries.first())
+    }
+
     /// The pill's copy and tint, split out so it can be asserted on directly.
     pub fn connection_state(&self) -> (&'static str, u32) {
         if self.mount_error.is_some() {
@@ -840,6 +997,7 @@ impl ChatWindow {
                     .text_color(color(MUTED))
                     .child(self.send_state()),
             )
+            .child(self.attach_row(cx))
             .child(
                 div()
                     .flex()
@@ -871,6 +1029,70 @@ impl ChatWindow {
             .into_any_element()
     }
 
+    /// `<div class="attach-row">`: the picker, then whatever the upload has to
+    /// say — its live entry, a rejection, or the declared limits.
+    ///
+    /// Everything rendered here comes off the handle, which the server drives
+    /// over `upload_ops`. Progress repaints without the message list
+    /// re-rendering: upload state is not part of the state tree, so a
+    /// `{op: progress}` marks no `socket.assigns` key changed.
+    fn attach_row(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.8))
+            .mb(px(7.2))
+            .child(
+                Button::new("attach")
+                    .large()
+                    .h(px(ATTACH_H))
+                    .label(if self.busy == Some(Pending::Attach) {
+                        "Uploading"
+                    } else {
+                        "Attach file"
+                    })
+                    .disabled(self.busy.is_some())
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.attach(None, window, cx);
+                    }))
+                    .debug_selector(|| "attach-button".into()),
+            )
+            .child(self.attach_state())
+            .into_any_element()
+    }
+
+    /// The line beside the picker.
+    fn attach_state(&self) -> AnyElement {
+        let Some(handle) = self.attachment.as_ref() else {
+            return note(TEXT_STATUS, MUTED, "waiting for the upload config");
+        };
+
+        // A rejected file produces no entry at all (BDR-0024), so a
+        // handle-level error is the only thing left to show for it.
+        if let Some(error) = handle.errors.first() {
+            return note(TEXT_STATUS, RUST, error.message.clone());
+        }
+
+        match self.attach_entry() {
+            Some(entry) => stat_pill(
+                format!("{} — {}%", entry.client_name, entry.progress),
+                Some(TEAL),
+            )
+            .debug_selector(|| "attach-progress".into())
+            .into_any_element(),
+            None => note(
+                TEXT_STATUS,
+                MUTED,
+                format!(
+                    "{} up to {}",
+                    accept_text(&handle.config.accept),
+                    byte_text(handle.config.max_file_size)
+                ),
+            ),
+        }
+    }
+
     /// §4.5. `last_send_status` is written only by `handle_async/3`, so this
     /// line flips on a *second*, independent patch with no command reply
     /// attached — the tail of the
@@ -895,6 +1117,117 @@ impl ChatWindow {
             Some(SendStatus::Ok { id }) => format!("ok ({id})").into(),
             Some(SendStatus::Failed { reason }) => format!("failed ({reason})").into(),
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The upload path
+// -----------------------------------------------------------------------------
+
+/// The native file dialog. `None` means the user cancelled.
+async fn pick_file(cx: &mut AsyncWindowContext) -> Option<PathBuf> {
+    let paths = cx
+        .update(|_window, app| {
+            app.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Attach".into()),
+            })
+        })
+        .ok()?;
+
+    // `Canceled` (the window went away), then the platform's own error, then
+    // the user pressing Cancel — all three mean the same thing here.
+    paths.await.ok()?.ok()??.into_iter().next()
+}
+
+/// `select` → `start` → `attach`, in order, with the feedback line each step
+/// would produce.
+///
+/// The command is not optional: a completed entry sits in the server's index
+/// until something consumes it, and `consume_uploaded_entries/3` may only run
+/// inside a command handler (`docs/uploads.md`).
+async fn transfer(
+    upload: &Upload,
+    mounted: &Mounted<ChatRoomStore>,
+    path: &Path,
+    bytes: Vec<u8>,
+) -> Result<SharedString, String> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "attachment".to_owned());
+
+    let file = UploadFile::new(name, content_type(path), bytes);
+
+    let entries = upload
+        .select(vec![file])
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if entries.is_empty() {
+        return Err(upload
+            .snapshot()
+            .errors
+            .first()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| "the server accepted no entry".to_owned()));
+    }
+
+    upload.start().await.map_err(|error| error.to_string())?;
+
+    let reply = mounted
+        .command(Attach {})
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok(match reply {
+        AttachReply {
+            attached: true,
+            name: Some(name),
+        } => format!("Attached {name}.").into(),
+        _ => "Nothing to attach.".into(),
+    })
+}
+
+/// The `client_type` the server is told about, guessed from the extension.
+///
+/// The declared `accept` list is checked against the extension and never
+/// against this, so a wrong guess cannot reject a file.
+fn content_type(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+
+    match extension.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("txt") => "text/plain",
+        Some("md") => "text/markdown",
+        _ => DEFAULT_CONTENT_TYPE,
+    }
+}
+
+/// `formatAccept()` from `App.tsx`.
+fn accept_text(accept: &UploadAccept) -> String {
+    match accept {
+        UploadAccept::Any => "Any file".to_owned(),
+        UploadAccept::Extensions(extensions) => extensions.join(" "),
+    }
+}
+
+/// `formatBytes()` from `App.tsx`, to the decimal place and all.
+fn byte_text(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+
+    match bytes {
+        bytes if bytes < KB => format!("{bytes} B"),
+        bytes if bytes < MB => format!("{} kB", bytes.div_ceil(KB)),
+        bytes => format!("{:.1} MB", bytes as f64 / MB as f64),
     }
 }
 
@@ -1016,6 +1349,16 @@ fn status_dot(tint: u32) -> AnyElement {
         .flex_shrink_0()
         .rounded_full()
         .bg(color(tint))
+        .into_any_element()
+}
+
+/// One tinted line of copy at a given size — the composer dock's hint, its
+/// rejection message, and anything else that is text and nothing else.
+fn note(size: f32, tint: u32, text: impl Into<SharedString>) -> AnyElement {
+    div()
+        .text_size(px(size))
+        .text_color(color(tint))
+        .child(text.into())
         .into_any_element()
 }
 
@@ -1185,7 +1528,11 @@ fn message_row(state: &State, index: usize, dimmed: bool) -> AnyElement {
                 .mt(px(7.2))
                 .line_height(px(BODY_LINE_HEIGHT))
                 .child(message.body.clone()),
-        );
+        )
+        // `attachment` is an ordinary `Option` field on the message, not upload
+        // state: by the time this row exists the entry has been consumed and
+        // the handle is back to idle.
+        .children(message.attachment.as_ref().map(attachment_chip));
 
     let row = div()
         .flex()
@@ -1207,6 +1554,59 @@ fn message_row(state: &State, index: usize, dimmed: bool) -> AnyElement {
         .when(from_self, |wrapper| wrapper.justify_end())
         .when(dimmed, |wrapper| wrapper.opacity(0.55))
         .child(row)
+        .into_any_element()
+}
+
+/// `<a class="attachment">`: what the `attach` command moved into the example's
+/// agent, as the message row reports it.
+///
+/// The browser client renders an `<img>` preview off `attachment.url`; this one
+/// shows the name and size, because the Musubi transport carries no images and
+/// the example is not going to grow an HTTP client to fetch one.
+fn attachment_chip(attachment: &AttachmentState) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.8))
+        .mt(px(8.8))
+        .p(px(7.2))
+        .rounded(px(RADIUS))
+        .border_1()
+        .border_color(color(BORDER_SOFT))
+        .bg(color(STAT))
+        .text_color(color(INK))
+        .debug_selector(|| "attachment-chip".into())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(AVATAR))
+                .flex_shrink_0()
+                .rounded(px(RADIUS))
+                .bg(color(GOLD))
+                .text_size(px(TEXT_EYEBROW))
+                .font_weight(FontWeight::BLACK)
+                .child("FILE"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .child(
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .child(attachment.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(color(MUTED))
+                        .child(byte_text(attachment.size.max(0) as u64)),
+                ),
+        )
         .into_any_element()
 }
 
@@ -1288,7 +1688,7 @@ mod tests {
     use futures::{FutureExt, Sink, Stream, StreamExt};
     use gpui::{Entity, Modifiers, Point, TestAppContext, VisualTestContext};
     use gpui_component::Root;
-    use musubi_client::{Connector, Frame, Socket, TransportError};
+    use musubi_client::{BinaryPush, Connector, Frame, Socket, TransportError};
     use serde_json::{Value, json};
 
     use super::*;
@@ -1300,6 +1700,12 @@ mod tests {
     const ROOT: &str = "ChatRoom.Stores.ChatRoomStore:general";
     /// Who the canned snapshot says you are.
     const ME: &str = "Ada Lovelace";
+    /// The entry ref the scripted preflight hands out.
+    const ENTRY: &str = "u_1";
+    /// The per-entry chunk topic that ref implies.
+    const UPLOAD_TOPIC: &str = "musubi_upload:u_1";
+    /// The bytes the attach test uploads.
+    const FILE: &[u8] = b"musubi upload demo\n";
 
     // -------------------------------------------------------------------------
     // The scripted transport
@@ -1317,6 +1723,18 @@ mod tests {
         topic: String,
         event: String,
         payload: Value,
+    }
+
+    /// The text `phx_reply` shape a chunk is answered with; Phoenix never
+    /// answers a binary push with a binary frame.
+    fn as_reply_target(push: &BinaryPush) -> Wire {
+        Wire {
+            join_ref: Some(push.join_ref.clone()),
+            msg_ref: Some(push.msg_ref.clone()),
+            topic: push.topic.clone(),
+            event: push.event.clone(),
+            payload: Value::Null,
+        }
     }
 
     impl Wire {
@@ -1425,6 +1843,8 @@ mod tests {
         sockets: Arc<Mutex<VecDeque<TestSocket>>>,
         to_client: Option<UnboundedSender<Result<Frame, TransportError>>>,
         from_client: UnboundedReceiver<Frame>,
+        /// Frames drained off the socket but not yet claimed by a reader.
+        pending: Vec<Frame>,
     }
 
     impl Server {
@@ -1435,6 +1855,7 @@ mod tests {
                 sockets: Arc::clone(&sockets),
                 to_client: None,
                 from_client: mpsc::unbounded().1,
+                pending: Vec::new(),
             };
 
             server.queue_socket();
@@ -1454,17 +1875,49 @@ mod tests {
 
             self.to_client = Some(to_client);
             self.from_client = from_client;
+            self.pending.clear();
         }
 
-        /// Everything the client wrote since the last call.
+        /// The text frames the client wrote since the last call.
+        ///
+        /// Binary frames stay queued for [`sent_binary`](Self::sent_binary):
+        /// a chunk transfer interleaves the two, and a reader that discarded
+        /// the kind it was not asked for would silently eat them.
         fn sent(&mut self) -> Vec<Wire> {
-            let mut frames = Vec::new();
+            self.take(|frame| match frame {
+                Frame::Text(_) => Some(Wire::decode(frame)),
+                Frame::Binary(_) => None,
+            })
+        }
 
+        /// The binary pushes the client wrote since the last call.
+        fn sent_binary(&mut self) -> Vec<BinaryPush> {
+            self.take(|frame| match frame {
+                Frame::Binary(bytes) => {
+                    Some(BinaryPush::decode(bytes).expect("chunks are binary pushes"))
+                }
+                Frame::Text(_) => None,
+            })
+        }
+
+        /// Drains the socket into the pending buffer, then removes and decodes
+        /// every frame `decode` claims, leaving the rest in order.
+        fn take<T>(&mut self, decode: impl Fn(&Frame) -> Option<T>) -> Vec<T> {
             while let Ok(frame) = self.from_client.try_recv() {
-                frames.push(Wire::decode(&frame));
+                self.pending.push(frame);
             }
 
-            frames
+            let mut taken = Vec::new();
+
+            self.pending.retain(|frame| match decode(frame) {
+                Some(decoded) => {
+                    taken.push(decoded);
+                    false
+                }
+                None => true,
+            });
+
+            taken
         }
 
         /// The one frame the client wrote for `event`, panicking otherwise.
@@ -1528,6 +1981,10 @@ mod tests {
                 "path": "",
                 "value": {
                     "__musubi_store_id__": [],
+                    // The framework injects one marker per declared upload
+                    // after `render/1` returns; it is inert, and carries only
+                    // the name the live handle is keyed by.
+                    "attachment": {"__musubi_upload__": "attachment"},
                     "current_user": {"id": "user-7", "name": ME},
                     "last_send_status": {"type": "idle"},
                     "messages": {
@@ -1552,15 +2009,101 @@ mod tests {
                 {
                     "op": "insert", "stream": "messages", "ref": "0", "store_id": [],
                     "item_key": "msg-msg-1", "at": -1, "limit": null,
-                    "item": {"id": "msg-1", "body": "first", "sender": "Grace Hopper"}
+                    "item": {
+                        "id": "msg-1", "body": "first", "sender": "Grace Hopper",
+                        "attachment": null
+                    }
                 },
                 {
                     "op": "insert", "stream": "messages", "ref": "0", "store_id": [],
                     "item_key": "msg-msg-2", "at": -1, "limit": null,
-                    "item": {"id": "msg-2", "body": "second", "sender": ME}
+                    "item": {"id": "msg-2", "body": "second", "sender": ME, "attachment": null}
                 }
             ],
-            "upload_ops": [],
+            // What the mount emits for a declared upload: one `config` op with
+            // the limits the store declared, and no entries yet.
+            "upload_ops": [{
+                "op": "config",
+                "upload": "attachment",
+                "store_id": [],
+                "config": {
+                    "accept": [".png", ".jpg", ".jpeg", ".gif", ".txt", ".md"],
+                    "max_entries": 1,
+                    "max_file_size": 2_000_000,
+                    "chunk_size": 64_000
+                }
+            }],
+            "events": []
+        })
+    }
+
+    /// An envelope that carries nothing but `upload_ops` — the shape a
+    /// transfer produces, since upload state marks no `socket.assigns` key
+    /// changed and so drives no JSON patch of its own.
+    fn upload_envelope(base: u64, version: u64, ops: Value) -> Value {
+        json!({
+            "type": "patch",
+            "root_id": ROOT,
+            "base_version": base,
+            "version": version,
+            "ops": [],
+            "stream_ops": [],
+            "upload_ops": ops,
+            "events": []
+        })
+    }
+
+    fn add_op(progress: u64) -> Value {
+        json!({
+            "op": "add", "upload": "attachment", "store_id": [], "ref": ENTRY,
+            "entry": {
+                "ref": ENTRY,
+                "client_name": "musubi-attach.txt",
+                "client_size": FILE.len(),
+                "client_type": "text/plain",
+                "progress": progress,
+                "status": "pending",
+                "errors": []
+            }
+        })
+    }
+
+    fn progress_op(progress: u64) -> Value {
+        json!({
+            "op": "progress", "upload": "attachment", "store_id": [],
+            "ref": ENTRY, "progress": progress
+        })
+    }
+
+    fn complete_op() -> Value {
+        json!({"op": "complete", "upload": "attachment", "store_id": [], "ref": ENTRY})
+    }
+
+    /// The envelope the `attach` command produces: the row the server appended,
+    /// plus the `reset` that consuming the last entry emits.
+    fn attachment_envelope(base: u64, version: u64) -> Value {
+        json!({
+            "type": "patch",
+            "root_id": ROOT,
+            "base_version": base,
+            "version": version,
+            "ops": [],
+            "stream_ops": [{
+                "op": "insert", "stream": "messages", "ref": "0", "store_id": [],
+                "item_key": "msg-msg-3", "at": 0, "limit": -100,
+                "item": {
+                    "id": "msg-3",
+                    "body": "shared musubi-attach.txt",
+                    "sender": ME,
+                    "attachment": {
+                        "name": "musubi-attach.txt",
+                        "content_type": "text/plain",
+                        "size": FILE.len(),
+                        "url": "/attachments/att-1"
+                    }
+                }
+            }],
+            "upload_ops": [{"op": "reset", "upload": "attachment", "store_id": []}],
             "events": []
         })
     }
@@ -1763,6 +2306,137 @@ mod tests {
         cx.run_until_parked();
 
         assert!(chat.update(cx, |chat, _| chat.busy.is_none()));
+    }
+
+    /// The whole channel-mode upload, driven over the scripted socket:
+    /// preflight, the signed sub-channel, the chunk, then the `config` /
+    /// `add` / `progress` / `complete` ops and the message row that follows.
+    ///
+    /// The path is passed in rather than picked: a native file dialog cannot
+    /// be driven from a test, and everything after the path is identical
+    /// either way.
+    #[gpui::test]
+    fn attaching_a_file_uploads_it_and_renders_the_message_it_produces(cx: &mut TestAppContext) {
+        let (mut server, chat, cx) = boot(cx);
+        let join = mount(&mut server, cx);
+
+        // Written under the OS temp dir rather than the repo: the app reads it
+        // with `std::fs::read`, so it has to be a real file.
+        let path = std::env::temp_dir().join(format!("musubi-attach-{}.txt", std::process::id()));
+        std::fs::write(&path, FILE).expect("the temp file is writable");
+
+        cx.update(|window, cx| {
+            chat.update(cx, |chat, cx| chat.attach(Some(path.clone()), window, cx))
+        });
+        cx.run_until_parked();
+
+        // 1. Preflight. The size is the byte length the client read, and the
+        //    type is guessed from the extension.
+        let allow = server.only("allow_upload");
+        assert_eq!(allow.topic, TOPIC);
+        assert_eq!(allow.payload["name"], json!("attachment"));
+        assert_eq!(
+            allow.payload["entries"],
+            json!([{
+                "client_ref": "0",
+                "name": path.file_name().unwrap().to_string_lossy(),
+                "size": FILE.len(),
+                "type": "text/plain",
+            }])
+        );
+
+        server.reply(
+            &allow,
+            "ok",
+            json!({
+                "ref": "attachment",
+                "config": {
+                    "accept": [".png", ".jpg", ".jpeg", ".gif", ".txt", ".md"],
+                    "max_entries": 1,
+                    "max_file_size": 2_000_000,
+                    "chunk_size": 64_000
+                },
+                "entries": {"0": {"type": "channel", "entry_ref": ENTRY, "token": "tok"}},
+                "errors": []
+            }),
+        );
+        cx.run_until_parked();
+
+        // 2. The sub-channel, joined with the stateless preflight token.
+        let upload_join = server.only("phx_join");
+        assert_eq!(upload_join.topic, UPLOAD_TOPIC);
+        assert_eq!(upload_join.payload, json!({"token": "tok"}));
+
+        server.reply(&upload_join, "ok", json!({}));
+        cx.run_until_parked();
+
+        // 3. One chunk: the file is far below the 64 kB slice size.
+        let chunks = server.sent_binary();
+        assert!(
+            matches!(
+                chunks.as_slice(),
+                [BinaryPush { topic, event, payload, .. }]
+                    if topic == UPLOAD_TOPIC && event == "chunk" && payload == FILE
+            ),
+            "expected one whole-file chunk, got {chunks:?}"
+        );
+
+        // 4. Progress renders off the handle's updates stream, not off a reply.
+        server.reply(&as_reply_target(&chunks[0]), "ok", json!({"progress": 100}));
+        server.push_patch(
+            &join,
+            upload_envelope(1, 2, json!([add_op(0), progress_op(60)])),
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            chat.update(cx, |chat, _| chat
+                .attach_entry()
+                .map(|entry| entry.progress)),
+            Some(60),
+            "the progress op repaints the composer dock"
+        );
+        assert!(cx.debug_bounds("attach-progress").is_some());
+
+        // 5. `complete` is the authoritative finish, and the command that
+        //    consumes the entry goes out only after `start` resolves.
+        server.push_patch(&join, upload_envelope(2, 3, json!([complete_op()])));
+        cx.run_until_parked();
+
+        let command = server.only("command");
+        assert_eq!(command.payload["name"], json!("attach"));
+        assert_eq!(command.payload["payload"], json!({}));
+
+        server.reply(
+            &command,
+            "ok",
+            json!({"attached": true, "name": "musubi-attach.txt"}),
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            chat.update(cx, |chat, _| chat.send_state()),
+            "Attached musubi-attach.txt."
+        );
+
+        // 6. The row itself arrives on the ordinary stream, one envelope later
+        //    and carrying the consumed attachment as plain state — never out of
+        //    the reply (BDR-0009). Consuming the last entry empties the index,
+        //    so the same envelope resets the handle to idle.
+        server.push_patch(&join, attachment_envelope(3, 4));
+        cx.run_until_parked();
+
+        assert_eq!(chat.update(cx, |chat, _| chat.messages().len()), 3);
+        assert_eq!(
+            chat.update(cx, |chat, _| chat
+                .attach_entry()
+                .map(|entry| entry.progress)),
+            None,
+            "the reset op empties the handle"
+        );
+        assert!(cx.debug_bounds("attachment-chip").is_some());
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// A socket that goes away flips the pill on the next failed command, and

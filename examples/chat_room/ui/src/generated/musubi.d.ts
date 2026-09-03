@@ -98,6 +98,7 @@ declare namespace Musubi {
         current_user: ChatRoom.OnlineUser
         online_users: Musubi.AsyncField<ChatRoom.OnlineUser[]>
         last_send_status: { type: "idle" } | { type: "ok"; id: string } | { type: "failed"; reason: string }
+        attachment: UploadField
       },
       {
         set_name: {
@@ -117,6 +118,13 @@ declare namespace Musubi {
             queued: boolean
           }
         }
+        attach: {
+          payload: {}
+          reply: {
+            attached: boolean
+            name: string | null
+          }
+        }
       },
       {}
     >
@@ -124,10 +132,18 @@ declare namespace Musubi {
 }
 
 declare namespace ChatRoom {
+  interface AttachmentState {
+    name: string
+    content_type: string
+    size: number
+    url: string
+  }
+
   interface MessageState {
     id: string
     body: string
     sender: string
+    attachment: ChatRoom.AttachmentState | null
   }
 
   interface OnlineUser {

@@ -392,6 +392,116 @@ h2 {
   gap: 0.55rem;
 }
 
+.attach-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 0 0 0.55rem;
+}
+
+.attach-button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 0.8rem;
+  border: 1px solid rgba(32, 33, 29, 0.18);
+  border-radius: 999px;
+  background: rgba(255, 250, 241, 0.74);
+  color: #20211d;
+  font-size: 0.82rem;
+  font-weight: 800;
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease;
+}
+
+.attach-button:hover {
+  border-color: #d75a35;
+}
+
+.attach-button[data-busy] {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.attach-button:focus-within {
+  border-color: #d75a35;
+  box-shadow: 0 0 0 4px rgba(215, 90, 53, 0.14);
+}
+
+.attach-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.attach-progress progress {
+  width: 120px;
+  height: 8px;
+  accent-color: #2b796b;
+}
+
+.attach-hint,
+.attach-progress small {
+  color: rgba(32, 33, 29, 0.58);
+}
+
+.attach-error {
+  color: #8a3d2a;
+  font-weight: 700;
+}
+
+.attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-top: 0.55rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid rgba(32, 33, 29, 0.12);
+  border-radius: 8px;
+  background: rgba(32, 33, 29, 0.05);
+  color: inherit;
+  text-decoration: none;
+}
+
+.message-self .attachment {
+  background: rgba(255, 250, 241, 0.16);
+  border-color: rgba(255, 250, 241, 0.28);
+}
+
+.attachment-preview {
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
+  object-fit: cover;
+}
+
+.attachment-mark {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
+  background: #ebbc3f;
+  color: #20211d;
+  font-size: 0.62rem;
+  font-weight: 900;
+}
+
+.attachment-meta {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.attachment-meta strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sr-only {
   position: absolute;
   width: 1px;

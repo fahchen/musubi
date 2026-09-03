@@ -13,10 +13,19 @@ pub mod musubi {
 
 pub mod chat_room {
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct AttachmentState {
+        pub name: String,
+        pub content_type: String,
+        pub size: i64,
+        pub url: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     pub struct MessageState {
         pub id: String,
         pub body: String,
         pub sender: String,
+        pub attachment: Option<super::chat_room::AttachmentState>,
     }
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -33,6 +42,7 @@ pub mod chat_room {
             impl super::super::super::musubi::Store for ChatRoomStore {
                 const MODULE: &'static str = "ChatRoom.Stores.ChatRoomStore";
                 type State = State;
+                type Params = Params;
             }
 
             /// The store's rendered shape: state fields plus one `UploadSlot` per
@@ -47,6 +57,16 @@ pub mod chat_room {
                     Vec<super::super::super::chat_room::OnlineUser>,
                 >,
                 pub last_send_status: ChatRoomStoreLastSendStatus,
+                pub attachment: super::super::super::musubi::UploadSlot,
+            }
+
+            /// The mount params object, one field per `attr/3` declaration: required
+            /// attrs are plain fields, optional ones `Option` that serialize to an
+            /// absent key rather than an explicit `null`. A store declaring no `attr`
+            /// gets an empty struct, which serializes to `{}`.
+            #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+            pub struct Params {
+                pub room_id: String,
             }
 
             #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -89,6 +109,20 @@ pub mod chat_room {
             impl super::super::super::musubi::Command<ChatRoomStore> for SendMessage {
                 const NAME: &'static str = "send_message";
                 type Reply = SendMessageReply;
+            }
+
+            #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+            pub struct Attach {}
+
+            #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+            pub struct AttachReply {
+                pub attached: bool,
+                pub name: Option<String>,
+            }
+
+            impl super::super::super::musubi::Command<ChatRoomStore> for Attach {
+                const NAME: &'static str = "attach";
+                type Reply = AttachReply;
             }
         }
     }
