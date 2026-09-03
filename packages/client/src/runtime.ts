@@ -919,6 +919,7 @@ function acceptEnvelope(
     connection.snapshotCache,
     envelope.ops,
     envelope.stream_ops,
+    uploadOps,
     previousRoot,
     nextRoot
   )
@@ -1230,6 +1231,7 @@ function invalidateSnapshotsForOps(
   snapshotCache: Map<string, unknown>,
   ops: readonly JsonPatchOp[],
   streamOps: readonly StreamOp[],
+  uploadOps: readonly UploadOp[],
   previousRoot: unknown,
   root: unknown
 ): void {
@@ -1245,6 +1247,14 @@ function invalidateSnapshotsForOps(
   }
 
   for (const op of streamOps) {
+    invalidateStoreIdAncestors(snapshotCache, op.store_id)
+  }
+
+  // Upload ops mutate the `UploadHandleImpl` in place, so no JSON patch op ever
+  // touches the owning store's node. Without this the cached snapshot keeps its
+  // identity and `useSyncExternalStore` bails out of the re-render that the
+  // upload-touched notification in `notifySubscribers` just asked for.
+  for (const op of uploadOps) {
     invalidateStoreIdAncestors(snapshotCache, op.store_id)
   }
 }
