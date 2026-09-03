@@ -299,11 +299,15 @@ h2 {
 .chat-stats {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 0.45rem;
 }
 
-.chat-stats span {
+/* Counters only: the status dot is a bare `span` too, and a plain
+   `.chat-stats span` (0,1,1) outranks `.status-dot`/`.status-ok` (0,1,0),
+   which turned the dot into an empty capsule. */
+.chat-stats span:not(.status-dot) {
   border: 1px solid rgba(32, 33, 29, 0.14);
   border-radius: 999px;
   padding: 0.4rem 0.65rem;
