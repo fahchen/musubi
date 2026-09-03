@@ -89,7 +89,7 @@ defmodule Musubi.Page.ServerSendUpdateTest do
 
       # Drain the mount render and bootstrap envelope.
       assert_received :root_render_called
-      assert_received {:patch, %PatchEnvelope{base_version: 0, version: 1}}
+      assert_receive {:patch, %PatchEnvelope{base_version: 0, version: 1}}
 
       assert :ok = Musubi.send_update(pid, ["comments"], %{reload_token: make_ref()})
       sync_server!(pid)
@@ -114,7 +114,7 @@ defmodule Musubi.Page.ServerSendUpdateTest do
       pid = start!()
 
       assert_received :root_render_called
-      assert_received {:patch, %PatchEnvelope{base_version: 0, version: 1}}
+      assert_receive {:patch, %PatchEnvelope{base_version: 0, version: 1}}
 
       assert :ok = Musubi.send_update(pid, ["does_not_exist"], %{reload_token: make_ref()})
       sync_server!(pid)
@@ -183,7 +183,7 @@ defmodule Musubi.Page.ServerSendUpdateTest do
       pid =
         start_supervised!({Server, {OverlapRoot, %{"page_id" => "p1"}, %{transport_pid: self()}}})
 
-      assert_received {:patch, %PatchEnvelope{base_version: 0, version: 1}}
+      assert_receive {:patch, %PatchEnvelope{base_version: 0, version: 1}}
       assert %{label: "from_parent"} = child_render(pid, ["c"])
 
       # `label` is also a parent prop, but the reconcile gate compares the
@@ -204,7 +204,7 @@ defmodule Musubi.Page.ServerSendUpdateTest do
       pid = start!()
 
       assert_received :root_render_called
-      assert_received {:patch, %PatchEnvelope{base_version: 0, version: 1}}
+      assert_receive {:patch, %PatchEnvelope{base_version: 0, version: 1}}
 
       assert :ok = Musubi.send_update(pid, [], %{title: "Renamed"})
       sync_server!(pid)

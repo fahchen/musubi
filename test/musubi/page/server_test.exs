@@ -239,4 +239,22 @@ defmodule Musubi.Page.ServerTest do
 
     assert root_socket.assigns.status == "mounted"
   end
+
+  test "a child store's init/1 runs even when its module has been purged" do
+    # The child-store half of the cold-VM race: a child is only ever named by
+    # the `child(Module, ...)` atom in its parent's render, so nothing loads it
+    # before `Musubi.Reconciler.init_store/1` probes for `init/1`. Without
+    # `Code.ensure_loaded?/1` the callback was silently skipped and the child
+    # rendered from unmounted assigns.
+    child = Musubi.Test.Fixtures.ColdVMStore
+    :code.purge(child)
+    :code.delete(child)
+    refute :erlang.module_loaded(child)
+
+    parent = Musubi.Test.Fixtures.ColdVMParentStore
+    pid = start_supervised!({Server, {parent, %{}, %{transport_pid: self()}}})
+
+    assert {:ok, %{socket: child_socket}} = Server.peek(pid, ["cold"])
+    assert child_socket.assigns.status == "mounted"
+  end
 end
