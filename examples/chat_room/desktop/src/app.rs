@@ -144,6 +144,17 @@ const MARK: f32 = 48.0;
 /// `.bubble p { line-height: 1.45 }`.
 const BODY_LINE_HEIGHT: f32 = TEXT_BODY * 1.45;
 
+/// `button, input { min-height: 44px }` — the stylesheet's one control height.
+///
+/// gpui-component's `Size::Large` gives `Input` exactly this (`input_h` maps
+/// `Large` to `h_11`), but a *labelled* `Button` ignores the size above
+/// `Small`: `button.rs` falls through to `h_8().px_4()` for both `Medium` and
+/// `Large`, so `.large()` alone leaves the button 12 px shorter than the input
+/// beside it. Pinning the height afterwards is the fix — `Button` keeps its
+/// `Styled` refinement in a separate field and applies it *after* its own
+/// sizing, so this overrides `h_8` rather than being overridden by it.
+const CONTROL_H: f32 = 44.0;
+
 /// Which command is in flight. The window allows one at a time, so the button
 /// labels ("Sending" / "Saving", as in `App.tsx`) need to know which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,6 +602,7 @@ impl ChatWindow {
                 Button::new("rename")
                     .primary()
                     .large()
+                    .h(px(CONTROL_H))
                     .label(if self.busy == Some(Pending::Rename) {
                         "Saving"
                     } else {
@@ -843,6 +855,7 @@ impl ChatWindow {
                         Button::new("send")
                             .primary()
                             .large()
+                            .h(px(CONTROL_H))
                             .label(if self.busy == Some(Pending::Send) {
                                 "Sending"
                             } else {
