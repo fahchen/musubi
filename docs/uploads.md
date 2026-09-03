@@ -316,7 +316,8 @@ export type EntryStatus =
 export interface UploadError {
   code:
     | "too_large" | "too_many_files" | "not_accepted"
-    | "chunk_timeout" | "external_failed" | "preflight_rejected"
+    | "chunk_timeout" | "chunk_too_large" | "external_failed"
+    | "preflight_rejected" | "internal"
     | (string & {})
   message: string
 }

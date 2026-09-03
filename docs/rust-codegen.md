@@ -822,10 +822,12 @@ Three concrete Rust details this pins down:
 
 **Uploads: only the slot type.** The full TS upload family (`UploadConfig`,
 `UploadEntryStatus`, `UploadStatus`, `UploadError`, `UploadEntry`,
-`UploadHandle`) is **not** emitted in v1. The client crate defers the upload
-engine wholesale (`docs/rust-client.md` §10), so nothing would ever deserialize
-those types. An upload field renders as `musubi::UploadSlot`; only the upload
-*name* reaches the bundle. See §8.
+`UploadHandle`) is **not** emitted. Those types are hand-written in
+`musubi-client` and keyed by `(store_id, upload_name)` at runtime
+(`docs/rust-client.md` §10) — they are never a state field's type, so codegen
+would have nothing to point at them. An upload field renders as
+`musubi::UploadSlot`, whose `name` is exactly that key; only the upload *name*
+reaches the bundle. See §8.
 
 ### 4.6 Store registry — the crate's `Store` / `Command` / `Event` traits
 
@@ -839,6 +841,7 @@ the source of truth; reproduced verbatim:
 pub trait Store: Send + Sync + 'static {
     const MODULE: &'static str;
     type State: serde::de::DeserializeOwned + Send + Sync + 'static;
+    type Params: serde::Serialize + Send + 'static;
 }
 
 /// One implementation per declared command, generic over the owning store so
@@ -854,16 +857,8 @@ pub trait Event<S: Store>: serde::de::DeserializeOwned + Send + 'static {
 }
 ```
 
-There is no `type Params`, no `type Commands`, no `type Events`, and no
-`STORES` const:
+There is no `type Commands`, no `type Events`, and no `STORES` const:
 
-- **`type Params` is not generable.** Mount params are declared with `attr/3`
-  and reflected through `__musubi__(:attrs)`, which the shared manifest does not
-  carry (`:module, :kind, :fields, :commands, :events, :uploads, :source`).
-  `Connection::mount` therefore takes an untyped
-  `serde_json::Map<String, serde_json::Value>`, matching the TS target, which
-  has no params typing either. Adding `:attrs` to the manifest and generating a
-  params struct is recorded as future work in §8.
 - **No `Command` / `Event` sum enums.** Nothing consumes them: the client
   dispatches typed payload structs (`mounted.command(Checkout { .. })`) and
   routes events by `(store_id, name)` into a per-event payload type. A sum enum
@@ -884,6 +879,7 @@ pub struct CartStore;
 impl R::Store for CartStore {
     const MODULE: &'static str = "MyApp.Stores.CartStore";
     type State = State;
+    type Params = Params;
 }
 
 /// The store's rendered shape: state fields plus one `UploadSlot` per
@@ -892,6 +888,17 @@ impl R::Store for CartStore {
 pub struct State {
     pub title: String,
     pub avatar: R::UploadSlot,
+}
+
+/// The mount params object, one field per `attr/3` declaration: required
+/// attrs are plain fields, optional ones `Option` that serialize to an
+/// absent key rather than an explicit `null`. A store declaring no `attr`
+/// gets an empty struct, which serializes to `{}`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Params {
+    pub cart_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coupon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -919,6 +926,35 @@ Design points:
 - **Marker and shape are two types.** `CartStore` is the `St: Store` parameter
   (`Mounted<CartStore>`); `State` is what a snapshot holds
   (`Arc<<CartStore as Store>::State>`). They are never the same type.
+- **`Params` is a third type, next to the marker and the shape.** It is built
+  from `__musubi__(:attrs)`, which `Musubi.Codegen.Manifest.collect/1` carries
+  with the same alias expansion it applies to state fields. A `required: true`
+  attr is a plain field; every other attr is `Option<T>` — declared `default:`
+  values stay server-side, applied by `Musubi.Reconciler.normalize_assigns/2`,
+  so the client never re-implements them. An attr already declared `T | nil`
+  renders `Option<T>` once, not twice. A store declaring no `attr` still gets
+  `pub struct Params {}`, which serializes to `{}` — `Connection::mount` is
+  total over every store. Anonymous shapes inside an attr type hoist under the
+  `<Marker>Params` prefix (`CartStoreParamsFilter`), so an attr and a state
+  field of the same name cannot collide.
+- **An unset optional attr is an absent key**, not an explicit `null`: every
+  optional field carries `#[serde(skip_serializing_if = "Option::is_none")]`,
+  which is what the TypeScript client's object literals already do. It matters
+  twice. `musubi_client::cache_key/3` canonicalizes the params object, so an
+  explicit `null` would fork one store's cache slot in two across the two
+  clients; and a `mount/2` that folds `params` into `socket.assigns` would
+  otherwise write an explicit `nil`, which `Musubi.Reconciler.normalize_assigns/2`
+  — gated on `Map.has_key?/2` — treats as "supplied", suppressing the attr's
+  declared `default:`.
+- **`attrs` is a heuristic for the mount params, not the server's contract.**
+  `attr/3` declares the assigns a *child* store accepts from its parent
+  (`spec/glossary.md`); the root mount path does not validate against it —
+  `Musubi.Page.Server.mount_root_store/2` hands the join payload's `params` map
+  to `mount/2` as it arrives, and `normalize_root_assigns/1` runs over
+  `socket.assigns`, not over `params`. So `params ⊆ attrs` is a convention, and
+  a root whose `mount/2` reads a key it never declared is legal. The typed
+  struct is the ergonomic path; `Connection::mount_with_params::<St>(id,
+  params)` takes any `Serialize` for the rest (`docs/rust-client.md` §7).
 - **`store_id` is not part of any generated struct or command payload.** For
   commands it is transport framing, filled by the client runtime from the store
   handle the command was dispatched on. For child stores it lives on
@@ -965,7 +1001,8 @@ Anchors (see `docs/client-contract.md`, `packages/client/src/types.ts`,
   state tree).
 - Upload slot ⇒ `{"__musubi_upload__": "<name>"}`, auto-injected at the store's
   render root (BDR-0024), deserialized into the inert `musubi::UploadSlot`.
-  Contents arrive in `upload_ops` (BDR-0025) and are discarded in v1.
+  Contents arrive in `upload_ops` (BDR-0025) and are folded into the client's
+  upload registry, not into the state tree (`docs/rust-client.md` §10).
 - Async node ⇒ `{"__musubi_async__": true, "status", "result", "reason"}`
   (`AsyncResult<T>`), with `result` resolved recursively — it may itself be a
   stream marker, a store node, an array, or a plain object.
@@ -990,8 +1027,11 @@ Anchors (see `docs/client-contract.md`, `packages/client/src/types.ts`,
   and the server already rejects non-roots with
   `"declared store is not a root store"`. Nothing in the bundle enumerates or
   gates on it (there is no `STORES` const).
-- Mount params (`attr/3`). Not in the shared manifest; `mount` takes an untyped
-  JSON object (§4.6).
+- Attr **defaults** (`attr :locale, String.t(), default: "en"`). The manifest
+  carries them, but the generated `Params` renders such an attr as
+  `Option<String>` and lets the server apply the default; duplicating it in the
+  bundle would be a second source of truth. Attr *names*, *types* and
+  *required*-ness are generated (§4.6).
 
 ---
 
@@ -1140,6 +1180,7 @@ neither type-checks generated code.
 | Async marker | `__musubi_async__` in the type | dropped (ignored on deserialize) | static typing makes detection unnecessary |
 | Cross-refs | namespace lookup | `super::`-chained paths | no ambient namespace merging |
 | Upload key casing | camelCase via renames | snake_case verbatim | wire is already snake_case |
+| Mount params | untyped (no params typing) | generated `Params` struct per store, plus `mount_with_params` for anything outside `:attrs` | `:attrs` is in the shared manifest; Rust has no structural object literal |
 
 ---
 
@@ -1159,16 +1200,17 @@ Scope is deliberately capped at "what `:musubi_ts` does, for Rust".
   `serde_json` only.
 - **Structural dedupe of hoisted types** (§3.5).
 - **Upload handle/config types.** The bundle emits only `musubi::UploadSlot`.
-  `UploadConfig`, `UploadAccept`, `UploadEntry`, `UploadEntryStatus`,
-  `UploadStatus`, `UploadError`, and the `UploadHandle` state machine are
-  deferred to land with the client crate's upload engine
-  (`docs/rust-client.md` §10), which v1 defers wholesale. Emitting them now
-  would ship seven types nothing deserializes.
-- **Typed mount params.** `attr/3` declarations are not in the shared manifest,
-  so no `Params` struct is generated and `mount` takes an untyped JSON object
-  (§4.6). Adding `:attrs` to `Manifest.collect/1` (and to the `@type entry()`)
-  plus a generated params struct is the follow-up if typed mounts are wanted;
-  the TS target has no params typing either, so it is also beyond parity.
+  `UploadConfig`, `UploadAccept`, `UploadEntry`, `EntryStatus`,
+  `UploadStatus`, `UploadError`, and the `UploadHandle` state machine live in
+  `musubi-client` (`docs/rust-client.md` §10) and are reached through
+  `Mounted::upload(&store_id, name)`, not through a generated field type.
+  Emitting them would ship seven types nothing deserializes.
+- **Typed mount params for the TS target.** `:attrs` is in the shared manifest
+  and the Rust target generates a `Params` struct from it (§4.6), but the TS
+  renderer still ignores the key: `StoreDef<Module, Shape, Commands, Events>`
+  has no params slot and `connect()` takes an untyped object. A deliberate,
+  recorded parity gap — Rust needs a nominal type to call `mount` at all,
+  TypeScript does not. Adding a `params` slot to `StoreDef` is the follow-up.
 - **Per-store `Command` / `Event` sum enums** and any `AnyStore` enum. Re-add
   only if a consumer needs exhaustive matching.
 - **`:input` modules**, stream options, upload config values, root-ness (§5).

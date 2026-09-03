@@ -19,7 +19,10 @@ config :musubi, Musubi.Transport.ChannelTest.TestEndpoint,
   secret_key_base: String.duplicate("a", 64),
   server: false
 
-config :musubi, Musubi.Transport.ConnectionChannelTest.TestEndpoint,
-  pubsub_server: Musubi.Transport.ConnectionChannelTest.PubSub,
+# Endpoint for the shared wire-capture harness in `test/support/wire_capture/`,
+# driven both by `test/musubi/transport/connection_channel_test.exs` and by
+# `mix musubi.capture_wire`. `server: false` keeps it from binding a port.
+config :musubi, Musubi.WireCapture.Endpoint,
+  pubsub_server: Musubi.WireCapture.PubSub,
   secret_key_base: String.duplicate("a", 64),
   server: false

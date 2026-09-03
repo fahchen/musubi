@@ -386,6 +386,8 @@ server.
 | 6 | Identity + rename | `set_name` command, reply `{ok, name}` | `Input` + `Button` |
 | 7 | Online panel | `assign_async :online_users` + PubSub | `AsyncResult` `match` + plain column |
 | 8 | Connection pill | reconnect (BDR-0015), version 0 window | derived flag on the view |
+| 9 | Attach button + progress | `upload :attachment` in channel mode, `attach` command | `Button` + `App::prompt_for_paths` + `Upload::updates` |
+| 10 | Attachment chip on a row | the consumed entry, as plain state on `MessageState` | column inside the bubble |
 
 ### 4.1 `ChatWindow`
 
@@ -414,7 +416,7 @@ struct ChatWindow {
 `mounted` is an `Option` because the window opens before the join resolves:
 commands are refused until it is `Some`, and `mount_error` is what the message
 pane renders instead of a list. There is no separate connection-state enum —
-the pill (§4.6) reads these fields directly, because any enum over them would
+the pill (§4.7) reads these fields directly, because any enum over them would
 store nothing the fields do not already say.
 
 `_updates` and `_in_flight` are held rather than `.detach()`ed so that closing
@@ -524,7 +526,57 @@ after the `start_async` task settles — a second, independent patch with no
 command reply attached. Together with §4.4 it renders the whole
 command → reply → patch → async-completion → patch sequence in one screen.
 
-### 4.6 Connection pill, and the gap behind it
+### 4.6 Attachments — the upload data plane
+
+Uploads are the one Musubi feature that is **not** state: `upload :attachment`
+is declared outside `state do`, the framework injects an inert `UploadSlot`
+marker into the render output, and the live handle is driven by a separate
+`upload_ops` stream (BDR-0028). The window models that split directly — two
+fields, two update loops:
+
+```rust
+upload: Option<Upload>,          // the control plane: select / start / cancel
+attach: Option<UploadHandle>,    // the last value its own updates stream gave
+```
+
+`watch_upload` takes the handle the first time a snapshot names the slot
+(`mounted.upload(&StoreId::root(), &state.attachment.name)`) and spawns a second
+foreground loop over `Upload::updates()`. Progress therefore repaints the
+composer dock *without* the message list re-rendering: an upload op marks no
+`socket.assigns` key changed, so it produces an envelope with an empty `ops`
+array.
+
+The transfer itself is three awaits, in order — `select` (preflight; the server
+signs one token per accepted entry), `start` (join `musubi_upload:<ref>`, push
+the bytes as binary frames), then the `attach` command, which is what consumes
+the finished entry server-side. The command is not optional: a completed entry
+sits in the server's index until something consumes it, and
+`consume_uploaded_entries/3` may only run inside a command handler. The row that
+announces the file arrives afterwards on the ordinary message stream, carrying
+the attachment as plain state — never out of the reply (BDR-0009).
+
+`musubi-client` never touches a filesystem, so the embedder reads the file. The
+picker is gpui 0.2.2's `App::prompt_for_paths(PathPromptOptions { files: true,
+directories: false, multiple: false, prompt })`, which returns a
+`oneshot::Receiver<Result<Option<Vec<PathBuf>>>>`; the bytes are then read on
+`cx.background_executor()` rather than the UI thread.
+
+**The test seam.** A native modal cannot be driven from a script, so
+`ChatWindow::attach` takes an `Option<PathBuf>`: the button passes `None` and
+gets the dialog, and the test passes `Some(path)` for a file it wrote itself —
+everything after the path is the same code the button runs.
+
+**What this surfaced.** Channel-mode uploads had never run over a real Phoenix
+transport before this example — the wire fixtures use external mode, because a
+channel-mode token is signed per run and could not survive `git diff
+--exit-code`, and `Phoenix.ChannelTest.push/3` hands the channel a raw binary.
+The real serializer does not: `Phoenix.Socket.V2.JSONSerializer.decode_binary/1`
+tags the payload `{:binary, data}`, which matched no `handle_in/3` clause, so
+every real chunk crashed its sub-channel and the entry came back as
+`{op: cancel}`. `Musubi.Transport.UploadChannel` now accepts both shapes and
+`test/musubi/transport/upload_channel_test.exs` covers the serializer's.
+
+### 4.7 Connection pill, and the gap behind it
 
 `Mounted::snapshot()` returns `None` before the initial patch and **is never
 cleared afterwards** — not by a reconnect either (`crates/musubi-client/src/mounted.rs`
@@ -673,14 +725,14 @@ mirrors `main.tsx`'s "Connect failed" panel without mirroring its top-level
 
 **The mount carries params.** `ChatRoom.Stores.ChatRoomStore` declares
 `attr(:room_id, String.t(), required: true)` and its `mount/2` does
-`Map.fetch!(params, "room_id")`, so joining with `{}` raises server-side and the
-join is rejected. `mount` takes untyped `impl Serialize` params
-(`docs/rust-client.md` §7 — there is no `Store::Params`, because `attr/3`
-declarations are not in the shared manifest):
+`Map.fetch!(params, "room_id")`. That attr is generated as a plain field on the
+store's `Params` struct (`docs/rust-client.md` §7), so the required param
+cannot be forgotten at the call site — omitting it no longer waits for a
+server-side rejection, it fails to compile:
 
 ```rust
 let mounted = connection
-    .mount::<ChatRoomStore>(room_id, json!({ "room_id": room_id }))  // "general"
+    .mount::<ChatRoomStore>(room_id, Params { room_id: room_id.to_owned() })  // "general"
     .await?;
 ```
 
@@ -762,7 +814,7 @@ versions"), so the README should say the example is pinned to
 ### 6.3 Reconnect demo
 
 Stop `mix server` and watch the message list stay rendered (BDR-0015: keep
-last-good, no resync). The pill still says "live" at this point — see §4.6:
+last-good, no resync). The pill still says "live" at this point — see §4.7:
 nothing tells the view the socket is gone until it tries to use it — so press
 **Send**, watch the command fail with `Disconnected` and the pill flip to
 "reconnecting". Restart the server, watch the client rejoin, receive a
@@ -888,7 +940,7 @@ deliberately routes around both.
    "have I ever loaded" and nothing else — it is never cleared on reconnect,
    because BDR-0015 requires clients to keep rendering the last good tree — so
    a client has no way to observe a socket that dropped while it was idle.
-   Every non-React client will re-derive the §4.6 workaround (a `stale` flag set
+   Every non-React client will re-derive the §4.7 workaround (a `stale` flag set
    by the first command that fails). **Still open**, and it is the one visible
    rough edge in the shipped example: the connection pill reads "live" until the
    user tries to send. Proposal: add

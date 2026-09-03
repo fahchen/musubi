@@ -11,7 +11,7 @@ Feature coverage map:
 | Musubi feature | Declared in §1 | Generated in §2 | Used in §3 |
 | :--- | :--- | :--- | :--- |
 | `Musubi.State` modules (`state do`) | `Demo.ProfileState`, `Demo.LineItem` | bare structs in `demo::` | field reads |
-| Root store + `attr/3` mount params | `CartPageStore` | untyped (`:attrs` not in manifest) | §3.2 |
+| Root store + `attr/3` mount params | `CartPageStore` | `Params` struct | §3.2 |
 | Child store + `Module.state()` | `checkout_panel` field | `StoreField<...State>` | §3.5 child commands |
 | Scalars, `atom()`, literals, `map()` | `title` … `metadata` | `String`/`i64`/`bool`/`Map` | §3.3 |
 | `T \| nil` | `coupon` | `Option<String>` | §3.3 |
@@ -199,6 +199,7 @@ pub mod demo {
             impl super::super::super::musubi::Store for CartPageStore {
                 const MODULE: &'static str = "Demo.Stores.CartPageStore";
                 type State = State;
+                type Params = Params;
             }
 
             /// The store's rendered shape: state fields plus one `UploadSlot` per
@@ -227,6 +228,14 @@ pub mod demo {
                     super::super::super::demo::stores::checkout_panel_store::State,
                 >,
                 pub attachments: super::super::super::musubi::UploadSlot,
+            }
+
+            /// The mount params object, one field per `attr/3` declaration: required
+            /// attrs are plain fields, optional ones `Option`. A store declaring no
+            /// `attr` gets an empty struct, which serializes to `{}`.
+            #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+            pub struct Params {
+                pub cart_id: String,
             }
 
             #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -320,6 +329,7 @@ pub mod demo {
             impl super::super::super::musubi::Store for CheckoutPanelStore {
                 const MODULE: &'static str = "Demo.Stores.CheckoutPanelStore";
                 type State = State;
+                type Params = Params;
             }
 
             /// The store's rendered shape: state fields plus one `UploadSlot` per
@@ -329,6 +339,12 @@ pub mod demo {
                 pub status: CheckoutPanelStoreStatus,
                 pub total_cents: i64,
             }
+
+            /// The mount params object, one field per `attr/3` declaration: required
+            /// attrs are plain fields, optional ones `Option`. A store declaring no
+            /// `attr` gets an empty struct, which serializes to `{}`.
+            #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+            pub struct Params {}
 
             #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
             pub enum CheckoutPanelStoreStatus {
@@ -397,10 +413,12 @@ Reading notes:
   module references — not `float()` — so this example uses integer cents. The
   `f64` row of `docs/rust-codegen.md` §3.2 is reachable only through float
   literals (`1.0`, or a union of them).
-- **Invisible declarations.** `attr/3`, `item_key`/`limit` stream opts, upload
-  config values (`accept`, `max_entries`, …), and every callback leave no trace:
-  the generator consumes only `{fields, commands, events, uploads}` from the
-  manifest. Upload config arrives at runtime via the `config` upload op.
+- **Invisible declarations.** `item_key`/`limit` stream opts, upload config
+  values (`accept`, `max_entries`, …), attr `default:` values, and every
+  callback leave no trace: the generator consumes only
+  `{fields, commands, events, attrs, uploads}` from the manifest, and of an
+  attr only its name, type and required-ness. Upload config arrives at runtime
+  via the `config` upload op; attr defaults are applied server-side.
 - **Field docs**: command/event fields render `///` from `doc:`; state fields
   don't (mirrors the TS asymmetry).
 
@@ -444,12 +462,12 @@ let connection = musubi_client_tokio::builder("wss://example.app/musubi")
     .heartbeat(Duration::from_secs(30))     // optional; 30s is the default
     .build()?;
 
-// Mount params are untyped (no `type Params` — `:attrs` is not in the
-// manifest): anything serializing to a JSON object. `cart_id` is required
-// by this store's `attr/3`. Only root stores mount; the server rejects a
-// child module with "declared store is not a root store".
+// Mount params are the store's generated `Params` struct: `cart_id` is a
+// plain field because this store's `attr/3` declares `required: true`.
+// Only root stores mount; the server rejects a child module with
+// "declared store is not a root store".
 let mounted = connection
-    .mount::<CartPageStore>("cart-1", serde_json::json!({ "cart_id": "cart-1" }))
+    .mount::<CartPageStore>("cart-1", Params { cart_id: "cart-1".to_owned() })
     .await?;
 ```
 

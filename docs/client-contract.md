@@ -98,6 +98,10 @@ Public rules:
 interface MountedStore<M, R> {
   readonly store: StoreProxy<M, R>
   readonly unmount: () => Promise<void>
+  // Stale-while-revalidate state; inert for an uncached mount. See Store Cache.
+  readonly fromCache: boolean
+  readonly isFetching: boolean
+  readonly revalidated: Promise<void>
 }
 ```
 
@@ -337,6 +341,130 @@ Envelope rules:
 
 See `Musubi.Stream` for declaration, render placement, and validation
 rules, and `docs/push-events.md` for push events.
+
+## Store Cache (Stale-While-Revalidate)
+
+Caching is opt-in **per mount**: `mountStore` with a `cache` option resolves
+immediately from a valid cached entry and revalidates in the background, while
+an uncached mount resolves only once the live initial patch has landed. The
+cache is a rendering optimization layered on top of the wire contract above —
+it never changes what the server sends or how versions advance.
+
+```ts
+type CacheOptions = {
+  // Maximum entry age in ms. Default `DEFAULT_GC_MS` (300_000, 5 minutes).
+  gcTime?: number
+  // Backend. Defaults to a connection-scoped in-memory persister.
+  persister?: MusubiCachePersister
+  // Shape/deploy version. Default "". An entry written under a different
+  // buster is discarded on read.
+  buster?: string
+  // Seed used only when no valid entry exists; written through to the
+  // persister so later mounts read it back as an ordinary entry.
+  initialData?: unknown
+}
+
+type MusubiCacheEntry = {
+  // The wire tree with markers intact (`__musubi_store_id__`,
+  // `__musubi_stream__`, `__musubi_upload__`), so seeding runs the same
+  // materialization as a live patch rather than a second decoding path.
+  data: unknown
+  // `Date.now()` at write time, in ms.
+  updatedAt: number
+  buster: string
+}
+
+type MaybePromise<T> = T | Promise<T>
+
+interface MusubiCachePersister {
+  getEntry(key: string): MaybePromise<MusubiCacheEntry | undefined>
+  setEntry(key: string, entry: MusubiCacheEntry): MaybePromise<void>
+  removeEntry(key: string): MaybePromise<void>
+  clear?(): MaybePromise<void>
+  // Storage-backed adapters set this so the runtime can warn (outside
+  // production) when a durable cache is used with an empty `buster`.
+  readonly durable?: boolean
+}
+```
+
+A cache slot is keyed by mount identity, not by the wire `root_id`:
+
+```ts
+storeCacheKey({ module, id, params }) // "<id>|<module>|<canonical(params)>"
+```
+
+`canonicalStringify` sorts object keys at every depth and drops `undefined`
+members, so params field order cannot fork one store into two slots; omitted
+params canonicalize to `null`. Both helpers are exported from `@musubi/client`
+and `@musubi/react` derives its mount key from `storeCacheKey`, so a store
+mounted through either layer maps to the same slot.
+
+Two persisters ship with the client: `createMemoryPersister()` — the default,
+connection-scoped, `durable: false`, cleared on `disconnect()` — and
+`createStorageCachePersister(storage, { prefix = "musubi:cache:" })` for
+`localStorage` / `sessionStorage`, which is `durable: true` and JSON-encodes
+entries under the prefix. Storage faults never reach the patch path: a quota or
+serialization failure is warned and dropped, a throwing or malformed read is
+treated as a miss and the offending key removed.
+
+Seeding rules:
+
+- the root registration and the channel join happen before the cache read, so a
+  slow persister delays the seed and never the revalidation
+- a seed installs the cached tree and store index with `version` still `0`; the
+  live initial patch is still required to carry `base_version: 0, version: 1`,
+  and its whole-root `replace ""` swaps the seed out in one op
+- an entry whose `buster` differs, or whose age exceeds `gcTime`, is removed on
+  read and the mount is cold
+- a read that suspends past the live initial patch loses: `version !== 0` means
+  the server's state stays, the seed is discarded, and `fromCache` is false
+- a persister that throws is warned about and degrades to a cold mount
+- `initialData` is consulted only after a miss (or an evicted entry) and is
+  written through to the persister, so later mounts read it back as an ordinary
+  entry and it ages out under the same `gcTime`
+- streams and uploads are not cached — that state rides `stream_ops` /
+  `upload_ops`, not the tree — so a seeded stream materializes as `[]` and a
+  seeded upload slot as an idle handle until the live envelope refills them
+- `fromCache` is true only for a mount that actually rendered a seed;
+  `isFetching` stays true until `revalidated` settles, and `revalidated`
+  rejects with the revalidation error (e.g. unmount or disconnect mid-flight)
+
+Commands dispatched in the stale window queue rather than fail. While a
+cache-seeded root is still at version `0`, `dispatchCommand` chains onto the
+in-flight initial patch and re-dispatches once the live envelope lands; if
+revalidation fails, the command rejects with that same error. An uncached mount
+has no such window — dispatching before the initial patch rejects with "Store is
+not connected".
+
+Writes are throttled per slot. Every accepted envelope schedules the root's tree
+on a trailing throttle (`CACHE_PERSIST_THROTTLE_MS`, 1s), so a burst of
+envelopes costs at most one write per interval and always persists the latest
+tree. The write is fire-and-forget; a rejection is warned, never thrown into the
+patch path.
+
+Teardown flushes, then arms eviction. When a root's last consumer unmounts — or
+an orphaned root's channel drops — the pending write is flushed and a gc timer
+is armed for the remainder of `gcTime` measured from the entry's own
+`updatedAt`, so a slot that was already half-expired is not handed a fresh
+lifetime. The timer is a no-op if the slot has been re-mounted or re-registered
+by the time it fires. `disconnect()` flushes every pending write, drops the
+timers and the registry, and clears the runtime-owned memory persister; a
+durable persister keeps its flushed entries, subject to `gcTime` on the next
+read. `connection.clearStoreCache(target?)` drops one slot outright (writer,
+timer, registration and stored entry) or, with no target, clears every persister
+on the connection.
+
+The Rust client mirrors this design in `docs/rust-client.md` §6.4, where
+`CacheEntry { data, updated_at, buster }` and `cache_key(module, id, params)`
+are this entry and this key under Rust naming. Three divergences there are
+deliberate: the Rust cache is connection-wide rather than per-mount (so it has
+no `initialData`), its `disconnect()` flushes without evicting (the store is the
+embedder's, not the runtime's), and it emits no durable-without-`buster` warning
+(a `CacheStore` does not declare durability). Key compatibility holds for
+object-valued params over non-float scalars only — TypeScript canonicalizes
+omitted params to `null` where Rust always renders an object, and float
+rendering differs — so point both clients at one durable store only under those
+terms. This document stays normative for the TypeScript behavior.
 
 ## Async Values
 

@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "codex-grid-background",
+        "value": "*",
+        "files": [
+          "examples/chat_room/ui/src/App.css"
+        ],
+        "createdAt": "2026-09-03T12:52:22.218Z",
+        "reason": "pre-existing chat_room example aesthetic (paper+grid), untouched by this change set; desktop client mirrors it for parity"
+      }
+    ]
+  }
+}
