@@ -20,8 +20,17 @@
 //! the socket. Nothing here runs on a wall clock the actor cannot see, so the
 //! actor can never find two ticks queued and read the second as proof that the
 //! first went unanswered.
+//!
+//! Nothing here ever *waits* on the socket's write half either. Outbound frames
+//! are queued in an outbox the loop drains by polling, so a peer that stops
+//! reading — a full send buffer, a zero-window TCP receiver, an upload's chunks
+//! banked up behind it — costs the actor a branch rather than its loop. Waiting
+//! on a write inline would mean no frame gets read and no timer tick gets
+//! handled until the peer relents, which is how every timeout here stops being
+//! a bound on wall-clock time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::future::poll_fn;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -29,7 +38,7 @@ use std::time::Duration;
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
 use futures_util::task::noop_waker_ref;
-use futures_util::{FutureExt, SinkExt, StreamExt, select_biased};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 
 use super::{SocketStatus, StatusCell};
@@ -101,6 +110,16 @@ pub(crate) enum ActorMsg {
 pub(crate) enum PushPayload {
     Json(Value),
     Binary(Vec<u8>),
+}
+
+/// One frame on its way out, and what its *write* — not its queueing — is
+/// allowed to set off.
+struct Outgoing {
+    frame: Frame,
+    /// Set on heartbeats only: the socket incarnation whose next tick this
+    /// frame's write arms. See [`Actor::heartbeat_written`] for why the clock
+    /// hangs off the write and not off the queueing.
+    arms_heartbeat: Option<u64>,
 }
 
 /// What the builder decided, as the actor needs it.
@@ -188,6 +207,19 @@ pub(super) struct Actor {
     tx: UnboundedSender<ActorMsg>,
     rx: UnboundedReceiver<ActorMsg>,
     socket: Option<Box<dyn Socket>>,
+    /// Frames the actor has produced but the socket has not taken yet, oldest
+    /// first. Written in order, and only ever to the socket they were queued
+    /// for — [`drop_socket`](Self::drop_socket) empties it, because the join
+    /// refs they carry mean nothing to a replacement.
+    outbox: VecDeque<Outgoing>,
+    /// Whether the sink is holding something that has not been flushed.
+    needs_flush: bool,
+    /// The heartbeat incarnation owed an armed tick by the flush now
+    /// outstanding.
+    ///
+    /// One is enough: the next heartbeat is only queued by the tick this one's
+    /// write arms, so two can never be waiting on the sink at once.
+    unflushed_heartbeat: Option<u64>,
     channels: HashMap<Arc<str>, ChannelState>,
     inflight: HashMap<u64, Inflight>,
     next_ref: u64,
@@ -228,6 +260,9 @@ impl Actor {
             tx,
             rx,
             socket: None,
+            outbox: VecDeque::new(),
+            needs_flush: false,
+            unflushed_heartbeat: None,
             channels: HashMap::new(),
             inflight: HashMap::new(),
             next_ref: 0,
@@ -243,68 +278,159 @@ impl Actor {
         spawner.spawn(Box::pin(actor.run()));
     }
 
-    /// The actor loop: one wake-up at a time, from the inbox or the socket.
+    /// The actor loop: one wake-up at a time, from the inbox, the socket, or a
+    /// write that failed.
+    ///
+    /// Every wake-up is one [`poll_event`](Self::poll_event) away and every
+    /// handler below it is synchronous, so the loop is only ever suspended
+    /// where it can be woken by all three at once. That is the whole reason
+    /// writes go through an outbox: an inline `send` on a peer that has stopped
+    /// reading suspends the loop somewhere it can be woken by nothing else, and
+    /// the actor stops reading frames and stops handling timer ticks for as
+    /// long as the peer cares to hold it.
     ///
     /// The selection is biased rather than random, and deliberately so: the
     /// protocol suites drive this loop on a hand-pumped single-threaded pool,
-    /// where `futures::select!`'s randomised poll order would make frame
-    /// ordering irreproducible. The bias is inbox-first — a handle's join or
-    /// push should not queue behind an inbound broadcast — but a bias with no
-    /// ceiling is starvation: a producer that can outrun frame handling (an
-    /// upload's progress reports, say) would keep `socket.next()` from ever
-    /// being polled, and a socket whose frames go unread is indistinguishable
-    /// from a dead one. [`FAIRNESS_BUDGET`] caps how many wake-ups in a row the
-    /// inbox may take before a ready frame gets the first look.
+    /// where a randomised poll order would make frame ordering irreproducible.
+    /// The bias is inbox-first — a handle's join or push should not queue
+    /// behind an inbound broadcast — but a bias with no ceiling is starvation:
+    /// a producer that can outrun frame handling (an upload's progress reports,
+    /// say) would keep the socket from ever being read, and a socket whose
+    /// frames go unread is indistinguishable from a dead one.
+    /// [`FAIRNESS_BUDGET`] caps how many wake-ups in a row the inbox may take
+    /// before a ready frame gets the first look.
     async fn run(mut self) {
         let mut inbox_streak: u32 = 0;
 
         loop {
-            let next = match self.socket.as_mut() {
-                Some(socket) => {
-                    let mut msg = self.rx.next().fuse();
-                    let mut frame = socket.next().fuse();
-
-                    if inbox_streak < FAIRNESS_BUDGET {
-                        select_biased! {
-                            msg = msg => Next::Msg(msg),
-                            frame = frame => Next::Frame(frame),
-                        }
-                    } else {
-                        // The socket only holds the lead until it actually
-                        // supplies a frame, so this can never starve the inbox
-                        // in turn.
-                        select_biased! {
-                            frame = frame => Next::Frame(frame),
-                            msg = msg => Next::Msg(msg),
-                        }
-                    }
-                }
-                None => Next::Msg(self.rx.next().await),
-            };
+            // The socket only holds the lead until it actually supplies a
+            // frame, so handing it over can never starve the inbox in turn.
+            let socket_first = inbox_streak >= FAIRNESS_BUDGET;
+            let next = poll_fn(|cx| self.poll_event(cx, socket_first)).await;
 
             inbox_streak = match next {
                 Next::Msg(_) => inbox_streak.saturating_add(1),
-                Next::Frame(_) => 0,
+                Next::Frame(_) | Next::WriteFailed(_) => 0,
             };
 
             match next {
                 Next::Msg(None) | Next::Msg(Some(ActorMsg::Shutdown)) => break,
-                Next::Msg(Some(msg)) => self.handle_msg(msg).await,
+                Next::Msg(Some(msg)) => self.handle_msg(msg),
                 Next::Frame(frame) => {
-                    self.handle_socket(frame).await;
+                    self.handle_socket(frame);
+                }
+                Next::WriteFailed(error) => {
+                    tracing::debug!(%error, "socket write failed");
+                    self.drop_socket(ChannelErrorReason::SocketClosed);
+                    self.schedule_reconnect();
                 }
             }
         }
     }
 
+    /// One poll of everything the loop waits on: the outbox first, then a
+    /// message or a frame under the loop's bias.
+    ///
+    /// Writes are driven here rather than as a third branch of the biased
+    /// selection, because a branch only runs when it *wins* the bias — and the
+    /// inbox-first bias is exactly the one that would keep it from running
+    /// while a producer is busy, which is the case the outbox exists for.
+    /// Driving them first and unconditionally on every poll is what makes the
+    /// outbox unstarvable, and costs nothing when it is empty.
+    fn poll_event(&mut self, cx: &mut Context<'_>, socket_first: bool) -> Poll<Next> {
+        if let Poll::Ready(error) = self.drive_writes(cx) {
+            return Poll::Ready(Next::WriteFailed(error));
+        }
+
+        if socket_first {
+            if let Poll::Ready(frame) = self.poll_readable(cx) {
+                return Poll::Ready(Next::Frame(frame));
+            }
+        }
+
+        if let Poll::Ready(msg) = self.rx.poll_next_unpin(cx) {
+            return Poll::Ready(Next::Msg(msg));
+        }
+
+        if !socket_first {
+            if let Poll::Ready(frame) = self.poll_readable(cx) {
+                return Poll::Ready(Next::Frame(frame));
+            }
+        }
+
+        Poll::Pending
+    }
+
+    /// Pushes as much of the outbox onto the socket as it will take right now,
+    /// and never one byte's worth more.
+    ///
+    /// [`Poll::Pending`] is the ordinary outcome and means "that is as far as
+    /// it goes for the moment": the outbox is drained, or the sink is full and
+    /// has parked its waker here. [`Poll::Ready`] carries the write failure
+    /// that ends this socket — and carries it out to the loop, which acts on it
+    /// against the socket that produced it, before anything else can run.
+    fn drive_writes(&mut self, cx: &mut Context<'_>) -> Poll<TransportError> {
+        let Some(socket) = self.socket.as_mut() else {
+            return Poll::Pending;
+        };
+        let mut written = None;
+
+        let outcome = loop {
+            if !self.outbox.is_empty() {
+                match socket.poll_ready_unpin(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(error)) => break Poll::Ready(error),
+                    Poll::Pending => break Poll::Pending,
+                }
+
+                let outgoing = self.outbox.pop_front().expect("the outbox is not empty");
+                let arms_heartbeat = outgoing.arms_heartbeat;
+
+                if let Err(error) = socket.start_send_unpin(outgoing.frame) {
+                    break Poll::Ready(error);
+                }
+
+                self.needs_flush = true;
+                // Owed until the flush below says the frame is really gone;
+                // `SinkExt::send`, which this replaced, drew the same line.
+                self.unflushed_heartbeat = arms_heartbeat.or(self.unflushed_heartbeat);
+
+                continue;
+            }
+
+            if !self.needs_flush {
+                break Poll::Pending;
+            }
+
+            match socket.poll_flush_unpin(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.needs_flush = false;
+                    written = self.unflushed_heartbeat.take();
+
+                    break Poll::Pending;
+                }
+                Poll::Ready(Err(error)) => break Poll::Ready(error),
+                Poll::Pending => break Poll::Pending,
+            }
+        };
+
+        if let Some(epoch) = written {
+            self.heartbeat_written(epoch);
+        }
+
+        outcome
+    }
+
     /// Handles one wake-up from the socket — a frame, a read failure or the end
     /// of the stream — and reports whether the socket survived it.
-    async fn handle_socket(&mut self, next: Option<Result<Frame, TransportError>>) -> bool {
+    fn handle_socket(&mut self, next: Option<Result<Frame, TransportError>>) -> bool {
         match next {
             Some(Ok(frame)) => {
-                self.handle_frame(frame).await;
-                // A frame can take the socket with it: an undeliverable write
-                // on the reply path drops it.
+                self.handle_frame(frame);
+                // Handling a frame only ever *queues* a write now, so nothing
+                // on this path can take the socket down with it. Still read
+                // rather than assumed: it is what lets `drain_readable` keep
+                // going, and it must stay true rather than be true by luck.
                 self.socket.is_some()
             }
             Some(Err(error)) => {
@@ -330,12 +456,17 @@ impl Actor {
     /// unanswered heartbeat proves the socket dead — because the frame sitting
     /// there may be the reply that answers it. Everything else in the actor is
     /// happy to read frames a wake-up later.
-    async fn drain_readable(&mut self) {
+    fn drain_readable(&mut self) {
+        // The waker is a no-op because nothing waits on it: this only takes
+        // what the transport has already delivered, and the loop registers a
+        // real one the moment the caller returns to it.
+        let mut cx = Context::from_waker(noop_waker_ref());
+
         loop {
-            match self.poll_readable() {
+            match self.poll_readable(&mut cx) {
                 Poll::Pending => return,
                 Poll::Ready(next) => {
-                    if !self.handle_socket(next).await {
+                    if !self.handle_socket(next) {
                         return;
                     }
                 }
@@ -345,47 +476,44 @@ impl Actor {
 
     /// Whatever the socket has for the taking right now, or
     /// [`Poll::Pending`] if it has nothing — or if there is no socket.
-    ///
-    /// Kept out of `async fn` on purpose: a [`Context`] is not `Send`, and the
-    /// actor loop has to be. The waker is a no-op because nothing waits on it —
-    /// the loop registers a real one the moment the caller returns to it.
-    fn poll_readable(&mut self) -> Poll<Option<Result<Frame, TransportError>>> {
-        let mut cx = Context::from_waker(noop_waker_ref());
-
+    fn poll_readable(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame, TransportError>>> {
         match self.socket.as_mut() {
-            Some(socket) => socket.poll_next_unpin(&mut cx),
+            Some(socket) => socket.poll_next_unpin(cx),
             None => Poll::Pending,
         }
     }
 
-    async fn handle_msg(&mut self, msg: ActorMsg) {
+    fn handle_msg(&mut self, msg: ActorMsg) {
         match msg {
             ActorMsg::Attach {
                 topic,
                 params,
                 reply,
             } => self.attach(topic, params, reply),
-            ActorMsg::Join { topic, generation } => self.join(topic, generation).await,
-            ActorMsg::Leave { topic, generation } => self.leave(topic, generation).await,
+            ActorMsg::Join { topic, generation } => self.join(topic, generation),
+            ActorMsg::Leave { topic, generation } => self.leave(topic, generation),
             ActorMsg::Push {
                 topic,
                 generation,
                 event,
                 payload,
                 reply,
-            } => self.push(topic, generation, event, payload, reply).await,
+            } => self.push(topic, generation, event, payload, reply),
             ActorMsg::Rejoin {
                 topic,
                 generation,
                 attempt,
-            } => self.rejoin(topic, generation, attempt).await,
-            ActorMsg::Connected(result) => self.connected(result).await,
+            } => self.rejoin(topic, generation, attempt),
+            ActorMsg::Connected(result) => self.connected(result),
             ActorMsg::Reconnect => {
                 self.reconnect_scheduled = false;
                 self.connect();
             }
-            ActorMsg::HeartbeatTick { epoch } => self.heartbeat_tick(epoch).await,
-            ActorMsg::Timeout { msg_ref } => self.timeout(msg_ref).await,
+            ActorMsg::HeartbeatTick { epoch } => self.heartbeat_tick(epoch),
+            ActorMsg::Timeout { msg_ref } => self.timeout(msg_ref),
             ActorMsg::Disconnect { ack } => {
                 self.closed = true;
                 self.drop_socket(ChannelErrorReason::SocketClosed);
@@ -429,7 +557,7 @@ impl Actor {
         let _ = reply.send((generation, events_rx));
     }
 
-    async fn join(&mut self, topic: Arc<str>, generation: u64) {
+    fn join(&mut self, topic: Arc<str>, generation: u64) {
         let Some(state) = self.live_mut(&topic, generation) else {
             return;
         };
@@ -442,7 +570,7 @@ impl Actor {
             return;
         }
 
-        self.send_join(topic, generation).await;
+        self.send_join(topic, generation);
     }
 
     /// A scheduled rejoin came due.
@@ -451,7 +579,7 @@ impl Actor {
     /// it whenever the socket errors: while the transport is down the reconnect
     /// ladder owns recovery and rejoins everything on open, so a rejoin that
     /// dialled on its own would only jump the queue the ladder exists to hold.
-    async fn rejoin(&mut self, topic: Arc<str>, generation: u64, attempt: u64) {
+    fn rejoin(&mut self, topic: Arc<str>, generation: u64, attempt: u64) {
         let armed = match self.live_mut(&topic, generation) {
             Some(state) if state.rejoin_scheduled == Some(attempt) => {
                 state.rejoin_scheduled = None;
@@ -461,7 +589,7 @@ impl Actor {
         };
 
         if armed && self.socket.is_some() {
-            self.join(topic, generation).await;
+            self.join(topic, generation);
         }
     }
 
@@ -473,7 +601,7 @@ impl Actor {
     /// asks the server to throw away the very work we are waiting on. Only a
     /// [`ChannelStatus::Closed`] channel may join — which is `phoenix.js`'s
     /// `joinedOnce` guard and its `rejoin()` leaving-guard in one condition.
-    async fn send_join(&mut self, topic: Arc<str>, generation: u64) {
+    fn send_join(&mut self, topic: Arc<str>, generation: u64) {
         let msg_ref = self.next_ref();
         let ref_str = msg_ref.to_string();
 
@@ -505,11 +633,10 @@ impl Actor {
             topic: topic.to_string(),
             event: EVENT_JOIN.to_owned(),
             payload,
-        })
-        .await;
+        });
     }
 
-    async fn leave(&mut self, topic: Arc<str>, generation: u64) {
+    fn leave(&mut self, topic: Arc<str>, generation: u64) {
         let connected = self.socket.is_some();
 
         let Some(state) = self.live_mut(&topic, generation) else {
@@ -545,11 +672,10 @@ impl Actor {
             topic: topic.to_string(),
             event: EVENT_LEAVE.to_owned(),
             payload: json!({}),
-        })
-        .await;
+        });
     }
 
-    async fn push(
+    fn push(
         &mut self,
         topic: Arc<str>,
         generation: u64,
@@ -607,10 +733,10 @@ impl Actor {
 
         self.inflight.insert(msg_ref, Inflight::Push { reply });
         self.spawn_timeout(msg_ref, self.push_timeout);
-        self.send_encoded(frame).await;
+        self.send_encoded(frame);
     }
 
-    async fn connected(&mut self, result: Result<Box<dyn Socket>, TransportError>) {
+    fn connected(&mut self, result: Result<Box<dyn Socket>, TransportError>) {
         self.connecting = false;
 
         let socket = match result {
@@ -645,13 +771,13 @@ impl Actor {
             .collect();
 
         for (topic, generation) in pending {
-            self.send_join(topic, generation).await;
+            self.send_join(topic, generation);
         }
     }
 
     /// One beat of the heartbeat clock: judge the previous heartbeat, send the
     /// next, and arm the tick after it.
-    async fn heartbeat_tick(&mut self, epoch: u64) {
+    fn heartbeat_tick(&mut self, epoch: u64) {
         // The fence: a tick armed against a socket that has since been replaced
         // would put a second clock on its successor, halving the interval and
         // making every other tick look like a missed reply.
@@ -664,7 +790,7 @@ impl Actor {
             // sitting in the socket, delivered by the transport but unread
             // because the loop is inbox-first. An unread reply is not a missed
             // one.
-            self.drain_readable().await;
+            self.drain_readable();
         }
 
         // Nothing to beat on — or the drain took the socket down with it, which
@@ -684,32 +810,29 @@ impl Actor {
 
         let msg_ref = self.next_ref();
         self.pending_heartbeat = Some(msg_ref);
-        self.send_frame(Message {
-            join_ref: None,
-            msg_ref: Some(msg_ref.to_string()),
-            topic: TOPIC_PHOENIX.to_owned(),
-            event: EVENT_HEARTBEAT.to_owned(),
-            payload: json!({}),
-        })
-        .await;
 
-        // The clock is armed here, *after* the write, and nowhere else. That is
-        // what makes the interval a measure of how long this heartbeat has gone
-        // unanswered rather than of how long ago some other timer thought one
-        // was due — and it is why the actor can never find two ticks queued.
-        //
-        // Whatever moves socket writes off this loop must keep that anchor: arm
-        // the next tick when the heartbeat is actually *sent*, not when it is
-        // handed to a writer. Arming on the queueing would restore the very
-        // decoupling this replaced.
-        if self.socket.is_some() {
-            self.arm_heartbeat();
-        }
+        // The tick that judges this beat is armed by the beat's *write*, not
+        // here: the frame carries the incarnation to arm, and
+        // [`heartbeat_written`](Self::heartbeat_written) does it when the
+        // socket has actually taken it. Nothing arms the clock on the queueing,
+        // which is what keeps the interval a measure of how long this beat has
+        // gone unanswered — and why the actor can never find two ticks queued.
+        self.queue(
+            Message {
+                join_ref: None,
+                msg_ref: Some(msg_ref.to_string()),
+                topic: TOPIC_PHOENIX.to_owned(),
+                event: EVENT_HEARTBEAT.to_owned(),
+                payload: json!({}),
+            }
+            .encode(),
+            Some(epoch),
+        );
     }
 
-    async fn timeout(&mut self, msg_ref: u64) {
+    fn timeout(&mut self, msg_ref: u64) {
         if let Some(inflight) = self.inflight.remove(&msg_ref) {
-            self.abandon(inflight, PushError::Timeout).await;
+            self.abandon(inflight, PushError::Timeout);
         }
     }
 
@@ -729,7 +852,7 @@ impl Actor {
     /// other way a join is superseded — a `phx_error`, a deliberate leave, a
     /// dead transport — is one the server already knows about, so this is the
     /// one path that has to say `phx_leave` on its own.
-    async fn abandon(&mut self, inflight: Inflight, push_error: PushError) {
+    fn abandon(&mut self, inflight: Inflight, push_error: PushError) {
         match inflight {
             Inflight::Push { reply } => {
                 let _ = reply.send(Err(push_error));
@@ -747,7 +870,7 @@ impl Actor {
                 emit(state, ChannelEvent::JoinTimeout);
 
                 if let Some(join_ref) = join_ref {
-                    self.leave_abandoned_join(&topic, join_ref).await;
+                    self.leave_abandoned_join(&topic, join_ref);
                 }
 
                 self.schedule_rejoin(&topic, generation);
@@ -771,7 +894,7 @@ impl Actor {
     ///
     /// Fire and forget: nothing is registered for the reply, because the
     /// channel stays in the registry to be rejoined rather than dropped.
-    async fn leave_abandoned_join(&mut self, topic: &Arc<str>, join_ref: String) {
+    fn leave_abandoned_join(&mut self, topic: &Arc<str>, join_ref: String) {
         let msg_ref = self.next_ref();
 
         self.send_frame(Message {
@@ -780,11 +903,10 @@ impl Actor {
             topic: topic.to_string(),
             event: EVENT_LEAVE.to_owned(),
             payload: json!({}),
-        })
-        .await;
+        });
     }
 
-    async fn handle_frame(&mut self, frame: Frame) {
+    fn handle_frame(&mut self, frame: Frame) {
         let text = match frame {
             Frame::Text(text) => text,
             Frame::Binary(bytes) => {
@@ -802,7 +924,7 @@ impl Actor {
         };
 
         if message.event == EVENT_REPLY {
-            self.handle_reply(message).await;
+            self.handle_reply(message);
             return;
         }
 
@@ -858,7 +980,7 @@ impl Actor {
         self.schedule_rejoin(topic, generation);
     }
 
-    async fn handle_reply(&mut self, message: Message) {
+    fn handle_reply(&mut self, message: Message) {
         let Some(msg_ref) = message.msg_ref.as_ref().and_then(|r| r.parse::<u64>().ok()) else {
             tracing::warn!(msg_ref = ?message.msg_ref, "reply without a usable ref");
             return;
@@ -878,7 +1000,7 @@ impl Actor {
             Ok(reply) => reply,
             Err(error) => {
                 tracing::warn!(%error, "dropping malformed reply payload");
-                self.abandon(inflight, PushError::MalformedReply).await;
+                self.abandon(inflight, PushError::MalformedReply);
                 return;
             }
         };
@@ -927,20 +1049,67 @@ impl Actor {
         }
     }
 
-    async fn send_frame(&mut self, message: Message) {
-        self.send_encoded(message.encode()).await;
+    fn send_frame(&mut self, message: Message) {
+        self.send_encoded(message.encode());
     }
 
-    async fn send_encoded(&mut self, frame: Frame) {
-        let result = match self.socket.as_mut() {
-            Some(socket) => socket.send(frame).await,
-            None => return,
-        };
+    fn send_encoded(&mut self, frame: Frame) {
+        self.queue(frame, None);
+    }
 
-        if let Err(error) = result {
-            tracing::debug!(%error, "socket write failed");
-            self.drop_socket(ChannelErrorReason::SocketClosed);
-            self.schedule_reconnect();
+    /// Hands one frame to the outbox for the loop to write.
+    ///
+    /// Queueing is the whole of it: no `await`, so no caller can be parked by a
+    /// peer that has stopped reading, and no fallible enqueue either — the
+    /// outbox has no capacity of its own to run out of. It is a staging area
+    /// between two queues the actor already had (the unbounded inbox that
+    /// produced the frame, and the transport's own send buffer), not a new
+    /// place for the connection to accumulate work it never had before: a
+    /// producer that outruns the socket is bounded by the timeouts that fail
+    /// its pushes, exactly as it was when the writes were inline.
+    ///
+    /// A frame produced with no socket is dropped, as it always was — there is
+    /// nothing to write it to, and the reconnect rejoins from scratch.
+    fn queue(&mut self, frame: Frame, arms_heartbeat: Option<u64>) {
+        if self.socket.is_none() {
+            return;
+        }
+
+        self.outbox.push_back(Outgoing {
+            frame,
+            arms_heartbeat,
+        });
+    }
+
+    /// The heartbeat queued for `epoch` has reached the socket: start the
+    /// interval that judges it.
+    ///
+    /// **This is the clock's anchor.** The tick is armed here, from the write
+    /// completing, and nowhere else, so the interval measures how long *this*
+    /// beat has gone unanswered rather than how long ago some other timer
+    /// thought one was due. Arming it where the beat is queued instead would
+    /// put the clock back on a schedule the actor does not drive: a beat that
+    /// waited in the outbox behind an upload's chunks would be judged missed
+    /// moments after it was written, which is the false timeout the
+    /// self-clocking heartbeat exists to rule out.
+    ///
+    /// Fenced like every other deferred effect in this file: the frame names
+    /// the incarnation it was queued for, so a completion the actor has since
+    /// moved off re-arms nothing. Emptying the outbox with the socket makes
+    /// that belt-and-braces, and it is meant to stay that way.
+    ///
+    /// A socket that never takes the beat therefore never re-arms the clock and
+    /// is never torn down by it. That is the deliberate trade: it is strictly
+    /// better than the loop that used to park in that write (which handled no
+    /// ticks either, nor any read or timeout besides), pushes riding on such a
+    /// socket still fail on their own timeouts, and a peer that has genuinely
+    /// gone will still error the read half. Bounding how long a socket may
+    /// refuse to be written to is a write deadline — a different timer, for a
+    /// different question, and one that must not be smuggled in here as a
+    /// second heartbeat clock.
+    fn heartbeat_written(&mut self, epoch: u64) {
+        if self.socket.is_some() && epoch == self.heartbeat_epoch {
+            self.arm_heartbeat();
         }
     }
 
@@ -963,9 +1132,19 @@ impl Actor {
     /// the actor itself handled, so clearing the socket stops it: the tick that
     /// is already armed arrives naming an incarnation that is over, and the
     /// fence drops it. The next socket starts a new epoch of its own.
+    ///
+    /// Everything queued for this socket goes with it. A frame written to a
+    /// replacement would be stamped with join refs that socket never issued,
+    /// and a write half-way into the old sink is not one another sink can
+    /// finish — so the outbox, the flush it owes and the heartbeat that flush
+    /// would have armed are all dropped together with the transport that owned
+    /// them.
     fn drop_socket(&mut self, reason: ChannelErrorReason) {
         self.report_lost();
         self.socket = None;
+        self.outbox.clear();
+        self.needs_flush = false;
+        self.unflushed_heartbeat = None;
         self.pending_heartbeat = None;
 
         for (_, inflight) in self.inflight.drain() {
@@ -1065,6 +1244,12 @@ impl Actor {
 
     /// Arms the next tick, stamped with the incarnation it beats for.
     ///
+    /// Called from exactly two places, both of which are a *completed write*:
+    /// [`start_heartbeat`](Self::start_heartbeat), where the socket's own
+    /// connect is the event, and [`heartbeat_written`](Self::heartbeat_written),
+    /// where the previous beat reaching the socket is. Nothing else may call
+    /// it, or the clock stops measuring what it claims to.
+    ///
     /// Like every other timer here it cannot be cancelled, so one armed against
     /// a socket that then dies survives until its interval elapses and is
     /// dropped on arrival by the fence in [`heartbeat_tick`](Self::heartbeat_tick).
@@ -1137,6 +1322,11 @@ impl Actor {
 enum Next {
     Msg(Option<ActorMsg>),
     Frame(Option<Result<Frame, TransportError>>),
+    /// The socket refused a write. Reported as a wake-up of its own rather
+    /// than handled where it is noticed, so that tearing the socket down is
+    /// one more thing the loop does in its own order — and so the socket that
+    /// failed is provably still the one the loop is holding when it does.
+    WriteFailed(TransportError),
 }
 
 /// Delivers one event; a dropped receiver is not an error.

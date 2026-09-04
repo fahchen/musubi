@@ -264,12 +264,12 @@ channel — a mount and a version-gap recovery, both through `attach_and_join` �
 plus `disconnect`, which is terminal anyway. `attach_and_join` awaits
 `PhoenixSocket::channel`: a round trip through the socket actor's own inbox, not
 to the server, since the join push that follows is fire-and-forget.
-Normally that window is microseconds. Under a concurrent channel-mode upload it
-widens: the socket actor serializes writes, and an upload chunk occupies it for
-one frame flush, so the `Attach` waits behind that flush. It is bounded by *one*
-chunk rather than the whole transfer only because chunks are sequential with one
-push in flight (§10.2) — the actor is never stalled for the length of a file,
-but a large `chunk_size` on a slow link is a real stall for every other root.
+That window is microseconds, and it stays microseconds under a concurrent
+channel-mode upload: the socket actor queues writes rather than awaiting them
+(§3.1), so an upload chunk costs it an encode and an enqueue, not a flush. A
+slow link — or a peer that has stopped reading altogether — backs the chunks up
+in the socket actor's outbox, where they wait on the transport instead of on the
+`Attach`.
 
 **No backpressure, anywhere.** Sends are non-blocking and
 infallible-until-closed, which is what lets the actor publish without ever
@@ -286,14 +286,18 @@ different:
   value and the skipped ones are gone. Nothing reads intermediates: v1 publishes
   one whole-root snapshot per envelope and no client-side fold consumes the
   ones in between.
-- **Queue** (`events()`, upload `updates()`, and the actor's own inbox).
+- **Queue** (`events()`, upload `updates()`, the actor's own inbox, and the
+  socket actor's outbox).
   `futures_channel::mpsc::unbounded`, because these items are discrete
   occurrences and none of them stands in for another. Here the old cost is
   real: a consumer that stops polling grows its queue without bound until the
   process runs out of memory, and an embedder that cannot keep up must drop the
   stream (which unsubscribes, and the sender is pruned at the next send) or
   coalesce on its own side. The same applies to a stalled actor: the inbox grows
-  while a handler is blocked.
+  while a handler is blocked. The socket actor's outbox is the same shape and
+  the same trade: a transport that stops accepting writes does not slow the
+  producer, it grows the queue — which is why the push timeout, not the socket,
+  is what bounds a command whose frame is still waiting to go out.
 
 The consequence worth stating for consumers of both: an event is delivered with
 no promise about which state its `updates()` neighbour is showing, because that
@@ -371,9 +375,14 @@ the workspace (§1.3); the crates.io name is a question for publishing time.
     beside the actor. An independent timer that keeps ticking while the actor
     is behind puts two ticks in the inbox at once, and the second reads the
     first one's heartbeat, sent moments earlier, as unanswered: a full
-    reconnect and re-hydrate on a connection that had just recovered. Anything
-    that later moves socket writes off the actor loop must keep this anchor and
-    arm on the heartbeat being *sent*, not on it being queued for a writer.
+    reconnect and re-hydrate on a connection that had just recovered. Socket
+    writes now go through an outbox (below), so the anchor is explicit: the
+    queued beat carries the incarnation it beats for, and the tick is armed by
+    the write driver once the sink has actually taken the frame — never when it
+    was queued behind whatever else was waiting. A socket that will not take the
+    beat therefore never re-arms the clock and is not torn down by it; pushes
+    riding on it still fail on their own timeouts, and bounding an unwritable
+    socket is a *write deadline*, a separate question from this one.
   - Each tick names the socket incarnation it beats for, and one that outlives
     its socket is dropped on arrival. Timers here cannot be cancelled (the
     `Timer` seam returns a future, not a handle), so a tick armed against a
@@ -393,6 +402,24 @@ the workspace (§1.3); the crates.io name is a question for publishing time.
   unthrottled upload progress reporter is the reachable one) can keep the
   socket unread indefinitely, and a socket whose frames go unread is
   indistinguishable from a dead one.
+- **Socket writes are queued, never awaited.** The actor holds an outbox of
+  frames and drains it by driving `poll_ready`/`start_send`/`poll_flush` as loop
+  state, at the top of every wake-up and *ahead of* the bias above — not as a
+  third branch of it, which the inbox-first bias could starve. Awaiting a write
+  inline is the thing the loop must not do: a peer that stops reading (a full
+  send buffer, a zero-window TCP receiver, an upload's chunks banked up behind
+  one slow consumer) parks `poll_ready` indefinitely and says nothing about it,
+  and a loop parked there reads no frames and handles no `Timeout`,
+  `HeartbeatTick`, `Reconnect` or `Disconnect` — so every timeout stops being a
+  bound on wall-clock time and `disconnect().await` never returns. Queueing is
+  synchronous, infallible and unbounded, for the same reason the inbox is: the
+  outbox is a staging area between two queues that already existed (the actor's
+  inbox and the transport's send buffer), not a new place to accumulate work,
+  and a producer that outruns the socket is bounded by the push timeouts that
+  fail it. The outbox belongs to the socket incarnation that will write it — a
+  teardown empties it along with the flush it owed and the heartbeat tick that
+  flush would have armed, so nothing a dead socket queued or failed can reach
+  its replacement.
 - Refs are a monotonically increasing `u64` stringified; `join_ref` is the ref
   of the channel's current `phx_join` and must be echoed on every push for that
   channel.

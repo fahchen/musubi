@@ -33,9 +33,10 @@ pub(crate) use self::actor::{ActorMsg, PushPayload};
 /// Phoenix's own default heartbeat interval; a missed reply within one
 /// interval means the socket is dead (`phoenix.js` `heartbeatTimer`).
 ///
-/// The interval is counted from each heartbeat's own write, not from a clock
-/// running beside the actor, so it measures how long *this* heartbeat has gone
-/// unanswered rather than how far the actor has fallen behind.
+/// The interval is counted from the point each heartbeat is actually written to
+/// the socket, not from a clock running beside the actor, so it measures how
+/// long *this* heartbeat has gone unanswered rather than how far the actor —
+/// or the transport's send buffer — has fallen behind.
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 /// Phoenix's own default push timeout, applied to joins and leaves too.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);

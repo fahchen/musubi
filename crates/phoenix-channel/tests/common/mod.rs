@@ -6,12 +6,14 @@
 //! (`#[path = "../../phoenix-channel/tests/common/mod.rs"]`) so the two suites
 //! cannot drift; each keeps only what is specific to its own layer.
 //!
-//! Two knobs let a test observe the client mid-flight rather than only at rest:
-//! [`ServerEnd::stall_writes`] parks it inside a write, and [`Harness::armed`]
-//! reads which sleeps exist at that moment. Between them a test can watch work
-//! *queue up* — a timer tick that has not been handled, a frame that has been
-//! delivered but not read — which is otherwise invisible, because every pump
-//! runs the client to quiescence.
+//! Three knobs let a test observe the client mid-flight rather than only at
+//! rest, which is otherwise impossible because every pump runs it to
+//! quiescence. [`ServerEnd::stall_writes`] holds the socket's sink not-ready,
+//! so a test can watch what the client still manages while a write of its own
+//! is going nowhere. [`Harness::armed`] reads which sleeps exist at that
+//! moment. [`Harness::resolve`] fires a timer *without* pumping afterwards, so
+//! two things can be made ready against a parked actor and the test can see
+//! which of them it takes first.
 
 // Each suite uses a subset of the rig.
 #![allow(dead_code)]
@@ -123,6 +125,20 @@ impl<T> Harness<T> {
         self.fire_where(|pending| pending == dur);
     }
 
+    /// Resolves every pending sleep of exactly `dur` **without settling**.
+    ///
+    /// [`fire`](Self::fire) runs the client to quiescence, so whatever it
+    /// resolves is fully handled before the test's next line. Some questions
+    /// are about what the actor does when two things are ready *at once* — a
+    /// timer tick in its inbox and a frame the transport has delivered but it
+    /// has not read yet — and the only way to ask one is to arm both against a
+    /// parked actor. Resolving first puts the timer's task ahead of the actor
+    /// in the pool's run queue, so the message it posts is already waiting by
+    /// the time the actor is polled for the frame that woke it.
+    pub fn resolve(&mut self, dur: Duration) {
+        self.resolve_where(|pending| pending == dur);
+    }
+
     /// Resolves the reconnect/rejoin ladder, whose rungs are all sub-second.
     pub fn fire_backoff(&mut self) {
         self.fire_where(|pending| pending < Duration::from_secs(1));
@@ -165,7 +181,12 @@ impl<T> Harness<T> {
             .count()
     }
 
-    pub fn fire_where(&mut self, mut matches: impl FnMut(Duration) -> bool) {
+    pub fn fire_where(&mut self, matches: impl FnMut(Duration) -> bool) {
+        self.resolve_where(matches);
+        self.pump();
+    }
+
+    pub fn resolve_where(&mut self, mut matches: impl FnMut(Duration) -> bool) {
         let mut kept = Vec::new();
 
         for (dur, waker) in self.sleeps.lock().unwrap().drain(..) {
@@ -177,7 +198,6 @@ impl<T> Harness<T> {
         }
 
         self.sleeps.lock().unwrap().extend(kept);
-        self.pump();
     }
 
     pub fn spawn_capture<T2: Send + 'static>(
@@ -246,15 +266,15 @@ pub struct ServerEnd {
 }
 
 impl ServerEnd {
-    /// Holds the socket not-ready for writing, parking the client inside its
-    /// next write until [`resume_writes`](Self::resume_writes).
+    /// Holds the socket's sink not-ready, so whatever the client writes stays
+    /// unwritten until [`resume_writes`](Self::resume_writes).
     ///
-    /// This is the only way to stop the actor draining its inbox while the
-    /// harness keeps running: it owns the transport, so every other wake-up it
-    /// takes is handled to completion within one `pump`. A test that needs work
-    /// to *queue up* — two timer ticks, a frame the actor has not read yet —
-    /// parks it here first. Real transports stall exactly like this whenever
-    /// their send buffer is full.
+    /// Real transports stall exactly like this whenever their send buffer
+    /// fills, and it is the one condition a peer can impose indefinitely
+    /// without saying anything about it: no error, no close, just a socket that
+    /// stops taking bytes. What the client can still do while it is held here —
+    /// read the frames the peer is *sending*, fire its own timeouts, hang up —
+    /// is the whole question the knob exists to ask.
     pub fn stall_writes(&self) {
         self.stall.inner.lock().unwrap().held = true;
     }
@@ -407,6 +427,10 @@ impl Stream for MockSocket {
 impl Sink<Frame> for MockSocket {
     type Error = TransportError;
 
+    /// The stall lives here rather than in `poll_flush` because this is where a
+    /// real websocket refuses work: `poll_ready` flushes what it is holding and
+    /// reports the socket not-ready when the kernel will take no more. A frame
+    /// that gets past it has left the client for good.
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut state = self.stall.inner.lock().unwrap();
 

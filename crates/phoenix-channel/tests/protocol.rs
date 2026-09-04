@@ -431,9 +431,9 @@ fn the_heartbeat_clock_is_armed_from_the_send_not_from_the_tick() {
     harness.pump();
     drain(&mut events);
 
-    // Park the actor inside the heartbeat's own write. A write is where it can
-    // fall behind for real — the reply path awaits the sink too, since an
-    // unreadable reply owes the server a `phx_leave`.
+    // Hold the transport's write side, so the beat is queued but not written.
+    // A write is where the clock can fall behind for real: the socket's send
+    // buffer fills long before the peer says anything about it.
     server.stall_writes();
     harness.fire(HEARTBEAT);
 
@@ -474,17 +474,12 @@ fn a_readable_heartbeat_reply_is_read_before_the_heartbeat_is_judged() {
     harness.fire(HEARTBEAT);
     let beat = server.sent(&mut harness);
 
-    // Park the actor inside an unrelated write, so that what arrives next is
-    // delivered by the transport but not yet read.
-    server.stall_writes();
-    let _push = harness.push_later(&channel, "command", json!({}));
-    harness.pump();
-
-    // The reply lands first, the tick second — but the loop is inbox-first, so
-    // on waking the actor is offered the tick while the reply is still unread.
+    // Line both up against a parked actor: the tick is queued for its inbox
+    // first, the reply delivered to the transport second. On waking, the loop
+    // is inbox-first, so it is offered the tick while the reply that answers
+    // the heartbeat is still sitting in the socket unread.
+    harness.resolve(HEARTBEAT);
     server.reply(&beat[0], ReplyStatus::Ok, json!({}));
-    harness.fire(HEARTBEAT);
-    server.resume_writes();
     harness.pump();
 
     assert!(
@@ -493,8 +488,7 @@ fn a_readable_heartbeat_reply_is_read_before_the_heartbeat_is_judged() {
     );
     assert!(matches!(
         server.sent(&mut harness).as_slice(),
-        [Message { event: push, .. }, Message { event: next_beat, .. }]
-            if push == "command" && next_beat == "heartbeat"
+        [Message { event, .. }] if event == "heartbeat"
     ));
 }
 
@@ -864,6 +858,183 @@ fn disconnect_drops_every_channel_and_stops_reconnecting() {
         harness.push(&channel, "command", json!({})),
         Err(PushError::Stale)
     ));
+}
+
+// ------------------------------------------------------------ backpressure --
+//
+// A socket that stops accepting writes is the ordinary end of a peer that has
+// stopped reading: a full send buffer, a zero-window TCP receiver, an upload's
+// chunks banked up behind one slow consumer. It is not an error and it may last
+// a long time, so the one thing the actor may not do is wait for it — every
+// timeout it owns is a bound on wall-clock time, and none of them can be while
+// a write owns the loop.
+
+#[test]
+fn a_stalled_write_does_not_stop_the_actor_reading_frames() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let joined = server.sent(&mut harness);
+    server.reply(&joined[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    drain(&mut events);
+
+    server.stall_writes();
+    let pending = harness.push_later(&channel, "command", json!({}));
+    harness.pump();
+    assert!(
+        server.sent(&mut harness).is_empty(),
+        "the write is genuinely stalled, or this proves nothing"
+    );
+
+    // The peer is not reading, but it is still talking. Everything it says has
+    // to keep arriving: a socket whose frames go unread is a socket the client
+    // has silently stopped being connected to.
+    server.push_event(&joined[0], "patch", json!({"version": 1}));
+    harness.pump();
+
+    assert!(
+        matches!(
+            drain(&mut events).as_slice(),
+            [ChannelEvent::Message { event, payload }]
+                if event == "patch" && payload["version"] == json!(1)
+        ),
+        "a stalled write stopped the socket being read"
+    );
+
+    // And the frame that was waiting is not lost — it goes out, in order, the
+    // moment the socket will take it.
+    server.resume_writes();
+    let sent = server.sent(&mut harness);
+    assert!(matches!(
+        sent.as_slice(),
+        [Message { event, .. }] if event == "command"
+    ));
+
+    server.reply(&sent[0], ReplyStatus::Ok, json!({"ok": true}));
+    assert!(matches!(harness.settle(pending), Ok(Reply { .. })));
+}
+
+#[test]
+fn a_stalled_write_does_not_stop_a_push_timing_out() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, _events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let joined = server.sent(&mut harness);
+    server.reply(&joined[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+
+    server.stall_writes();
+    let pending = harness.push_later(&channel, "command", json!({}));
+    harness.pump();
+    assert!(
+        server.sent(&mut harness).is_empty(),
+        "the write is genuinely stalled, or this proves nothing"
+    );
+
+    // The push timeout is the caller's only guarantee that a command comes back
+    // at all. A loop parked in a write cannot handle the tick that fires it, so
+    // the timeout would be a bound on nothing.
+    harness.fire(PUSH_TIMEOUT);
+
+    assert!(matches!(harness.settle(pending), Err(PushError::Timeout)));
+}
+
+#[test]
+fn disconnect_completes_while_a_write_is_stalled() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let joined = server.sent(&mut harness);
+    server.reply(&joined[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    drain(&mut events);
+
+    server.stall_writes();
+    let pending = harness.push_later(&channel, "command", json!({}));
+    harness.pump();
+
+    // `disconnect` is an awaited round-trip through the actor: it resolves when
+    // the actor acknowledges it. Shutting down is the one thing that must work
+    // when the transport has stopped cooperating — a caller that cannot even
+    // hang up has no way out at all.
+    harness.disconnect();
+
+    assert_eq!(harness.inner.status(), SocketStatus::Closed);
+    assert!(ended(&mut events));
+    assert!(matches!(
+        harness.settle(pending),
+        Err(PushError::Disconnected)
+    ));
+}
+
+#[test]
+fn a_write_stranded_on_a_dead_socket_never_reaches_its_replacement() {
+    let mut harness = Harness::new();
+    let mut first = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let joined = first.sent(&mut harness);
+    first.reply(&joined[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    drain(&mut events);
+
+    first.stall_writes();
+    let stranded = harness.push_later(&channel, "command", json!({}));
+    harness.pump();
+    assert!(
+        first.sent(&mut harness).is_empty(),
+        "the write is genuinely stalled, or this proves nothing"
+    );
+
+    // The transport dies with that write still outstanding, and the ladder
+    // brings a fresh one up under the same channel.
+    let mut second = harness.queue_socket();
+    first.disconnect();
+    harness.pump();
+    assert!(matches!(
+        harness.settle(stranded),
+        Err(PushError::Disconnected)
+    ));
+    drain(&mut events);
+    harness.fire_backoff();
+
+    let rejoin = second.sent(&mut harness);
+    assert!(
+        matches!(rejoin.as_slice(), [Message { event, .. }] if event == "phx_join"),
+        "the replacement never got off the ground"
+    );
+    second.reply(&rejoin[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    drain(&mut events);
+
+    // The dead socket's write unparks at last. It belongs to a transport that
+    // no longer exists: neither the frame — stamped with a join_ref the new
+    // socket never issued — nor the failure it would report may be allowed to
+    // land on the socket that replaced it.
+    first.resume_writes();
+    harness.pump();
+
+    assert!(
+        second.sent(&mut harness).is_empty(),
+        "a frame queued for a dead socket was written to its replacement"
+    );
+    assert!(
+        drain(&mut events).is_empty(),
+        "the replacement was torn down by its predecessor's writer"
+    );
+    assert_eq!(harness.inner.status(), SocketStatus::Connected);
 }
 
 // ----------------------------------------------------------- status watch --
