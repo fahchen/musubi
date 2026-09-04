@@ -31,8 +31,15 @@ impl Backoff {
         let base = Self::base_ms(self.attempt);
         self.attempt = self.attempt.saturating_add(1);
 
-        // Spread, not randomness: `RandomState` is seeded per instance, which
-        // is all a reconnect fleet needs — and it costs no dependency.
+        // Spread, not randomness — and it costs no dependency. A *fresh*
+        // `RandomState` per call is what varies the value: std keys each one
+        // from a thread-local seed pair whose first half it increments on every
+        // construction, so hashing the same (empty) input yields a different
+        // digest each call. That gives both axes a reconnect fleet needs —
+        // successive delays on one client differ (the per-call counter), and
+        // delays across clients differ (the per-thread random seed). Hoisting
+        // the `RandomState` onto `Backoff` would fix the keys and collapse the
+        // jitter to a per-instance constant.
         let seed = RandomState::new().build_hasher().finish();
         let jitter = seed % (base / JITTER_DENOMINATOR + 1);
 
@@ -74,6 +81,30 @@ mod tests {
                 "{delay}ms is not steady state"
             );
         }
+    }
+
+    #[test]
+    fn jitter_varies_between_calls_at_one_rung() {
+        // Guards the per-call `RandomState::new()`: storing one on `Backoff`
+        // would key every `finish()` identically over the same empty input, so
+        // this loop would return one constant and the jitter would be gone.
+        //
+        // The steady-state rung is fixed at 5000ms, so every sample here draws
+        // from the same 1251-wide jitter band. Asserting only "not all equal"
+        // keeps this honest — individual collisions are expected — and with 16
+        // samples a false failure needs all 15 to collide, ~1251^-15.
+        let mut backoff = Backoff::default();
+        for _ in 0..LADDER_MS.len() {
+            backoff.next_delay();
+        }
+
+        let first = backoff.next_delay();
+        let varied = (0..15).any(|_| backoff.next_delay() != first);
+
+        assert!(
+            varied,
+            "16 consecutive delays at the 5000ms rung were all {first:?}"
+        );
     }
 
     #[test]

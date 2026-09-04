@@ -58,10 +58,7 @@ defmodule Mix.Tasks.Compile.MusubiTs do
 
   @impl Mix.Task.Compiler
   @spec run([String.t()]) ::
-          :ok
-          | :noop
-          | {:ok, [Mix.Task.Compiler.Diagnostic.t()]}
-          | {:error, [Mix.Task.Compiler.Diagnostic.t()]}
+          :noop | {:ok, []} | {:error, [Mix.Task.Compiler.Diagnostic.t()]}
   def run(argv) do
     Compiler.run(argv,
       name: "musubi_ts",
