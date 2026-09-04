@@ -158,6 +158,13 @@ What it demonstrates, beyond what the React client already shows:
   `Spawner`/`Timer` on `BackgroundExecutor`, and a `Connector`/`Socket` pair
   over `async-net` + `async-tungstenite`, and is meant to be copied verbatim
   into other gpui apps.
+- **The SWR mount cache, made durable.** `desktop/src/cache_store.rs` is a
+  file-backed `CacheStore` (one JSON file at `~/.chat-room-desktop-cache.json`),
+  another copy-me reference like `transport.rs`. Quit the app and run
+  `mix desktop` again: identity and presence render instantly from the last
+  session — under a "joining" pill, streams excluded (`docs/rust-client.md`
+  §6.4) — and the live initial patch swaps the seed out atomically. Delete the
+  file for a cold start.
 
 ### Requirements
 
@@ -213,13 +220,13 @@ What it demonstrates, beyond what the React client already shows:
 
 With the desktop client running, stop `mix server`. The message list stays
 rendered — BDR-0015 says a client keeps its last good tree rather than blanking
-— but the pill still reads "live": nothing tells the view the socket went away
-until something tries to use it. Press **Send**. The command fails with
-`Disconnected`, the feedback line says so, and *then* the pill flips to
-"reconnecting". Restart the server: the client rejoins, receives a fresh initial
-patch at `version: 1`, and `messages` runs through `loading → ok` again with the
-1.5s seed delay, so the whole recovery contract is one observable loop.
-
-The idle-disconnect blind spot is a gap in the crate rather than in this client:
-`Mounted::snapshot()` is never cleared, so there is no mount-status signal to
-render. `docs/rust-gpui-example.md` open question 1 proposes a `MountStatus`.
+— and the pill flips to "reconnecting" **on its own**: the crate publishes a
+`MountStatus` stream (`Mounted::status_updates()`, BDR-0033), so the view
+notices the moment the transport reports the drop, or within one heartbeat
+interval (30 s by default) when the socket dies silently. No command is needed;
+pressing **Send** during the window still fails with `Disconnected` on the
+feedback line, coinciding with the pill rather than causing it. Restart the
+server: the client rejoins, receives a fresh initial patch at `version: 1`, the
+pill flips back to "live", and `messages` runs through `loading → ok` again
+with the 1.5s seed delay, so the whole recovery contract is one observable
+loop.

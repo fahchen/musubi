@@ -41,6 +41,12 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The file cache (`cache_store.rs`) logs read/write failures instead of
+# surfacing them — the `CacheStore` contract is that a broken cache degrades to
+# a cold mount. No subscriber is installed here; the events are for embedders
+# who copy the file and already have one.
+tracing = "0.1"
+
 # Tests only. The same crates.io `gpui`, with its in-process test platform and
 # `TestAppContext` turned on; `cargo build` links neither the feature nor the
 # extra dependencies it pulls. `phoenix-channel` stays absent here too — the

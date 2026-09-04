@@ -9,6 +9,7 @@
 //! in another terminal.
 
 mod app;
+mod cache_store;
 mod generated;
 mod theme;
 mod transport;
@@ -23,6 +24,7 @@ use gpui_component::Root;
 use musubi_client::Connection;
 
 use crate::app::ChatWindow;
+use crate::cache_store::FileCacheStore;
 use crate::transport::{GpuiSpawner, GpuiTimer, SmolConnector};
 
 /// The socket base; `/websocket` and `vsn=2.0.0` are appended by the client.
@@ -55,6 +57,13 @@ fn main() {
             .connector(SmolConnector)
             .spawner(GpuiSpawner(executor.clone()))
             .timer(GpuiTimer(executor))
+            // The SWR mount cache (`docs/rust-client.md` §6.4): a relaunch
+            // renders the last session's tree instantly, and the live initial
+            // patch swaps it out in one whole-root op. The store is durable, so
+            // the buster is the build version — a rebuild whose state shape
+            // changed discards old entries instead of trying to render them.
+            .cache(FileCacheStore::open(cache_store::default_path()))
+            .cache_buster(env!("CARGO_PKG_VERSION"))
             .build()
             .expect("every connection seam is supplied above");
 

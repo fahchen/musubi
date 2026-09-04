@@ -385,8 +385,9 @@ server.
 | 5 | Delivery receipt | `last_send_status` tagged union (`start_async`/`handle_async`) | `match` on `ChatRoomStoreLastSendStatus` |
 | 6 | Identity + rename | `set_name` command, reply `{ok, name}` | `Input` + `Button` |
 | 7 | Online panel | `assign_async :online_users` + PubSub | `AsyncResult` `match` + plain column |
-| 8 | Connection pill | reconnect (BDR-0015), version 0 window | derived flag on the view |
+| 8 | Connection pill | `Mounted::status_updates` (BDR-0033) over reconnect (BDR-0015) | `MountStatus` field fed by the stream |
 | 9 | Attach button + progress | `upload :attachment` in channel mode, `attach` command | `Button` + `App::prompt_for_paths` + `Upload::updates` |
+| 10 | Instant relaunch | SWR mount cache (`docs/rust-client.md` §6.4): `ConnectionBuilder::cache` over a durable `CacheStore` | `cache_store.rs` — one JSON file under `$HOME`, whole-map writes, corrupt-file tolerant |
 | 10 | Attachment chip on a row | the consumed entry, as plain state on `MessageState` | column inside the bubble |
 
 ### 4.1 `ChatWindow`
@@ -401,7 +402,7 @@ struct ChatWindow {
     url: SharedString,                      // for the "connecting to ..." line
     mount_error: Option<SharedString>,      // a rejected join is a rendered panel
     snapshot: Option<Arc<store::State>>,    // last good; never cleared on reconnect
-    stale: bool,                            // true between disconnect and next patch
+    status: MountStatus,                    // the crate's liveness stream (BDR-0033)
     mounted: Option<Mounted<ChatRoomStore>>, // None until the join succeeds
     feedback: SharedString,
     busy: bool,                             // one command at a time
@@ -415,9 +416,9 @@ struct ChatWindow {
 
 `mounted` is an `Option` because the window opens before the join resolves:
 commands are refused until it is `Some`, and `mount_error` is what the message
-pane renders instead of a list. There is no separate connection-state enum —
-the pill (§4.7) reads these fields directly, because any enum over them would
-store nothing the fields do not already say.
+pane renders instead of a list. The view keeps no derived connection enum of
+its own — the pill (§4.7) reads `mount_error`/`mounted` for the pre-mount
+arms and the crate's `MountStatus` for everything after.
 
 `_updates` and `_in_flight` are held rather than `.detach()`ed so that closing
 the window cancels both — dropping a gpui `Task` cancels it, and a detached
@@ -576,26 +577,28 @@ every real chunk crashed its sub-channel and the entry came back as
 `{op: cancel}`. `Musubi.Transport.UploadChannel` now accepts both shapes and
 `test/musubi/transport/upload_channel_test.exs` covers the serializer's.
 
-### 4.7 Connection pill, and the gap behind it
+### 4.7 Connection pill
 
 `Mounted::snapshot()` returns `None` before the initial patch and **is never
 cleared afterwards** — not by a reconnect either (`crates/musubi-client/src/mounted.rs`
 clears the cell only on teardown, deliberately, because BDR-0015 requires the
-client to keep rendering the last good tree). So the crate exposes no signal at
-all for "the socket went away": the `Option` says "have I ever loaded", and
-nothing says "am I current".
+client to keep rendering the last good tree). The `Option` says "have I ever
+loaded"; "am I current" is the crate's own status surface (BDR-0033):
+`Mounted::status()` / `Mounted::status_updates()` with
+`MountStatus { Connecting, Live, Reconnecting }`.
 
-v1 works around it in the view: `snapshot` is only ever assigned `Some`, never
-cleared, and `stale` is set when a command fails with `NotConnected` /
-`Disconnected` / `Transport` and cleared on the next update. That is enough for
-a pill, and wrong in one case — a socket that drops while the app is idle shows
-"live" until the next command is attempted, which is why the README's reconnect
-demo (§6.3) tells the reader to press Send. The correct fix is a `MountStatus`
-on the crate; see open questions.
+The pill renders that stream directly. A socket that drops while the app is
+idle flips it to "reconnecting" with no command involved (within one heartbeat
+interval when the death is silent), and the rejoin's fresh initial patch flips
+it back to "live". The v1 `stale`-flag workaround — set by the first command
+that failed with `NotConnected` / `Disconnected` / `Transport` — is gone; a
+command that fails on a dead socket now merely coincides with a pill that has
+already flipped.
 
-**As landed** the pill is five ordered conditions read straight off the view,
-with no intermediate enum: `mount_error` → offline, `mounted.is_none()` →
-connecting, `stale` → reconnecting, `snapshot.is_some()` → live, else joining.
+**As landed** the pill is `mount_error` → offline (a rejected join is terminal
+and never enters the status stream), `mounted.is_none()` → connecting (no
+handle to read a status from yet), then the `MountStatus` verbatim:
+`Connecting` → joining, `Live` → live, `Reconnecting` → reconnecting.
 
 ---
 
@@ -694,12 +697,13 @@ let task = cx.spawn(async move |this, cx| {
     while let Some(snapshot) = updates.next().await {
         let alive = this.update(cx, |view, cx| {
             view.snapshot = Some(snapshot);
-            view.stale = false;
             cx.notify();                    // the only re-render trigger in gpui
         });
         if alive.is_err() { break; }        // window closed
     }
 });
+// A second, identical loop consumes mounted.status_updates() into
+// view.status — that stream is what drives the connection pill (§4.7).
 ```
 
 Rules this encodes, all of which are load-bearing:
@@ -814,13 +818,15 @@ versions"), so the README should say the example is pinned to
 ### 6.3 Reconnect demo
 
 Stop `mix server` and watch the message list stay rendered (BDR-0015: keep
-last-good, no resync). The pill still says "live" at this point — see §4.7:
-nothing tells the view the socket is gone until it tries to use it — so press
-**Send**, watch the command fail with `Disconnected` and the pill flip to
-"reconnecting". Restart the server, watch the client rejoin, receive a
-`replace ""` at `version: 1`, and flip `messages` back through `loading → ok`
-with the 1.5 s seed delay. That sequence is the whole recovery contract in one
-observable loop and belongs in the README.
+last-good, no resync) while the pill flips to "reconnecting" on its own —
+`Mounted::status_updates()` reports the drop the moment the client notices it,
+within one heartbeat interval when the socket dies silently (§4.7, BDR-0033).
+A **Send** during the window still fails with `Disconnected` on the feedback
+line, coinciding with the pill rather than causing it. Restart the server,
+watch the client rejoin, receive a `replace ""` at `version: 1`, flip the pill
+back to "live", and run `messages` back through `loading → ok` with the 1.5 s
+seed delay. That sequence is the whole recovery contract in one observable
+loop and belongs in the README.
 
 ---
 
@@ -936,19 +942,17 @@ deliberately routes around both.
 
 ## Open questions
 
-1. **Mid-reconnect mount status.** `Mounted::snapshot() -> Option<_>` answers
-   "have I ever loaded" and nothing else — it is never cleared on reconnect,
-   because BDR-0015 requires clients to keep rendering the last good tree — so
-   a client has no way to observe a socket that dropped while it was idle.
-   Every non-React client will re-derive the §4.7 workaround (a `stale` flag set
-   by the first command that fails). **Still open**, and it is the one visible
-   rough edge in the shipped example: the connection pill reads "live" until the
-   user tries to send. Proposal: add
-   `MountStatus { Connecting, Live, Reconnecting, Unmounted }` plus a status
-   stream to `musubi-client` in client milestone R4, and state the client-side
-   rendering obligation in `docs/client-contract.md`. **Needs BDR** — it adds an
-   observable contract statement about reconnect rendering that currently only
-   exists implicitly in the TS client.
+1. ~~**Mid-reconnect mount status.**~~ Resolved by BDR-0033: `musubi-client`
+   exposes `MountStatus { Connecting, Live, Reconnecting }` via
+   `Mounted::status()` / `Mounted::status_updates()` (fed by the socket
+   layer's own liveness signal; `phoenix-channel` gained the connection-wide
+   `PhoenixSocket::status_updates()` watch), the TS client the per-connection
+   `connection.status()` / `onStatusChange()` analogue, and the pill renders
+   the stream directly (§4.7). The `Unmounted` arm from the original proposal
+   was dropped — teardown already surfaces as ended streams and
+   `Unmounted`/`Disconnected` command errors. The client-side rendering
+   obligation (keep the last-good tree while reconnecting) is stated in
+   BDR-0033 and `docs/client-contract.md`.
 2. ~~**Directory name.**~~ Resolved: `desktop/`. It names the artifact rather
    than the toolkit, so swapping toolkits later does not rename the directory,
    and it is not matched by the `examples/*/ui` pnpm glob. Alternatives
