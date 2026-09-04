@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde::de::{Deserialize, DeserializeOwned};
 use serde_json::Value;
 
-use crate::actor::{ActorMsg, CommandRequest, ConnectionInner};
+use crate::actor::{ActorMsg, CommandRequest, ConnectionInner, RootHold};
 use crate::error::{MusubiError, Result};
 use crate::generated::{Command, Event, Store, StoreId};
 use crate::latest::Latest;
@@ -36,7 +36,17 @@ use crate::uploads::{Upload, UploadControl, Uploads};
 /// The payload is shared rather than copied: one event reaches every subscriber
 /// of its key, and a whole `serde_json::Value` per subscriber is a deep clone
 /// of a tree each of them only reads.
-type EventRegistry = HashMap<(StoreId, String), Vec<UnboundedSender<Arc<Value>>>>;
+#[derive(Default)]
+struct EventRegistry {
+    senders: HashMap<(StoreId, String), Vec<UnboundedSender<Arc<Value>>>>,
+    /// Set by [`RootSink::clear`], and the reason this is a struct rather than
+    /// the bare map: teardown empties the map, so a per-key tombstone would say
+    /// nothing about the keys the registry no longer has — and a stale handle
+    /// subscribing to one of those would get a stream that never yields and
+    /// never ends. Closure belongs to the whole registry, exactly as
+    /// [`Latest::close`] holds it for state and status.
+    closed: bool,
+}
 
 /// Where a mounted root is in its connection lifecycle (BDR-0033).
 ///
@@ -111,7 +121,7 @@ impl<St: Store> RootCell<St> {
     pub(crate) fn new(control: Arc<UploadControl>) -> Self {
         Self {
             state: Latest::new(None),
-            events: Mutex::new(EventRegistry::new()),
+            events: Mutex::new(EventRegistry::default()),
             // Seeded where the state cell is empty: the pre-initial baseline is
             // a real status, and a subscriber replays it (BDR-0033).
             status: Latest::new(Some(MountStatus::Connecting)),
@@ -136,7 +146,7 @@ impl<St: Store> RootSink for RootCell<St> {
         let mut events = lock(&self.events);
         let key = (store_id.clone(), name.to_owned());
 
-        let Some(senders) = events.get_mut(&key) else {
+        let Some(senders) = events.senders.get_mut(&key) else {
             return;
         };
 
@@ -146,8 +156,11 @@ impl<St: Store> RootSink for RootCell<St> {
 
         senders.retain(|sender| sender.unbounded_send(Arc::clone(&payload)).is_ok());
 
+        // Dropping a stream unregisters it, but only a dispatch on its key
+        // notices; an emptied key is removed rather than kept as a tombstone,
+        // so a later subscription to it is a live one.
         if senders.is_empty() {
-            events.remove(&key);
+            events.senders.remove(&key);
         }
     }
 
@@ -173,7 +186,18 @@ impl<St: Store> RootSink for RootCell<St> {
         // last value it has not seen and *then* ends, while `snapshot()` and
         // `status()` fall back to their pre-initial baseline (BDR-0033).
         self.state.close();
-        lock(&self.events).clear();
+
+        {
+            // Terminal for the event registry too, and recorded rather than
+            // merely emptied: nothing rejoins after a teardown, so a handle
+            // still held across one must get an ended stream instead of a
+            // subscription no dispatch can ever reach.
+            let mut events = lock(&self.events);
+
+            events.senders.clear();
+            events.closed = true;
+        }
+
         self.status.close();
         self.uploads.clear();
     }
@@ -310,11 +334,15 @@ impl<St: Store> Mounted<St> {
     ///
     /// # Ordering
     ///
-    /// The reply resolves **before** the patch it caused is applied (BDR-0009:
-    /// reply, then the `"patch"` push, then server-side effects). A resolved
-    /// reply therefore says nothing about [`snapshot`](Self::snapshot); apps
-    /// that need "state settled" watch [`updates`](Self::updates) for the
-    /// condition they care about.
+    /// The reply is **not gated** on the patch it caused, and carries no
+    /// ordering relationship to it. BDR-0009 puts the reply on the wire first
+    /// — reply, then the `"patch"` push, then server-side effects — but that
+    /// is the *server's* frame order, not a client guarantee: the reply and the
+    /// patch reach this client's actor through two independently woken tasks,
+    /// so on a multi-threaded executor either can be handled first
+    /// (`docs/rust-client.md` §2.4). A resolved reply therefore says nothing
+    /// about [`snapshot`](Self::snapshot); apps that need "state settled" watch
+    /// [`updates`](Self::updates) for the condition they care about.
     ///
     /// ```text
     /// let reply = cart.command(Checkout { coupon: None }).await?;
@@ -354,6 +382,11 @@ impl<St: Store> Mounted<St> {
     /// live stream are dropped, and a payload that fails to deserialize is
     /// logged and skipped — an event is not state, so it never fails a cycle.
     ///
+    /// Like [`updates`](Self::updates), it ends when the root is unmounted or
+    /// the connection is disconnected — and a subscription taken *after* that
+    /// is an already-ended stream, never one waiting on events that can no
+    /// longer arrive.
+    ///
     /// ```text
     /// let mut toasts = cart.events::<ToastPayload, _>(&StoreId::root());
     ///
@@ -368,11 +401,24 @@ impl<St: Store> Mounted<St> {
         E: Event<T>,
     {
         let (sender, receiver) = mpsc::unbounded();
+        let mut events = lock(&self.cell.events);
 
-        lock(&self.cell.events)
-            .entry((store_id.clone(), E::NAME.to_owned()))
-            .or_default()
-            .push(sender);
+        // Read under the lock the insert takes, so a teardown cannot land
+        // between the two.
+        if events.closed {
+            // Nothing can ever write to this receiver again, so the sender is
+            // dropped instead of registered and the stream below is an ended
+            // one — the same answer `Latest::subscribe` gives after teardown.
+            drop(sender);
+        } else {
+            events
+                .senders
+                .entry((store_id.clone(), E::NAME.to_owned()))
+                .or_default()
+                .push(sender);
+        }
+
+        drop(events);
 
         // `ready` rather than an `async` block: the returned stream stays
         // `Unpin`, so a consumer can poll it without pinning it first.
@@ -419,17 +465,22 @@ impl<St: Store> Mounted<St> {
         self.cell.uploads.handle(store_id, name)
     }
 
-    /// Builds the handle. Called by the mount path once the actor has the root
-    /// registered, so the refcount this handle owns is already counted.
+    /// Builds the handle around the hold the mount reply carried, which the
+    /// actor has already counted.
+    ///
+    /// The guard is **disarmed** rather than kept as a field: releasing stays
+    /// this type's own [`Drop`], which runs before its fields do and therefore
+    /// enqueues its `Release` ahead of the `Shutdown` the last handle posts. A
+    /// hold is released by exactly one of the two, never both.
     pub(crate) fn new(
         inner: Arc<ConnectionInner>,
         cell: Arc<RootCell<St>>,
-        root_id: Arc<str>,
+        mut hold: RootHold,
     ) -> Self {
         Self {
             inner,
             cell,
-            root_id,
+            root_id: hold.disarm(),
         }
     }
 
@@ -471,11 +522,13 @@ impl<St: Store> Clone for Mounted<St> {
             root_id: Arc::clone(&self.root_id),
         });
 
-        Self::new(
-            Arc::clone(&self.inner),
-            Arc::clone(&self.cell),
-            Arc::clone(&self.root_id),
-        )
+        // Built directly rather than through `new`: the hold this clone owns is
+        // the one `Retain` just counted, not a guard handed over by the actor.
+        Self {
+            inner: Arc::clone(&self.inner),
+            cell: Arc::clone(&self.cell),
+            root_id: Arc::clone(&self.root_id),
+        }
     }
 }
 

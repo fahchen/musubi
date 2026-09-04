@@ -2,7 +2,7 @@
 //! `ManualTimer` (`docs/rust-client.md` §12, layer 3): mount/join, duplicate
 //! mount aliasing, drop-at-refcount-0 teardown, version-gap recovery including
 //! a failed re-join, bulk command rejection per teardown path,
-//! reply-before-patch ordering, and push-event dispatch.
+//! a command reply that is not gated on its patch, and push-event dispatch.
 //!
 //! Nothing here sleeps: the executor is a `LocalPool` the test pumps by hand
 //! and every timer fires only when a test says so.
@@ -272,7 +272,7 @@ fn a_failed_join_releases_every_waiting_mount() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_command_reply_resolves_before_the_patch_it_caused_is_applied() {
+fn a_command_reply_is_not_gated_on_the_patch_it_caused() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
     let (join, cart) = harness.mount(&mut server, "cart");
@@ -564,6 +564,62 @@ fn an_op_outside_the_allowlist_recovers_while_a_non_envelope_is_only_dropped() {
         cart.snapshot().as_deref(),
         Some(CartState { title, .. }) if title == "Cart"
     ));
+}
+
+#[test]
+fn an_envelope_addressed_to_another_root_fails_the_mount_waiting_on_it() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let pending = harness.mount_later("cart", CartParams::default());
+
+    let sent = server.sent(&mut harness);
+    server.reply(&sent[0], ReplyStatus::Ok, json!({"root_id": ROOT_ID}));
+    harness.pump();
+
+    // Unreachable against a correct server — the id is stamped by the one page
+    // process bound to this channel — but a dropped envelope is the one thing
+    // that can leave `mount(..).await` waiting forever.
+    let mut payload = initial_envelope();
+    payload["root_id"] = json!("MyApp.Stores.CartStore:other");
+    server.push_event(&sent[0], "patch", payload);
+
+    assert!(matches!(
+        harness.settle(pending),
+        Err(MusubiError::Protocol(message))
+            if message == "patch envelope was addressed to another root"
+    ));
+}
+
+#[test]
+fn an_envelope_addressed_to_another_root_recovers_a_published_root() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (join, cart) = harness.mount(&mut server, "cart");
+
+    let mut payload = envelope(
+        1,
+        2,
+        json!([{"op": "replace", "path": "/title", "value": "Second"}]),
+    );
+    payload["root_id"] = json!("MyApp.Stores.CartStore:other");
+    server.push_event(&join, "patch", payload);
+    harness.pump();
+
+    // A published root has no pending mount to fail, so nothing else would
+    // ever move it off the version it is stuck on: only a rejoin does.
+    assert!(matches!(
+        server.sent(&mut harness).as_slice(),
+        [Message { event: leave, .. }, Message { event: rejoin, .. }]
+            if leave == "phx_leave" && rejoin == "phx_join"
+    ));
+    assert!(
+        matches!(
+            cart.snapshot().as_deref(),
+            Some(CartState { title, .. }) if title == "Cart"
+        ),
+        "the last-good tree keeps rendering through the recreate window"
+    );
+    assert_eq!(cart.status(), MountStatus::Reconnecting);
 }
 
 #[test]
@@ -886,6 +942,57 @@ fn push_events_are_dispatched_to_their_store_after_the_state_is_published() {
 }
 
 #[test]
+fn a_subscription_taken_after_teardown_ends_instead_of_waiting_forever() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let mut before = cart.events::<ToastPayload, _>(&StoreId::root());
+    let panel: StoreId = serde_json::from_value(json!(["panel"])).expect("a child store path");
+
+    // The handle outlives the root, which is the documented disconnect case:
+    // nothing rejoins afterwards, so a subscription taken now has no sender
+    // that could ever write to it.
+    harness.disconnect();
+
+    assert!(ended(&mut before), "a live subscription ends with the root");
+    assert!(
+        ended(&mut cart.events::<ToastPayload, _>(&StoreId::root())),
+        "a key the cleared registry used to have"
+    );
+    assert!(
+        ended(&mut cart.events::<ToastPayload, _>(&panel)),
+        "and a key it never had — closure is the registry's, not a key's"
+    );
+    // The same rule the state and status cells already keep (`Latest::close`).
+    assert!(ended(&mut cart.updates()));
+    assert!(ended(&mut cart.status_updates()));
+}
+
+#[test]
+fn a_dropped_events_stream_is_unregistered_without_closing_its_key() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (join, cart) = harness.mount(&mut server, "cart");
+    let dropped = cart.events::<ToastPayload, _>(&StoreId::root());
+
+    drop(dropped);
+    server.push_event(&join, "patch", toast(1, 2, "first"));
+    harness.pump();
+
+    // Pruning the last subscriber of a key must not tombstone the key: a
+    // subscription taken afterwards is live, not an ended stream.
+    let mut fresh = cart.events::<ToastPayload, _>(&StoreId::root());
+
+    server.push_event(&join, "patch", toast(2, 3, "second"));
+    harness.pump();
+
+    assert!(matches!(
+        drain(&mut fresh).as_slice(),
+        [ToastPayload { message }] if message == "second"
+    ));
+}
+
+#[test]
 fn upload_ops_reach_the_handles_the_root_hands_out() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
@@ -969,6 +1076,75 @@ fn an_aliasing_mount_whose_future_was_dropped_gives_its_hold_back() {
 
     // The alias took a second hold before replying; with it leaked, the last
     // live handle going away would never reach refcount 0.
+    drop(cart);
+    harness.pump();
+    assert!(matches!(
+        server.sent(&mut harness).as_slice(),
+        [Message { event, topic, .. }] if event == "phx_leave" && topic == TOPIC
+    ));
+}
+
+#[test]
+fn a_mount_abandoned_after_the_actor_answered_gives_its_hold_back() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let connection = harness.inner.clone();
+    let mut mounting = Box::pin(connection.mount::<CartStore>("cart", CartParams::default()));
+    let waker = noop_waker();
+
+    assert!(
+        mounting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending(),
+        "the mount request is sent, then awaits the initial patch"
+    );
+
+    let sent = server.sent(&mut harness);
+    server.reply(&sent[0], ReplyStatus::Ok, json!({"root_id": ROOT_ID}));
+    harness.pump();
+    server.push_event(&sent[0], "patch", initial_envelope());
+    harness.pump();
+
+    // The other half of the window the twin above covers: the cell was *sent*
+    // — the receiver was alive at that instant — and the future is dropped
+    // before it ever polls again, so nobody ever owns what the actor handed
+    // over. The hold has to come back with the value, not with the send's
+    // return code.
+    drop(mounting);
+    harness.pump();
+
+    assert!(matches!(
+        server.sent(&mut harness).as_slice(),
+        [Message { event, topic, .. }] if event == "phx_leave" && topic == TOPIC
+    ));
+}
+
+#[test]
+fn an_aliasing_mount_abandoned_after_the_actor_answered_gives_its_hold_back() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let connection = harness.inner.clone();
+    let mut mounting = Box::pin(connection.mount::<CartStore>("cart", CartParams::default()));
+    let waker = noop_waker();
+
+    assert!(
+        mounting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending(),
+        "the alias is one message to the actor, which has not run yet"
+    );
+
+    harness.pump();
+    assert!(server.sent(&mut harness).is_empty(), "no second phx_join");
+
+    // The alias answered a live receiver and *then* lost it, which is the same
+    // window on the aliasing path.
+    drop(mounting);
+    harness.pump();
+
     drop(cart);
     harness.pump();
     assert!(matches!(
@@ -1578,6 +1754,15 @@ fn initial_envelope() -> Value {
     }]);
 
     envelope
+}
+
+/// An envelope whose only cargo is one root-store `"toast"` event.
+fn toast(base_version: u64, version: u64, message: &str) -> Value {
+    let mut payload = envelope(base_version, version, json!([]));
+
+    payload["events"] = json!([{"store_id": [], "name": "toast", "payload": {"message": message}}]);
+
+    payload
 }
 
 fn envelope(base_version: u64, version: u64, ops: Value) -> Value {

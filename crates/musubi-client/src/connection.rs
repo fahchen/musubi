@@ -17,7 +17,7 @@ use phoenix_channel::{Connector, PhoenixSocket, Spawner, Timer};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::actor::{Actor, ActorMsg, ConnectionInner, MountRequest};
+use crate::actor::{Actor, ActorMsg, ConnectionInner, MountReply, MountRequest};
 use crate::cache::{CacheStore, DEFAULT_CACHE_GC_TIME};
 use crate::cache_coordinator::CacheConfig;
 use crate::error::{MusubiError, Result};
@@ -157,21 +157,18 @@ impl Connection {
             reply: reply_tx,
         })))?;
 
-        let cell = reply_rx.await.map_err(|_| MusubiError::Disconnected)??;
+        let MountReply { cell, hold } = reply_rx.await.map_err(|_| MusubiError::Disconnected)??;
 
         // The registry is keyed by `"<module>:<id>"` and `MODULE` comes from
         // `St`, so the downcast only fails if two generated store markers claim
-        // the same Elixir module. The actor already counted this caller's hold,
-        // and no `Mounted` will exist to drop it, so it goes back here.
+        // the same Elixir module. The hold the actor counted for this caller
+        // needs nothing here either way: the handle adopts it below, and every
+        // path that does not build one drops it, which gives it back.
         let cell = cell.downcast::<RootCell<St>>().map_err(|_| {
-            let _ = self.inner.send(ActorMsg::Release {
-                root_id: Arc::clone(&root_id),
-            });
-
             MusubiError::Protocol("another store type is already mounted under this module and id")
         })?;
 
-        Ok(Mounted::new(Arc::clone(&self.inner), cell, root_id))
+        Ok(Mounted::new(Arc::clone(&self.inner), cell, hold))
     }
 
     /// Closes the connection for good: every root is torn down, every pending

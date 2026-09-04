@@ -162,7 +162,68 @@ pub(crate) struct MountRequest {
     /// The same allocation, as the actor's publish target.
     pub(crate) sink: Arc<dyn RootSink>,
     /// Resolved with the root's cell once the initial patch has landed.
-    pub(crate) reply: oneshot::Sender<Result<AnyCell>>,
+    pub(crate) reply: oneshot::Sender<Result<MountReply>>,
+}
+
+/// What a resolved mount hands back: the root's cell, and the hold the actor
+/// counted for the caller.
+///
+/// The hold travels **in** the payload rather than being released when
+/// [`oneshot::Sender::send`] reports failure. `send` only answers whether the
+/// receiver was alive when the value was stored, and a receiver dropped an
+/// instant later takes the value with it — a mount cancelled in that window (a
+/// `timeout`, a `select!`, an aborted task) would otherwise leave a root nobody
+/// owns, joined and patching into a cell no handle reads. Carrying the hold
+/// makes releasing it a property of the value, which no cancellation point can
+/// step around.
+pub(crate) struct MountReply {
+    /// The root's typed cell, for the mount call to downcast.
+    pub(crate) cell: AnyCell,
+    /// The hold this caller was counted for.
+    pub(crate) hold: RootHold,
+}
+
+/// One counted hold on a mounted root, given back when it is dropped.
+///
+/// [`Mounted`](crate::Mounted) **disarms** the guard it is built from and keeps
+/// releasing from its own [`Drop`], so every hold has exactly one release path
+/// rather than two. That is also why the handle does not simply keep the guard
+/// as a field: `Mounted::drop` runs before its fields do, which is what puts
+/// its `Release` in the inbox ahead of the `Shutdown` the last
+/// [`ConnectionInner`] posts.
+pub(crate) struct RootHold {
+    tx: UnboundedSender<ActorMsg>,
+    root_id: Arc<str>,
+    armed: bool,
+}
+
+impl RootHold {
+    /// Wraps a hold the actor has already counted.
+    fn new(tx: UnboundedSender<ActorMsg>, root_id: Arc<str>) -> Self {
+        Self {
+            tx,
+            root_id,
+            armed: true,
+        }
+    }
+
+    /// Hands the hold over to a [`Mounted`](crate::Mounted) and answers which
+    /// root it is a hold on. The guard releases nothing afterwards.
+    pub(crate) fn disarm(&mut self) -> Arc<str> {
+        self.armed = false;
+
+        Arc::clone(&self.root_id)
+    }
+}
+
+impl Drop for RootHold {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.tx.unbounded_send(ActorMsg::Release {
+                root_id: Arc::clone(&self.root_id),
+            });
+        }
+    }
 }
 
 /// A command dispatch.
@@ -365,13 +426,12 @@ impl Actor {
         }
 
         let cell = Arc::clone(&root.cell);
+        // The hold taken above rides along with the cell, so a caller whose
+        // mount future is dropped — before this send or after it — gives it
+        // back by dropping the reply.
+        let hold = RootHold::new(self.tx.clone(), Arc::clone(root_id));
 
-        // The hold was taken above, before the send; a caller whose mount
-        // future was already dropped never receives the cell and never builds
-        // the `Mounted` that would release it.
-        if request.reply.send(Ok(cell)).is_err() {
-            self.release(root_id);
-        }
+        let _ = request.reply.send(Ok(MountReply { cell, hold }));
     }
 
     /// Opens a fresh channel incarnation for `root_id` and joins it.
@@ -725,6 +785,20 @@ impl Actor {
                 actual = %envelope.root_id,
                 "dropping a patch envelope addressed to another root"
             );
+            // Unreachable against a correct server — the id is stamped by the
+            // one page process bound to this channel — but dropping it silently
+            // is the one outcome nothing recovers from: a waiting mount has
+            // nothing else to resolve it, and a root that already published has
+            // no mount to fail, so the rejoin is the only thing that can move
+            // it off the version it is stuck on.
+            self.fail_pending_mounts(root_id, || {
+                MusubiError::Protocol("patch envelope was addressed to another root")
+            });
+
+            if stalled {
+                self.recover(root_id).await;
+            }
+
             return;
         }
 
@@ -854,26 +928,26 @@ impl Actor {
         Ok(())
     }
 
-    /// Hands the root's cell to every mount waiting on it.
+    /// Hands the root's cell — and the hold each of them was counted for — to
+    /// every mount waiting on it.
     ///
-    /// A mount whose future was dropped never receives the cell, so the hold it
-    /// took at mount time has to be given back here — nothing else will.
+    /// A mount whose future was dropped never builds the [`Mounted`](crate::Mounted)
+    /// that would release its hold, so the hold goes out inside the reply: it
+    /// is given back by the same drop that discards the cell, whether that
+    /// happens before this send or after it ([`MountReply`]).
     fn resolve_mounts(&mut self, root_id: &Arc<str>) {
         let Some(root) = self.roots.get_mut(root_id) else {
             return;
         };
 
         let cell = Arc::clone(&root.cell);
-        let mut abandoned = 0;
+        let pending = std::mem::take(&mut root.pending_mounts);
 
-        for reply in root.pending_mounts.drain(..) {
-            if reply.send(Ok(Arc::clone(&cell))).is_err() {
-                abandoned += 1;
-            }
-        }
-
-        for _ in 0..abandoned {
-            self.release(root_id);
+        for reply in pending {
+            let _ = reply.send(Ok(MountReply {
+                cell: Arc::clone(&cell),
+                hold: RootHold::new(self.tx.clone(), Arc::clone(root_id)),
+            }));
         }
     }
 
@@ -1107,7 +1181,7 @@ struct Root {
     published: bool,
     /// Guards re-entry into version-mismatch recovery (§9).
     recovering: bool,
-    pending_mounts: Vec<oneshot::Sender<Result<AnyCell>>>,
+    pending_mounts: Vec<oneshot::Sender<Result<MountReply>>>,
     pending_commands: HashMap<u64, PendingCommand>,
     /// Dispatches held behind a seeded root's in-flight initial patch (§6.2).
     pending_dispatches: Vec<CommandRequest>,
