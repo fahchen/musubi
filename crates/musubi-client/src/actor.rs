@@ -27,7 +27,7 @@ use crate::engine::PatchEngine;
 use crate::envelope::PatchEnvelope;
 use crate::error::{CommandError, MusubiError, Result};
 use crate::generated::StoreId;
-use crate::mounted::RootSink;
+use crate::mounted::{MountStatus, RootSink};
 use crate::transfer;
 
 /// The push event a patch envelope arrives under.
@@ -853,6 +853,9 @@ impl Actor {
 
         root.published = true;
         root.recovering = false;
+        // Only an *accepted envelope* makes the root live — a cache seed
+        // publishes state without ever reaching this path (BDR-0033).
+        root.sink.set_status(MountStatus::Live);
 
         for event in &envelope.events {
             root.sink
@@ -939,6 +942,9 @@ impl Actor {
 
         root.recovering = true;
         root.engine.soft_reset();
+        // The cell refuses the transition on a root that was never live, so a
+        // failed *initial* envelope keeps reading as `Connecting` (BDR-0033).
+        root.sink.set_status(MountStatus::Reconnecting);
         reject_commands(root, &|| MusubiError::VersionMismatch);
 
         if let Some(channel) = root.channel.take() {
@@ -963,6 +969,9 @@ impl Actor {
             // hook restarts it.
             root.recovering = false;
             root.engine.soft_reset();
+            // Heartbeat timeout, peer close and IO failure all arrive here as
+            // channel events; the status flips without any command (BDR-0033).
+            root.sink.set_status(MountStatus::Reconnecting);
             reject_commands(root, &|| MusubiError::Disconnected);
         }
 

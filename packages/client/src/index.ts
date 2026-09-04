@@ -8,7 +8,7 @@ export type {
   MountedStore,
   MusubiConnection
 } from "./connect"
-export type { ChannelLike, PushLike, SocketLike } from "./runtime"
+export type { ChannelLike, MusubiSocketStatus, PushLike, SocketLike } from "./runtime"
 
 export {
   canonicalStringify,

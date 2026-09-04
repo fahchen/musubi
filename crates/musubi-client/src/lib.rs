@@ -9,8 +9,8 @@
 //!
 //! [`Connection`] is one socket; [`Connection::mount`] joins one channel per
 //! root store and hands back a [`Mounted`] handle. Everything past that point —
-//! `snapshot()`, `updates()`, `command()`, `events()` — is a method on the
-//! handle, and unmounting is [`Drop`].
+//! `snapshot()`, `updates()`, `status()`, `command()`, `events()` — is a
+//! method on the handle, and unmounting is [`Drop`].
 //!
 //! ```text
 //! let cart: Mounted<CartStore> = connection.mount("cart:page", Params {}).await?;
@@ -103,7 +103,7 @@ pub use crate::connection::{BuildError, Connection, ConnectionBuilder};
 pub use crate::engine::PatchEngine;
 pub use crate::envelope::{PatchEnvelope, PatchOp, PushEvent, StreamOp};
 pub use crate::error::{CommandError, MusubiError, PatchError, Result, TransferError};
-pub use crate::mounted::Mounted;
+pub use crate::mounted::{MountStatus, Mounted};
 pub use crate::transfer::{
     CancelSignal, UploadFile, UploadProgress, UploadRequest, Uploader, UploaderError,
 };

@@ -905,6 +905,9 @@ pub trait Event<S: Store>: DeserializeOwned + Send + 'static {
 }
 
 // ---- mounted root ------------------------------------------------------
+/// Client-local liveness projection (BDR-0033). No wire message carries it.
+pub enum MountStatus { Connecting, Live, Reconnecting }
+
 impl<St: Store> Mounted<St> {
     pub fn snapshot(&self) -> Option<Arc<St::State>>;          // None while version == 0 mid-reconnect
 
@@ -912,6 +915,19 @@ impl<St: Store> Mounted<St> {
     /// `Stream`, not a callback: dropping the stream unsubscribes.
     #[must_use]
     pub fn updates(&self) -> impl Stream<Item = Arc<St::State>> + Send + 'static;
+
+    /// BDR-0033: `Connecting` until the first *accepted* initial patch (a
+    /// cache seed does not count), `Live` after, `Reconnecting` from a socket
+    /// drop / heartbeat timeout / version-gap recovery until the rejoin's
+    /// fresh initial patch lands. Terminal outcomes (rejected join, unmount,
+    /// disconnect) stay on the mount error path — no error arm here.
+    pub fn status(&self) -> MountStatus;
+
+    /// One item per status transition; no replay — read `status()` first.
+    /// Same contract as `updates()`: dropping the stream unsubscribes, and it
+    /// ends when the root is unmounted or the connection disconnected.
+    #[must_use]
+    pub fn status_updates(&self) -> impl Stream<Item = MountStatus> + Send + 'static;
 
     pub async fn command<C: Command<St>>(&self, cmd: C) -> Result<C::Reply>;
 
@@ -944,6 +960,17 @@ Notes on the shape:
 - **`snapshot()` returns `Option`.** It is `None` before the initial patch and
   whenever the node is absent from the index mid-reconnect — same guard the TS
   client requires. Callers must handle it; there is no panicking accessor.
+- **`status()` answers "am I current", `snapshot()` answers "have I loaded".**
+  The two are deliberately separate (BDR-0033): a reconnect never clears the
+  snapshot, so an idle disconnect is observable only on the status surface.
+  The socket layer underneath exposes the connection-wide analogue
+  (`PhoenixSocket::status` / `status_updates`,
+  `SocketStatus { Connecting, Connected, Reconnecting, Closed }`); this crate
+  folds the per-topic projection of the same signal — the `ChannelEvent`s the
+  socket actor emits from the identical transitions — into a per-root
+  `MountStatus`. While `Reconnecting`, the embedder MUST keep rendering the
+  last-good tree; the status exists to annotate stale rendering, never to
+  blank it.
 - **Typed mount params.** `Store::Params` is the struct the generator emits
   from `__musubi__(:attrs)`, which the shared manifest carries as `:attrs`
   (`{module, kind, fields, commands, events, attrs, uploads, source}` — see
@@ -1109,11 +1136,23 @@ the transport's continued rejoin attempts.
 join callback carries the generation captured at `attach_and_join` time and is
 ignored if stale. Deliberate leaves set `suppress_close`.
 
+**Status surface (BDR-0033).** Every path above is observable without a failed
+command: transport drop, heartbeat timeout and version-gap recovery each flip
+`Mounted::status()` to `Reconnecting` the moment the client notices (bounded
+by the heartbeat interval for a silent death), and the rejoin's fresh initial
+patch — not the rejoin itself — flips it back to `Live`. A root that never
+reached `Live` stays `Connecting` through socket churn; terminal outcomes stay
+on the mount error path. The status is a client-local projection of the
+signals in this section — no wire message carries it, and it never modifies
+the recovery behavior it reports on.
+
 Consequences the embedder must be told about, in rustdoc: reconnect re-runs
 server `mount`, so mount-time push events re-fire and stream contents are
 rebuilt from whatever `mount` re-seeds (`stream(..., reset: true)` /
 `stream_async(..., reset: true)`, BDR-0022). Uploads in flight are lost —
-uploads are not resumable.
+uploads are not resumable. The reconnect window itself is renderable state:
+`status()`/`status_updates()` report it while `snapshot()` keeps serving the
+last-good tree.
 
 ---
 

@@ -30,6 +30,31 @@ use crate::uploads::{Upload, Uploads};
 /// Push-event subscribers, keyed the way BDR-0032 dispatches: `(store_id, name)`.
 type EventRegistry = HashMap<(StoreId, String), Vec<UnboundedSender<Value>>>;
 
+/// Where a mounted root is in its connection lifecycle (BDR-0033).
+///
+/// A client-local projection of the socket layer's liveness signal — no wire
+/// message carries it, and the server is not involved. Terminal outcomes (a
+/// rejected join, unmount, [`Connection::disconnect`](crate::Connection::disconnect))
+/// stay on the mount error path and end the subscription streams; the status
+/// deliberately has no error arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountStatus {
+    /// Mounted, but the first **accepted** initial patch has not landed yet.
+    /// A cache seed renders data without leaving this state — seeded state is
+    /// last-known, not live.
+    Connecting,
+    /// The initial patch landed; [`Mounted::snapshot`] tracks the server.
+    Live,
+    /// Liveness was lost after the root had been live — socket drop, heartbeat
+    /// timeout, or version-gap recovery — and the reconnect machinery is
+    /// working its way back. Ends when the rejoin's fresh initial patch lands.
+    ///
+    /// The last-good tree **keeps rendering** through this state (BDR-0015):
+    /// [`Mounted::snapshot`] stays `Some`, so the status is how an embedder
+    /// annotates stale rendering, never a cue to blank it.
+    Reconnecting,
+}
+
 /// What the actor needs from a mounted root without knowing its [`Store`] type.
 pub(crate) trait RootSink: Send + Sync + 'static {
     /// Deserializes the hydrated tree and publishes it to the snapshot cell and
@@ -39,6 +64,13 @@ pub(crate) trait RootSink: Send + Sync + 'static {
     /// Delivers one push event to every live `events()` subscriber of
     /// `(store_id, name)`. An event with no subscriber is dropped silently.
     fn dispatch_event(&self, store_id: &StoreId, name: &str, payload: &Value);
+
+    /// Publishes a [`MountStatus`] transition to the status cell and every
+    /// live `status_updates()` subscriber (BDR-0033). Repeats are dropped, and
+    /// a root that has never been [`MountStatus::Live`] refuses
+    /// [`MountStatus::Reconnecting`] — socket churn before the first accepted
+    /// initial patch is still `Connecting`.
+    fn set_status(&self, status: MountStatus);
 
     /// The root's upload registry, which the actor hands to its
     /// [`PatchEngine`](crate::PatchEngine) so the folded `upload_ops` land in
@@ -55,6 +87,8 @@ pub(crate) struct RootCell<St: Store> {
     snapshot: Mutex<Option<Arc<St::State>>>,
     updates: Mutex<Vec<UnboundedSender<Arc<St::State>>>>,
     events: Mutex<EventRegistry>,
+    status: Mutex<MountStatus>,
+    status_watchers: Mutex<Vec<UnboundedSender<MountStatus>>>,
     // Not behind the outer `Mutex`es: the registry has its own interior
     // locking, because the actor folds ops into it while the embedder reads
     // handles out of it.
@@ -72,6 +106,8 @@ impl<St: Store> RootCell<St> {
             snapshot: Mutex::new(None),
             updates: Mutex::new(Vec::new()),
             events: Mutex::new(EventRegistry::new()),
+            status: Mutex::new(MountStatus::Connecting),
+            status_watchers: Mutex::new(Vec::new()),
             uploads: Arc::new(Uploads::new(control)),
         }
     }
@@ -105,6 +141,27 @@ impl<St: Store> RootSink for RootCell<St> {
         }
     }
 
+    fn set_status(&self, status: MountStatus) {
+        {
+            let mut current = lock(&self.status);
+
+            // A root that has never been live cannot be reconnecting: socket
+            // churn before the first accepted initial patch is part of
+            // `Connecting` (BDR-0033).
+            if status == MountStatus::Reconnecting && *current == MountStatus::Connecting {
+                return;
+            }
+
+            if *current == status {
+                return;
+            }
+
+            *current = status;
+        }
+
+        lock(&self.status_watchers).retain(|watcher| watcher.unbounded_send(status).is_ok());
+    }
+
     fn uploads(&self) -> Arc<Uploads> {
         Arc::clone(&self.uploads)
     }
@@ -113,6 +170,10 @@ impl<St: Store> RootSink for RootCell<St> {
         *lock(&self.snapshot) = None;
         lock(&self.updates).clear();
         lock(&self.events).clear();
+        // Back to the pre-initial baseline, coherent with the cleared
+        // snapshot; the ended streams are the terminal signal (BDR-0033).
+        *lock(&self.status) = MountStatus::Connecting;
+        lock(&self.status_watchers).clear();
         self.uploads.clear();
     }
 }
@@ -174,6 +235,46 @@ impl<St: Store> Mounted<St> {
         let (sender, receiver) = mpsc::unbounded();
 
         lock(&self.cell.updates).push(sender);
+
+        receiver
+    }
+
+    /// Where this root is in its connection lifecycle (BDR-0033).
+    ///
+    /// [`MountStatus::Connecting`] until the first accepted initial patch,
+    /// [`MountStatus::Live`] after, [`MountStatus::Reconnecting`] from a
+    /// socket drop / heartbeat timeout / version-gap recovery until the
+    /// rejoin's fresh initial patch lands. Terminal outcomes stay on the
+    /// mount error path; there is no error arm here.
+    ///
+    /// ```text
+    /// if cart.status() == MountStatus::Reconnecting {
+    ///     render_stale_badge();
+    /// }
+    /// ```
+    pub fn status(&self) -> MountStatus {
+        *lock(&self.cell.status)
+    }
+
+    /// One item per [`MountStatus`] transition, oldest first (BDR-0033).
+    ///
+    /// The stream **is** the subscription: dropping it unsubscribes, and it
+    /// ends when the root is unmounted or the connection is disconnected. It
+    /// does not replay [`status`](Self::status) — read that first if the
+    /// current value matters.
+    ///
+    /// ```text
+    /// let mut statuses = cart.status_updates();
+    ///
+    /// while let Some(status) = statuses.next().await {
+    ///     pill.set(status);
+    /// }
+    /// ```
+    #[must_use = "the stream is the subscription; dropping it unsubscribes"]
+    pub fn status_updates(&self) -> impl Stream<Item = MountStatus> + Send + 'static {
+        let (sender, receiver) = mpsc::unbounded();
+
+        lock(&self.cell.status_watchers).push(sender);
 
         receiver
     }

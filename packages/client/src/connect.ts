@@ -3,11 +3,13 @@ import { getRootProxy } from "./proxy"
 import {
   clearConnectionStoreCache,
   disconnectConnectionState,
+  getConnectionStatus,
   mountConnectionRoot,
   openConnectionState,
+  subscribeConnectionStatus,
   unmountConnectionRoot
 } from "./runtime"
-import type { ConnectionState, SocketLike } from "./runtime"
+import type { ConnectionState, MusubiSocketStatus, SocketLike } from "./runtime"
 import type { ExternalUploader, StoreModule, StoreProxy } from "./types"
 
 export interface ConnectOptions {
@@ -53,6 +55,14 @@ export interface MusubiConnection<R> {
     id: string
     params?: Record<string, unknown>
   }): Promise<void>
+  // Socket-liveness status (BDR-0033): "connecting" until the transport first
+  // opens, "ready" while it is open, "reconnecting" after a drop while
+  // phoenix.js reconnects. Mounted stores keep serving their last-good
+  // snapshot through "reconnecting" (BDR-0015) — annotate, don't blank.
+  status(): MusubiSocketStatus
+  // Observe status transitions; returns an unsubscribe thunk. No replay —
+  // read `status()` first if the current value matters.
+  onStatusChange(listener: (status: MusubiSocketStatus) => void): () => void
   disconnect(): Promise<void>
 }
 
@@ -140,6 +150,14 @@ function buildConnectionApi<R>(connectionState: ConnectionState): MusubiConnecti
       params?: Record<string, unknown>
     }): Promise<void> {
       await clearConnectionStoreCache(connectionState, target)
+    },
+
+    status(): MusubiSocketStatus {
+      return getConnectionStatus(connectionState)
+    },
+
+    onStatusChange(listener: (status: MusubiSocketStatus) => void): () => void {
+      return subscribeConnectionStatus(connectionState, listener)
     },
 
     async disconnect(): Promise<void> {

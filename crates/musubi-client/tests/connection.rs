@@ -20,7 +20,7 @@ use futures_util::task::noop_waker;
 use musubi_client::generated::{Command, Event, NoReply, Store, StoreId};
 use musubi_client::{
     CACHE_WRITE_THROTTLE, CacheEntry, CacheStore, CommandError, Connection, EntryStatus,
-    MemoryCacheStore, Mounted, MusubiError, UploadEntry, cache_key, now_ms,
+    MemoryCacheStore, MountStatus, Mounted, MusubiError, UploadEntry, cache_key, now_ms,
 };
 use phoenix_channel::{Message, ReplyStatus};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,8 @@ const MODULE: &str = "MyApp.Stores.CartStore";
 const ROOT_ID: &str = "MyApp.Stores.CartStore:cart";
 const TOPIC: &str = "musubi:connection:MyApp.Stores.CartStore:cart";
 const PUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// The socket layer's default heartbeat interval, which the harness keeps.
+const HEARTBEAT: Duration = Duration::from_secs(30);
 /// The shape token `Harness::new_cached` writes and reads entries under.
 const BUSTER: &str = "v1";
 
@@ -418,6 +420,7 @@ fn dropping_the_last_handle_leaves_the_channel_and_drops_the_root() {
     let mut server = harness.queue_socket();
     let (_join, cart) = harness.mount(&mut server, "cart");
     let mut updates = cart.updates();
+    let mut statuses = cart.status_updates();
 
     drop(cart);
     harness.pump();
@@ -430,6 +433,7 @@ fn dropping_the_last_handle_leaves_the_channel_and_drops_the_root() {
         "leaving the channel is what stops the server-side root"
     );
     assert!(ended(&mut updates), "subscriptions end with the root");
+    assert!(ended(&mut statuses), "the status stream ends with the root");
 }
 
 #[test]
@@ -634,6 +638,157 @@ fn a_rejoin_after_a_transport_drop_re_arms_the_initial_patch_waiter() {
         drain(&mut updates).as_slice(),
         [state] if state.title == "Rejoined"
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Mount status (BDR-0033)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_cold_mount_is_live_once_its_initial_patch_has_been_accepted() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+
+    assert_eq!(cart.status(), MountStatus::Live);
+}
+
+#[test]
+fn a_seeded_mount_stays_connecting_until_the_live_initial_patch() {
+    let store = Arc::new(MemoryCacheStore::new());
+    seed(&store, cached_tree("Cached cart"), BUSTER);
+
+    let mut harness = Harness::new_cached(&store);
+    let mut server = harness.queue_socket();
+    let pending = harness.mount_later("cart", currency("EUR"));
+    let sent = server.sent(&mut harness);
+    let cart = harness.settle(pending).expect("the seeded mount resolves");
+    let mut statuses = cart.status_updates();
+
+    // Rendering cached state is not being live: the seed is last-known data,
+    // not an accepted initial patch.
+    assert_eq!(cart.status(), MountStatus::Connecting);
+
+    server.reply(&sent[0], ReplyStatus::Ok, json!({"root_id": ROOT_ID}));
+    harness.pump();
+    server.push_event(&sent[0], "patch", initial_envelope());
+    harness.pump();
+
+    assert_eq!(cart.status(), MountStatus::Live);
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
+}
+
+#[test]
+fn a_transport_drop_reports_reconnecting_and_the_rejoins_fresh_patch_restores_live() {
+    let mut harness = Harness::new();
+    let mut first = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut first, "cart");
+    let mut statuses = cart.status_updates();
+
+    let mut second = harness.queue_socket();
+    first.disconnect();
+    harness.pump();
+
+    assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert!(
+        cart.snapshot().is_some(),
+        "the last-good tree keeps rendering through the window (BDR-0015)"
+    );
+
+    harness.fire_backoff();
+    let rejoin = second.sent(&mut harness);
+    second.reply(&rejoin[0], ReplyStatus::Ok, json!({"root_id": ROOT_ID}));
+    harness.pump();
+
+    // The rejoin alone is not recovery: live returns only with the fresh
+    // initial patch that swaps the state in.
+    assert_eq!(cart.status(), MountStatus::Reconnecting);
+
+    second.push_event(&rejoin[0], "patch", initial_envelope());
+    harness.pump();
+
+    assert_eq!(cart.status(), MountStatus::Live);
+    assert_eq!(
+        drain(&mut statuses),
+        vec![MountStatus::Reconnecting, MountStatus::Live]
+    );
+}
+
+#[test]
+fn a_heartbeat_timeout_reports_reconnecting_without_any_command() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let mut statuses = cart.status_updates();
+
+    harness.fire(HEARTBEAT);
+    assert!(
+        matches!(
+            server.sent(&mut harness).as_slice(),
+            [Message { event, .. }] if event == "heartbeat"
+        ),
+        "nothing but the heartbeat itself goes out"
+    );
+    // Unanswered for a full interval: the socket is declared dead even though
+    // the transport has not noticed — and no command was ever dispatched.
+    harness.fire(HEARTBEAT);
+
+    assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Reconnecting]);
+    assert!(
+        cart.snapshot().is_some(),
+        "the last-good tree keeps rendering"
+    );
+}
+
+#[test]
+fn a_version_gap_recovery_passes_through_reconnecting() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (join, cart) = harness.mount(&mut server, "cart");
+    let mut statuses = cart.status_updates();
+
+    server.push_event(&join, "patch", envelope(7, 8, json!([])));
+    harness.pump();
+
+    assert_eq!(cart.status(), MountStatus::Reconnecting);
+
+    // Recovery left the diverged channel and joined a fresh one; its initial
+    // patch completes the loop.
+    let sent = server.sent(&mut harness);
+    let rejoin = &sent[1];
+    server.reply(rejoin, ReplyStatus::Ok, json!({"root_id": ROOT_ID}));
+    harness.pump();
+    server.push_event(rejoin, "patch", initial_envelope());
+    harness.pump();
+
+    assert_eq!(cart.status(), MountStatus::Live);
+    assert_eq!(
+        drain(&mut statuses),
+        vec![MountStatus::Reconnecting, MountStatus::Live]
+    );
+}
+
+#[test]
+fn a_root_that_was_never_live_stays_connecting_through_a_socket_drop() {
+    let store = Arc::new(MemoryCacheStore::new());
+    seed(&store, cached_tree("Cached cart"), BUSTER);
+
+    let mut harness = Harness::new_cached(&store);
+    let mut server = harness.queue_socket();
+    let pending = harness.mount_later("cart", currency("EUR"));
+    server.sent(&mut harness);
+    let cart = harness.settle(pending).expect("the seeded mount resolves");
+    let mut statuses = cart.status_updates();
+
+    let _next = harness.queue_socket();
+    server.disconnect();
+    harness.pump();
+
+    // Socket churn before the root was ever live is still `Connecting`; only
+    // a root that has been live can be `Reconnecting`.
+    assert_eq!(cart.status(), MountStatus::Connecting);
+    assert!(drain(&mut statuses).is_empty(), "no edge was crossed");
 }
 
 // ---------------------------------------------------------------------------

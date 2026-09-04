@@ -42,6 +42,10 @@
 //! reply within one interval declares the socket dead and starts that cycle.
 //! A deliberate [`Channel::leave`] suppresses the resulting `phx_close`, so it
 //! neither surfaces as an event nor triggers a rejoin.
+//!
+//! The connection-wide view of that cycle is observable (BDR-0033):
+//! [`PhoenixSocket::status`] reads the current [`SocketStatus`], and
+//! [`PhoenixSocket::status_updates`] streams every transition.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -58,4 +62,4 @@ pub use crate::channel::{Channel, ChannelErrorReason, ChannelEvent, ChannelEvent
 pub use crate::error::{BuildError, PushError, SocketClosed, TransportError};
 pub use crate::frame::{BinaryFrameError, BinaryPush, Frame, Message, Reply, ReplyStatus};
 pub use crate::seams::{Connector, Socket, Spawner, Timer};
-pub use crate::socket::{PhoenixSocket, SocketBuilder};
+pub use crate::socket::{PhoenixSocket, SocketBuilder, SocketStatus, SocketStatusUpdates};

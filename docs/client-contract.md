@@ -91,8 +91,9 @@ Public rules:
 - async values are exposed as normalized `AsyncResult<T>`
 - command failures and timeouts surface as `MusubiCommandError` (see
   below); the public `MusubiConnection<R>` interface exposes only
-  `mountStore` and `disconnect` — the connection topic is not part of
-  the public surface
+  `mountStore`, `clearStoreCache`, `status` / `onStatusChange`
+  (BDR-0033, see Reconnect) and `disconnect` — the connection topic is
+  not part of the public surface
 
 ```ts
 interface MountedStore<M, R> {
@@ -183,9 +184,41 @@ There are no separate `mount` / `unmount` messages.
 
 Phoenix owns reconnect: after a drop it automatically re-joins each channel,
 which re-runs the server join and rebuilds that one root. The client drives
-recovery from the channel's own join reply — no socket-level reopen handling.
-The last-good snapshot keeps rendering until the rebuilt root's initial patch
-(`replace ""`) atomically swaps in.
+recovery from the channel's own join reply — socket-level reopen handling
+plays no part in recovery. The last-good snapshot keeps rendering until the
+rebuilt root's initial patch (`replace ""`) atomically swaps in.
+
+#### Connection status (BDR-0033)
+
+The socket lifecycle is observable per connection, so an idle disconnect is
+visible without a failed command:
+
+```ts
+type MusubiSocketStatus = "connecting" | "ready" | "reconnecting"
+
+connection.status()                       // current value
+const off = connection.onStatusChange(cb) // transitions; returns unsubscribe
+```
+
+Rules:
+
+- client-local only: no wire message carries the status and the server is
+  not involved; it is driven by the phoenix.js socket `onOpen` / `onError` /
+  `onClose` hooks (optional on `SocketLike` — a socket without them reads as
+  a constant `"ready"` after `connect()`)
+- `"connecting"` until the transport first opens — failed initial attempts
+  stay here, they are not a regression; `"ready"` while open;
+  `"reconnecting"` after a drop until phoenix.js reopens the socket
+  (per-root recovery — rejoin + fresh initial patch — rides behind it)
+- terminal outcomes (join rejection, unmount, `disconnect()`) stay on their
+  existing error paths; the status deliberately has no error arm
+- while `"reconnecting"` the mounted stores keep serving their last-good
+  snapshots (the BDR-0015 obligation restated as a status-surface contract):
+  the status exists to *annotate* stale rendering, never to blank it
+- the Rust client surfaces the same signal per mounted root instead:
+  `Mounted::status()` / `status_updates()` with
+  `MountStatus { Connecting, Live, Reconnecting }` (`docs/rust-client.md`
+  §7, §9)
 
 ### Duplicate `(module, id)`
 
@@ -597,7 +630,9 @@ Rules:
   with `socket`, the provider owns the connect/disconnect lifecycle
 - `useMusubiConnectionStatus()` is the only safe hook inside the
   "connecting" / "error" states; `useMusubiConnection()` throws unless
-  the status is "ready"
+  the status is "ready". It covers the connect handshake only; the
+  live socket-liveness signal is `connection.status()` /
+  `connection.onStatusChange()` (BDR-0033, see Reconnect)
 - `useMusubiRoot` and `useMusubiRootSuspense` share one ref-counted
   root-mount cache keyed by `{module, id, canonical(params)}`; params
   are stringified with sorted keys so literal-equal params share mounts

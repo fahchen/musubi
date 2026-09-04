@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use phoenix_channel::{
     Channel, ChannelErrorReason, ChannelEvent, ChannelEvents, Message, PhoenixSocket, PushError,
-    Reply, ReplyStatus,
+    Reply, ReplyStatus, SocketStatus,
 };
 use serde_json::{Value, json};
 
@@ -495,6 +495,104 @@ fn disconnect_drops_every_channel_and_stops_reconnecting() {
         harness.push(&channel, "command", json!({})),
         Err(PushError::Stale)
     ));
+}
+
+// ----------------------------------------------------------- status watch --
+
+#[test]
+fn the_status_watch_reports_the_connect_drop_reconnect_cycle() {
+    let mut harness = Harness::new();
+    let mut first = harness.queue_socket();
+
+    assert_eq!(harness.inner.status(), SocketStatus::Connecting);
+    let mut statuses = harness.inner.status_updates();
+
+    let (channel, _events) = harness.attach(TOPIC, json!({}));
+    channel.join().unwrap();
+    harness.pump();
+    first.sent(&mut harness);
+
+    assert_eq!(harness.inner.status(), SocketStatus::Connected);
+
+    // The transport dies; the backoff ladder brings a fresh socket back up.
+    let mut second = harness.queue_socket();
+    first.disconnect();
+    harness.pump();
+
+    assert_eq!(harness.inner.status(), SocketStatus::Reconnecting);
+
+    harness.fire_backoff();
+
+    assert!(matches!(
+        second.sent(&mut harness).as_slice(),
+        [Message { event, .. }] if event == "phx_join"
+    ));
+    assert_eq!(harness.inner.status(), SocketStatus::Connected);
+    assert_eq!(
+        drain(&mut statuses),
+        vec![
+            SocketStatus::Connected,
+            SocketStatus::Reconnecting,
+            SocketStatus::Connected,
+        ],
+        "the watch carries edges only"
+    );
+}
+
+#[test]
+fn a_failed_first_connect_stays_connecting_rather_than_reconnecting() {
+    let mut harness = Harness::new();
+    // Nothing queued: the first connect attempt fails outright.
+    let (channel, _events) = harness.attach(TOPIC, json!({}));
+    let mut statuses = harness.inner.status_updates();
+
+    channel.join().unwrap();
+    harness.pump();
+
+    // A socket that has never been up is not "reconnecting".
+    assert_eq!(harness.inner.status(), SocketStatus::Connecting);
+    assert!(drain(&mut statuses).is_empty(), "no edge was crossed");
+
+    let _server = harness.queue_socket();
+    harness.fire_backoff();
+
+    assert_eq!(harness.inner.status(), SocketStatus::Connected);
+    assert_eq!(drain(&mut statuses), vec![SocketStatus::Connected]);
+}
+
+#[test]
+fn a_heartbeat_timeout_reports_reconnecting_on_the_status_watch() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, _events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    server.sent(&mut harness);
+
+    harness.fire(HEARTBEAT);
+    server.sent(&mut harness);
+    // The heartbeat goes unanswered for a full interval: the socket is dead
+    // even though the transport has not noticed.
+    harness.fire(HEARTBEAT);
+
+    assert_eq!(harness.inner.status(), SocketStatus::Reconnecting);
+}
+
+#[test]
+fn disconnect_reports_closed_rather_than_reconnecting() {
+    let mut harness = Harness::new();
+    let _server = harness.queue_socket();
+    let (channel, _events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let mut statuses = harness.inner.status_updates();
+
+    harness.disconnect();
+
+    assert_eq!(harness.inner.status(), SocketStatus::Closed);
+    assert_eq!(drain(&mut statuses), vec![SocketStatus::Closed]);
 }
 
 // ---------------------------------------------------------------- harness --

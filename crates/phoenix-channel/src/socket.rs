@@ -3,11 +3,14 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
+use futures_core::Stream;
 use futures_util::{FutureExt, SinkExt, StreamExt, select_biased};
 use serde_json::{Value, json};
 
@@ -73,6 +76,96 @@ pub(crate) enum PushPayload {
     Binary(Vec<u8>),
 }
 
+/// Where the socket is in its connection lifecycle (BDR-0033).
+///
+/// The connection-wide liveness signal. The per-channel projection of the same
+/// transitions arrives as [`ChannelEvent`]s; this watch is for embedders that
+/// want the one socket-level answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketStatus {
+    /// Never connected yet: before the first [`Channel::join`] opens the
+    /// socket lazily, and through initial connect attempts — a socket that
+    /// has never been up is not "reconnecting".
+    Connecting,
+    /// The transport is open.
+    Connected,
+    /// The transport was lost after having been up (peer close, IO failure,
+    /// missed heartbeat); the backoff ladder brings it back.
+    Reconnecting,
+    /// [`PhoenixSocket::disconnect`] was called; the socket never reconnects.
+    Closed,
+}
+
+/// The status transitions, as a [`Stream`] of [`SocketStatus`].
+///
+/// One item per edge — a repeated value is never emitted — and the stream is
+/// the subscription: dropping it unsubscribes, and it ends when the socket's
+/// actor shuts down.
+#[derive(Debug)]
+pub struct SocketStatusUpdates {
+    rx: UnboundedReceiver<SocketStatus>,
+}
+
+impl Stream for SocketStatusUpdates {
+    type Item = SocketStatus;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_next_unpin(cx)
+    }
+}
+
+/// The shared status cell: the actor writes transitions, the handles read.
+#[derive(Debug)]
+struct StatusCell {
+    current: Mutex<SocketStatus>,
+    watchers: Mutex<Vec<UnboundedSender<SocketStatus>>>,
+}
+
+impl StatusCell {
+    fn new() -> Self {
+        Self {
+            current: Mutex::new(SocketStatus::Connecting),
+            watchers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn get(&self) -> SocketStatus {
+        *lock(&self.current)
+    }
+
+    fn subscribe(&self) -> UnboundedReceiver<SocketStatus> {
+        let (tx, rx) = mpsc::unbounded();
+
+        lock(&self.watchers).push(tx);
+
+        rx
+    }
+
+    /// Publishes a transition. A repeat of the current value is dropped, so
+    /// watchers only ever see edges.
+    fn set(&self, next: SocketStatus) {
+        {
+            let mut current = lock(&self.current);
+
+            if *current == next {
+                return;
+            }
+
+            *current = next;
+        }
+
+        lock(&self.watchers).retain(|watcher| watcher.unbounded_send(next).is_ok());
+    }
+}
+
+/// Locks a mutex, ignoring poisoning: the cell holds plain state with no
+/// invariant a half-finished write could break.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The shared sender. Dropping the last handle (socket or channel) shuts the
 /// actor down, so a forgotten socket does not keep reconnecting forever.
 #[derive(Debug)]
@@ -94,6 +187,7 @@ impl Drop for SocketInner {
 #[derive(Debug, Clone)]
 pub struct PhoenixSocket {
     inner: Arc<SocketInner>,
+    status: Arc<StatusCell>,
 }
 
 impl PhoenixSocket {
@@ -147,6 +241,32 @@ impl PhoenixSocket {
             Channel::new(topic, generation, Arc::clone(&self.inner)),
             ChannelEvents::new(events),
         ))
+    }
+
+    /// Where the socket is in its connection lifecycle, right now.
+    ///
+    /// ```text
+    /// socket.status() //=> SocketStatus::Connected
+    /// ```
+    pub fn status(&self) -> SocketStatus {
+        self.status.get()
+    }
+
+    /// The status transitions, oldest first (BDR-0033).
+    ///
+    /// The stream **is** the subscription: dropping it unsubscribes. It does
+    /// not replay [`status`](Self::status) — read that first if the current
+    /// value matters.
+    ///
+    /// ```text
+    /// let mut statuses = socket.status_updates();
+    /// // statuses.next().await //=> Some(SocketStatus::Connected)
+    /// ```
+    #[must_use = "the stream is the subscription; dropping it unsubscribes"]
+    pub fn status_updates(&self) -> SocketStatusUpdates {
+        SocketStatusUpdates {
+            rx: self.status.subscribe(),
+        }
     }
 
     /// Closes the socket for good: no reconnect, every channel dropped, every
@@ -245,6 +365,7 @@ impl SocketBuilder {
         let timer = self.timer.ok_or(BuildError::MissingTimer)?;
 
         let (tx, rx) = mpsc::unbounded();
+        let status = Arc::new(StatusCell::new());
         let actor = Actor {
             url: endpoint_url(&url, &self.params),
             heartbeat: self.heartbeat.unwrap_or(DEFAULT_HEARTBEAT),
@@ -266,12 +387,14 @@ impl SocketBuilder {
             backoff: Backoff::default(),
             heartbeat_cancel: None,
             pending_heartbeat: None,
+            status: Arc::clone(&status),
         };
 
         spawner.spawn(Box::pin(actor.run()));
 
         Ok(PhoenixSocket {
             inner: Arc::new(SocketInner { tx }),
+            status,
         })
     }
 }
@@ -344,6 +467,8 @@ struct Actor {
     heartbeat_cancel: Option<oneshot::Sender<()>>,
     /// The ref of a heartbeat still awaiting its reply.
     pending_heartbeat: Option<u64>,
+    /// The liveness watch shared with every [`PhoenixSocket`] handle.
+    status: Arc<StatusCell>,
 }
 
 impl Actor {
@@ -413,6 +538,7 @@ impl Actor {
                 self.closed = true;
                 self.drop_socket(ChannelErrorReason::SocketClosed);
                 self.channels.clear();
+                self.status.set(SocketStatus::Closed);
                 let _ = ack.send(());
             }
             // Handled by the loop so it can break.
@@ -601,6 +727,7 @@ impl Actor {
             Ok(socket) => socket,
             Err(error) => {
                 tracing::debug!(%error, "socket connect failed");
+                self.report_lost();
                 self.notify_joining(ChannelEvent::Error {
                     reason: ChannelErrorReason::SocketClosed,
                 });
@@ -616,6 +743,7 @@ impl Actor {
         self.socket = Some(socket);
         self.backoff.reset();
         self.start_heartbeat();
+        self.status.set(SocketStatus::Connected);
 
         // Rejoin every registered channel; its join-ok fires again, which is
         // the one recovery hook consumers get.
@@ -837,9 +965,22 @@ impl Actor {
         }
     }
 
+    /// Reports a lost or failed transport on the status watch: a socket that
+    /// has never been up stays [`SocketStatus::Connecting`]; anything else is
+    /// [`SocketStatus::Reconnecting`]. A closed socket reports nothing — the
+    /// disconnect path owns [`SocketStatus::Closed`].
+    fn report_lost(&self) {
+        if self.closed || self.status.get() == SocketStatus::Connecting {
+            return;
+        }
+
+        self.status.set(SocketStatus::Reconnecting);
+    }
+
     /// Tears the socket down: cancels the heartbeat, fails everything in
     /// flight, and reports `reason` to every channel that wanted to be joined.
     fn drop_socket(&mut self, reason: ChannelErrorReason) {
+        self.report_lost();
         self.socket = None;
         self.heartbeat_cancel = None;
         self.pending_heartbeat = None;

@@ -15,7 +15,8 @@
 //! | Identity + rename | `set_name`, reply `{ok, name}` |
 //! | Online panel | `assign_async :online_users` + PubSub |
 //! | Attach button | `upload :attachment` in channel mode + `attach` |
-//! | Connection pill | reconnect (BDR-0015) |
+//! | Connection pill | `Mounted::status_updates` (BDR-0033) |
+//! | Instant relaunch | SWR mount cache (§6.4) over `cache_store::FileCacheStore` |
 //!
 //! The one rule the whole file is organized around: **state renders from
 //! [`Mounted::updates`], never from a command reply.** A reply resolves before
@@ -30,7 +31,8 @@
 //! identity card, rename form, presence panel) beside a chat column (header
 //! with activity pills, message bubbles, composer dock). The connection pill is
 //! the one piece of chrome the browser client has no equivalent for — it
-//! reports the reconnect state described in §4.6.
+//! renders the crate's [`MountStatus`] stream (BDR-0033), so an idle
+//! disconnect flips it without a command.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,7 +51,8 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Disableable, Sizable};
 use musubi_client::{
-    Connection, Mounted, MusubiError, Upload, UploadAccept, UploadEntry, UploadFile, UploadHandle,
+    Connection, MountStatus, Mounted, MusubiError, Upload, UploadAccept, UploadEntry, UploadFile,
+    UploadHandle,
 };
 
 use crate::generated::chat_room::stores::chat_room_store::{
@@ -190,11 +193,11 @@ pub struct ChatWindow {
     /// previous tree rendered (BDR-0015), and the fresh one replaces it
     /// atomically when the re-seeded initial patch lands.
     snapshot: Option<Arc<State>>,
-    /// Set when a command fails because the socket went away, cleared by the
-    /// next accepted patch. The §4.6 workaround: the crate publishes no mount
-    /// status, and `Mounted::snapshot()` is never cleared on reconnect, so a
-    /// failed command is the only evidence the view ever gets.
-    stale: bool,
+    /// The crate's own liveness signal (BDR-0033), fed by
+    /// [`Mounted::status_updates`]. `Reconnecting` flips the pill the moment
+    /// the client notices a dead socket — idle or not — with no command
+    /// involved.
+    status: MountStatus,
     /// `None` until the join succeeds; commands are refused before that.
     mounted: Option<Mounted<ChatRoomStore>>,
     /// The one-line reply/receipt channel. Written by command replies only, and
@@ -221,6 +224,9 @@ pub struct ChatWindow {
     /// which is the right teardown when the window closes. A detached loop
     /// would keep the `Mounted` — and so the server-side page — alive.
     _updates: Task<()>,
+    /// Held: the [`Mounted::status_updates`] loop, started once the mount
+    /// resolves.
+    _status_updates: Option<Task<()>>,
     /// Held: the upload handle's update loop, started with the first snapshot.
     _upload_updates: Option<Task<()>>,
     /// Held: one command at a time, cancelled with the window.
@@ -289,17 +295,36 @@ impl ChatWindow {
                 }
             };
 
-            // Subscribe *before* reading the snapshot: `updates()` does not
-            // replay, so taking the snapshot afterwards is what closes the gap
-            // between the two.
+            // Subscribe *before* reading the snapshot and status: neither
+            // stream replays, so reading the current values afterwards is what
+            // closes the gap between the two.
             let mut updates = mounted.updates();
+            let mut statuses = mounted.status_updates();
             let initial = mounted.snapshot();
+            let status = mounted.status();
 
             if this
                 .update_in(cx, |view, window, cx| {
                     view.adopt(initial, window, cx);
+                    view.status = status;
                     view.mounted = Some(mounted);
                     view.watch_upload(window, cx);
+                    // The crate's own liveness stream drives the pill
+                    // (BDR-0033): a socket drop or heartbeat timeout flips it
+                    // with no command involved, and the rejoin's fresh initial
+                    // patch flips it back.
+                    view._status_updates = Some(cx.spawn_in(window, async move |this, cx| {
+                        while let Some(status) = statuses.next().await {
+                            let alive = this.update(cx, |view, cx| {
+                                view.status = status;
+                                cx.notify();
+                            });
+
+                            if alive.is_err() {
+                                break;
+                            }
+                        }
+                    }));
                     cx.notify();
                 })
                 .is_err()
@@ -312,7 +337,6 @@ impl ChatWindow {
                 let alive = this.update_in(cx, |view, window, cx| {
                     view.adopt(Some(snapshot), window, cx);
                     view.watch_upload(window, cx);
-                    view.stale = false;
                     // `cx.notify()` is the only thing that schedules a repaint;
                     // mutating the view without it renders nothing.
                     cx.notify();
@@ -328,7 +352,7 @@ impl ChatWindow {
             url,
             mount_error: None,
             snapshot: None,
-            stale: false,
+            status: MountStatus::Connecting,
             mounted: None,
             upload: None,
             attachment: None,
@@ -340,6 +364,7 @@ impl ChatWindow {
             // this list is its head, not its tail.
             messages: ListState::new(0, ListAlignment::Top, px(200.0)),
             _updates: updates,
+            _status_updates: None,
             _upload_updates: None,
             _in_flight: None,
             _subscriptions: subscriptions,
@@ -600,16 +625,11 @@ impl ChatWindow {
         cx.notify();
     }
 
-    /// Records a command failure, and marks the view stale when the reason was
-    /// the socket rather than the server (§4.6).
+    /// Records a command failure on the feedback line. A failure caused by a
+    /// dead socket needs no special handling here: the crate's status stream
+    /// has already flipped the pill to "reconnecting" (BDR-0033), so the two
+    /// signals coincide instead of the command being the only evidence.
     fn note_failure(&mut self, label: &str, error: &MusubiError) {
-        if matches!(
-            error,
-            MusubiError::NotConnected | MusubiError::Disconnected | MusubiError::Transport(_)
-        ) {
-            self.stale = true;
-        }
-
         self.feedback = format!("{label} failed: {error}").into();
     }
 
@@ -872,18 +892,16 @@ impl ChatWindow {
             .into_any_element()
     }
 
-    /// §4.6. The pill flips without the message list blanking, because the
+    /// The pill flips without the message list blanking, because the
     /// last-good snapshot is kept (BDR-0015).
     ///
-    /// `stale` is the *only* reconnect signal v1 has, and it is set by a
-    /// command that failed on a dead socket. `Mounted::snapshot()` is never
-    /// cleared once the first patch lands — not by a reconnect either — so a
-    /// socket that drops while the app is idle keeps saying "live" until the
-    /// next command. Fixing that needs a `MountStatus` on the crate; see
-    /// `docs/rust-gpui-example.md` open question 1.
+    /// It renders [`Mounted::status_updates`] (BDR-0033): a socket that drops
+    /// while the app is idle flips to "reconnecting" the moment the client
+    /// notices — bounded by the heartbeat window — with no command involved,
+    /// and the rejoin's fresh initial patch flips it back to "live".
     ///
-    /// The browser client has no equivalent: `@musubi/react` resubscribes
-    /// silently, so there is nothing there to port.
+    /// The browser client has no equivalent piece of chrome, though the same
+    /// signal exists there as `connection.status()` / `onStatusChange()`.
     fn connection_pill(&self) -> AnyElement {
         let (label, tint) = self.connection_state();
 
@@ -903,17 +921,30 @@ impl ChatWindow {
     }
 
     /// The pill's copy and tint, split out so it can be asserted on directly.
+    ///
+    /// `mount_error` keeps its own arm — a rejected join is terminal and never
+    /// enters the status stream (BDR-0033) — and before the mount resolves
+    /// there is no handle to read a status from, hence "connecting". Past
+    /// that, the copy is the [`MountStatus`] verbatim.
+    ///
+    /// A cache-seeded mount (`docs/rust-client.md` §6.4) lands in the
+    /// `Connecting` arm *with* a rendered snapshot: `snapshot` and `status` are
+    /// independent on purpose, so last-session state paints under a "joining"
+    /// pill until the accepted live initial patch flips it — a seed never
+    /// counts as `Live`.
     pub fn connection_state(&self) -> (&'static str, u32) {
         if self.mount_error.is_some() {
-            ("offline", RUST)
-        } else if self.mounted.is_none() {
-            ("connecting", GOLD)
-        } else if self.stale {
-            ("reconnecting", GOLD)
-        } else if self.snapshot.is_some() {
-            ("live", TEAL)
-        } else {
-            ("joining", GOLD)
+            return ("offline", RUST);
+        }
+
+        if self.mounted.is_none() {
+            return ("connecting", GOLD);
+        }
+
+        match self.status {
+            MountStatus::Connecting => ("joining", GOLD),
+            MountStatus::Live => ("live", TEAL),
+            MountStatus::Reconnecting => ("reconnecting", GOLD),
         }
     }
 
@@ -1688,7 +1719,10 @@ mod tests {
     use futures::{FutureExt, Sink, Stream, StreamExt};
     use gpui::{Entity, Modifiers, Point, TestAppContext, VisualTestContext};
     use gpui_component::Root;
-    use musubi_client::{BinaryPush, Connector, Frame, Socket, TransportError};
+    use musubi_client::{
+        BinaryPush, CacheEntry, CacheStore, ConnectionBuilder, Connector, Frame, MemoryCacheStore,
+        Socket, TransportError, cache_key, now_ms,
+    };
     use serde_json::{Value, json};
 
     use super::*;
@@ -2115,6 +2149,15 @@ mod tests {
     /// Opens the real window tree — `Root` on the outside, or gpui-component
     /// panics looking for it — over a scripted socket.
     fn boot(cx: &mut TestAppContext) -> (Server, Entity<ChatWindow>, &mut VisualTestContext) {
+        boot_with(cx, |builder| builder)
+    }
+
+    /// [`boot`], with a hook to finish the [`ConnectionBuilder`] — how the
+    /// seeded-mount test turns the cache on without a second rig.
+    fn boot_with(
+        cx: &mut TestAppContext,
+        tune: impl FnOnce(ConnectionBuilder) -> ConnectionBuilder,
+    ) -> (Server, Entity<ChatWindow>, &mut VisualTestContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::apply_paper_theme(cx);
@@ -2122,11 +2165,12 @@ mod tests {
 
         let (connector, server) = Server::new();
         let executor = cx.executor();
-        let connection = Connection::builder()
+        let builder = Connection::builder()
             .url("ws://test.invalid/socket")
             .connector(connector)
             .spawner(GpuiSpawner(executor.clone()))
-            .timer(GpuiTimer(executor))
+            .timer(GpuiTimer(executor));
+        let connection = tune(builder)
             .build()
             .expect("every connection seam is supplied above");
 
@@ -2202,6 +2246,66 @@ mod tests {
             "identity label is {} wide, expected ~{IDENTITY_TEXT_W}",
             label.size.width
         );
+    }
+
+    /// A cache-seeded mount renders last-session state before any server frame
+    /// — under a "joining" pill, because a seed never counts as `Live`
+    /// (BDR-0033) — and the live initial patch then replaces the seed with the
+    /// server's tree in one whole-root op (`docs/rust-client.md` §6.4).
+    ///
+    /// The crate's in-memory store stands in for
+    /// [`FileCacheStore`](crate::cache_store::FileCacheStore): the seeding path
+    /// is identical behind the `CacheStore` trait, and the file layer has its
+    /// own round-trip and corrupt-file tests in `cache_store.rs`.
+    #[gpui::test]
+    fn a_seeded_mount_renders_cached_state_before_any_server_frame(cx: &mut TestAppContext) {
+        // What the last session's throttled write left behind: the wire tree
+        // out of `initial_envelope`, with a name only the cache could know.
+        let mut cached = initial_envelope()["ops"][0]["value"].clone();
+        cached["current_user"]["name"] = json!("Cached Ada");
+
+        let store = Arc::new(MemoryCacheStore::new());
+        futures::executor::block_on(store.put(
+            &cache_key(
+                "ChatRoom.Stores.ChatRoomStore",
+                ROOM_ID,
+                &json!({"room_id": ROOM_ID}),
+            ),
+            CacheEntry {
+                data: cached,
+                updated_at: now_ms(),
+                buster: String::new(),
+            },
+        ));
+
+        let (mut server, chat, cx) = boot_with(cx, |builder| builder.cache(Arc::clone(&store)));
+        cx.run_until_parked();
+
+        // Nothing has been replied to yet, so everything on screen is the
+        // seed: cached identity and cached presence rows under a "joining"
+        // pill — `snapshot` and `status` are independent on purpose.
+        assert_eq!(chat.update(cx, |chat, _| chat.poster()), "Cached Ada");
+        assert_eq!(
+            chat.update(cx, |chat, _| chat.connection_state().0),
+            "joining"
+        );
+        assert!(cx.debug_bounds("message-list").is_some());
+        // Streams are not cached (`stream_ops` are not part of the tree), so
+        // the seeded messages slot hydrates empty until the live envelope
+        // refills it.
+        assert_eq!(chat.update(cx, |chat, _| chat.messages().len()), 0);
+
+        // The join went out concurrently — the seed raced the network, it did
+        // not replace it. Answering it swaps the seed for the server's tree.
+        let join = server.only("phx_join");
+        server.reply(&join, "ok", json!({"root_id": ROOT}));
+        cx.run_until_parked();
+        server.push_patch(&join, initial_envelope());
+        cx.run_until_parked();
+
+        assert_eq!(chat.update(cx, |chat, _| chat.poster()), ME);
+        assert_eq!(chat.update(cx, |chat, _| chat.messages().len()), 2);
+        assert_eq!(chat.update(cx, |chat, _| chat.connection_state().0), "live");
     }
 
     /// A rejected join is a rendered panel, not a silent exit.
@@ -2439,10 +2543,13 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// A socket that goes away flips the pill on the next failed command, and
+    /// A socket that goes away flips the pill **on its own** (BDR-0033): the
+    /// crate's status stream reports the drop with no command involved, and
     /// the last good snapshot keeps rendering (BDR-0015).
     #[gpui::test]
-    fn a_dropped_socket_flips_the_pill_but_keeps_the_rows(cx: &mut TestAppContext) {
+    fn a_dropped_socket_flips_the_pill_without_a_command_and_keeps_the_rows(
+        cx: &mut TestAppContext,
+    ) {
         let (mut server, chat, cx) = boot(cx);
         mount(&mut server, cx);
 
@@ -2451,6 +2558,25 @@ mod tests {
         server.disconnect();
         cx.run_until_parked();
 
+        assert_eq!(
+            chat.update(cx, |chat, _| chat.connection_state().0),
+            "reconnecting",
+            "the pill flips from the status stream alone"
+        );
+        assert!(
+            server.sent().is_empty(),
+            "nothing was dispatched to notice the drop"
+        );
+        assert_eq!(
+            chat.update(cx, |chat, _| chat.messages().len()),
+            2,
+            "the last good snapshot is kept"
+        );
+        assert!(cx.debug_bounds("message-list").is_some());
+        assert!(cx.debug_bounds("connection-pill").is_some());
+
+        // A command sent into the dead window still fails onto the feedback
+        // line, coinciding with the pill rather than being its only source.
         cx.simulate_input("into the void");
         let send = center(cx, "send-button");
         cx.simulate_click(send, Modifiers::none());
@@ -2460,12 +2586,5 @@ mod tests {
             chat.update(cx, |chat, _| chat.connection_state().0),
             "reconnecting"
         );
-        assert_eq!(
-            chat.update(cx, |chat, _| chat.messages().len()),
-            2,
-            "the last good snapshot is kept"
-        );
-        assert!(cx.debug_bounds("message-list").is_some());
-        assert!(cx.debug_bounds("connection-pill").is_some());
     }
 }
