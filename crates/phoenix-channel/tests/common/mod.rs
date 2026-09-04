@@ -5,6 +5,13 @@
 //! `crates/musubi-client/tests/connection.rs` includes this file directly
 //! (`#[path = "../../phoenix-channel/tests/common/mod.rs"]`) so the two suites
 //! cannot drift; each keeps only what is specific to its own layer.
+//!
+//! Two knobs let a test observe the client mid-flight rather than only at rest:
+//! [`ServerEnd::stall_writes`] parks it inside a write, and [`Harness::armed`]
+//! reads which sleeps exist at that moment. Between them a test can watch work
+//! *queue up* — a timer tick that has not been handled, a frame that has been
+//! delivered but not read — which is otherwise invisible, because every pump
+//! runs the client to quiescence.
 
 // Each suite uses a subset of the rig.
 #![allow(dead_code)]
@@ -13,7 +20,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -90,16 +97,19 @@ impl<T> Harness<T> {
     pub fn queue_socket(&mut self) -> ServerEnd {
         let (to_client, inbound) = mpsc::unbounded();
         let (outbound, from_client) = mpsc::unbounded();
+        let stall = Stall::default();
 
-        self.sockets
-            .lock()
-            .unwrap()
-            .push_back(MockSocket { inbound, outbound });
+        self.sockets.lock().unwrap().push_back(MockSocket {
+            inbound,
+            outbound,
+            stall: stall.clone(),
+        });
 
         ServerEnd {
             to_client: Some(to_client),
             from_client,
             pending: Vec::new(),
+            stall,
         }
     }
 
@@ -139,6 +149,20 @@ impl<T> Harness<T> {
             seen += 1;
             hit
         });
+    }
+
+    /// How many sleeps of exactly `dur` are armed right now.
+    ///
+    /// A clock that arms its next tick only once the work of the current one is
+    /// done has an observable signature: between the two there is nothing armed
+    /// at all. This is how a test reads that.
+    pub fn armed(&self, dur: Duration) -> usize {
+        self.sleeps
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(pending, _)| *pending == dur)
+            .count()
     }
 
     pub fn fire_where(&mut self, mut matches: impl FnMut(Duration) -> bool) {
@@ -218,9 +242,36 @@ pub struct ServerEnd {
     /// are claimed by different assertions (`sent` vs `sent_binary`), so a
     /// frame of the other kind must not be dropped — or consumed out of order.
     pending: Vec<Frame>,
+    stall: Stall,
 }
 
 impl ServerEnd {
+    /// Holds the socket not-ready for writing, parking the client inside its
+    /// next write until [`resume_writes`](Self::resume_writes).
+    ///
+    /// This is the only way to stop the actor draining its inbox while the
+    /// harness keeps running: it owns the transport, so every other wake-up it
+    /// takes is handled to completion within one `pump`. A test that needs work
+    /// to *queue up* — two timer ticks, a frame the actor has not read yet —
+    /// parks it here first. Real transports stall exactly like this whenever
+    /// their send buffer is full.
+    pub fn stall_writes(&self) {
+        self.stall.inner.lock().unwrap().held = true;
+    }
+
+    /// Lets writing proceed again and wakes whoever was parked on it.
+    pub fn resume_writes(&self) {
+        let waker = {
+            let mut state = self.stall.inner.lock().unwrap();
+            state.held = false;
+            state.waker.take()
+        };
+
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
     /// Every text frame the client wrote since the last call, decoded.
     pub fn sent(&mut self, harness: &mut impl Pump) -> Vec<Message> {
         self.claim(harness, |frame| match frame {
@@ -325,10 +376,24 @@ impl ServerEnd {
     }
 }
 
+/// Whether a [`MockSocket`]'s sink is currently accepting writes, shared with
+/// the [`ServerEnd`] that flips it.
+#[derive(Clone, Default)]
+pub struct Stall {
+    inner: Arc<Mutex<StallState>>,
+}
+
+#[derive(Default)]
+struct StallState {
+    held: bool,
+    waker: Option<Waker>,
+}
+
 /// A socket whose two halves are plain unbounded channels.
 pub struct MockSocket {
     inbound: UnboundedReceiver<Result<Frame, TransportError>>,
     outbound: UnboundedSender<Frame>,
+    stall: Stall,
 }
 
 impl Stream for MockSocket {
@@ -342,7 +407,14 @@ impl Stream for MockSocket {
 impl Sink<Frame> for MockSocket {
     type Error = TransportError;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut state = self.stall.inner.lock().unwrap();
+
+        if state.held {
+            state.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+
         Poll::Ready(Ok(()))
     }
 

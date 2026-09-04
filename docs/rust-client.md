@@ -362,6 +362,37 @@ the workspace (§1.3); the crates.io name is a question for publishing time.
 - Heartbeat: push `{event: "heartbeat", topic: "phoenix", payload: {}}` every
   30s (configurable). Missing a heartbeat reply before the next tick ⇒ treat
   the socket as dead and tear down for reconnect, matching `phoenix.js`.
+
+  The clock is **self-clocking and fenced**, which is what makes that rule mean
+  what it says:
+
+  - Each tick is armed by the one before it, *from the point where the
+    heartbeat was written to the socket* — never from a wall clock running
+    beside the actor. An independent timer that keeps ticking while the actor
+    is behind puts two ticks in the inbox at once, and the second reads the
+    first one's heartbeat, sent moments earlier, as unanswered: a full
+    reconnect and re-hydrate on a connection that had just recovered. Anything
+    that later moves socket writes off the actor loop must keep this anchor and
+    arm on the heartbeat being *sent*, not on it being queued for a writer.
+  - Each tick names the socket incarnation it beats for, and one that outlives
+    its socket is dropped on arrival. Timers here cannot be cancelled (the
+    `Timer` seam returns a future, not a handle), so a tick armed against a
+    socket that then dies would otherwise beat off-phase on its replacement and
+    leave it running two clocks.
+  - Before an unanswered heartbeat is called a missed one, whatever the
+    transport has already delivered is read. The actor loop is inbox-first
+    (below), so the reply may be sitting in the socket, delivered but unread —
+    an unread reply is not a missed one.
+- Actor loop fairness: the loop selects inbox-first, so a handle's join or push
+  is not queued behind an inbound broadcast, and the bias is deterministic
+  because the protocol suites drive the loop on a hand-pumped single-threaded
+  pool where a randomised `select!` would make frame ordering irreproducible.
+  The bias carries a budget: after a bounded run of consecutive inbox wake-ups
+  a ready inbound frame takes the lead, which it holds only until it supplies
+  one frame. Without that ceiling a producer that outruns frame encoding (an
+  unthrottled upload progress reporter is the reachable one) can keep the
+  socket unread indefinitely, and a socket whose frames go unread is
+  indistinguishable from a dead one.
 - Refs are a monotonically increasing `u64` stringified; `join_ref` is the ref
   of the channel's current `phx_join` and must be echoed on every push for that
   channel.
@@ -536,6 +567,14 @@ costs nothing and matches the "forward/backward tolerant" posture the TS client
 takes for `upload_ops`/`events`. Unknown fields are ignored (no
 `deny_unknown_fields` anywhere on wire types — the server is allowed to add
 fields).
+
+`root_id` is checked against the root the channel was mounted for. A mismatch is
+unreachable against a correct server — the one page process bound to the channel
+stamps it — but it is **not** merely logged, because dropping the envelope
+silently is the one outcome nothing recovers from: any mount waiting on it fails
+with `MusubiError::Protocol`, and a root that has already published (so has no
+mount left to fail) goes into §9 recovery, which is the only thing that can move
+it off the version it is stuck on.
 
 ### 4.5 Version discipline
 
@@ -802,11 +841,13 @@ across exactly one revalidation, not a retry buffer:
   seeded, so it rejects as before. Queueing is a property of the seed, not of
   the cache being enabled.
 
-**Ordering (BDR-0009): reply, then the `"patch"` push, then server-side
-effects.** The Rust API must not let callers mistake a resolved reply for
-applied state. Concretely: `Mounted::command(...).await` returns `Reply` and
-the docs state, at the method's `# Ordering` heading, that the corresponding
-patch has *not* been applied yet. There is deliberately **no**
+**Ordering (BDR-0009): the server writes the reply, then the `"patch"` push,
+then server-side effects — and that frame order is *not* a client guarantee
+(§2.4).** The Rust API must not let callers mistake a resolved reply for applied
+state. Concretely: `Mounted::command(...).await` returns `Reply` and the docs
+state, at the method's `# Ordering` heading, that the reply is not gated on the
+patch it caused and implies nothing about applied state — neither that the patch
+has landed nor that it has not. There is deliberately **no**
 `command_and_wait_for_patch` helper in v1 — a `{:noreply}` command still
 patches out of band and there is no correlation id to wait on, so any such
 helper would be a race dressed as an API. Apps that need "state settled" watch
@@ -825,7 +866,11 @@ Events ride in `PatchEnvelope.events`; there is **no** `"event"` channel frame.
 Shape: `{"store_id": [...], "name": "toast", "payload": <wire term>}`.
 
 - The registry lives on the **root connection**, keyed by `(store_id, name)`,
-  and **survives reconnect** — it is cleared only on unmount/disconnect.
+  and **survives reconnect** — it is cleared only on unmount/disconnect. That
+  clear is **terminal for the registry as a whole**, not just for the keys it
+  held: nothing rejoins afterwards, so a handle still held across a teardown
+  gets an already-ended stream from `events()` rather than one that can never
+  yield, exactly as the state and status cells answer `subscribe` (§2.4).
 - Multiple `events()` streams per key; events with no live stream are silently
   dropped.
 - Dispatched exactly once per event, **after** ops/stream_ops/upload_ops are
@@ -1159,6 +1204,14 @@ Notes on the shape:
   are ignored, with a `tracing::warn!`. If the existing root's initial patch is
   still in flight, the aliasing caller awaits it and, on failure, decrements the
   refcount and propagates the error.
+- **A cancelled mount gives its hold back.** The hold the actor counts for a
+  waiting caller travels *inside* the mount reply, so dropping the mount future
+  — `tokio::time::timeout`, a losing `select!` branch, an aborted task —
+  releases it whether the cancellation lands before the actor answers or after.
+  Releasing on "the send reported no receiver" would cover only the first of
+  those: a `oneshot` send succeeds the moment the value is stored, and a
+  receiver dropped an instant later takes the value with it. A reply nobody
+  reads must not leave a joined channel and a live page server behind.
 - **Unmount is `Drop`, not a method.** There is no explicit `unmount()`.
   `Mounted` is `Clone` over a refcount; `Drop` decrements it, and at zero sends
   a non-blocking `Leave` message into the actor inbox (an unbounded
@@ -1701,8 +1754,8 @@ No live-server tests in v1. Three layers:
    coverage of: join/rejoin, join failure reasons, generation guarding,
    duplicate mount aliasing, drop-at-refcount-0 teardown,
    version-mismatch recovery (including re-join failure ⇒ keep last good),
-   bulk command rejection on each teardown path, reply-before-patch ordering,
-   heartbeat timeout, and refcount-0 close.
+   bulk command rejection on each teardown path, a command reply that is not
+   gated on the patch it caused, heartbeat timeout, and refcount-0 close.
 
 Elixir side: a `Musubi.Codegen.Rust.TypeRenderer` table test cloned from the TS
 one, plus a golden-bundle test over the existing `test/support/typespec_probe.ex`

@@ -9,16 +9,26 @@
 //! handle — so every timer is *fenced* instead: what it carries names the thing
 //! it was armed for, and the actor checks that name when the message lands. A
 //! push names its ref, a join reply and a join timeout name their attempt, a
-//! rejoin names the attempt it was armed to replace. Anything the channel has
-//! since moved off is dropped rather than acted on, which is what keeps a
-//! stale timer from stacking a second `phx_join` on a live one.
+//! rejoin names the attempt it was armed to replace, and a heartbeat tick names
+//! the socket incarnation it beats for. Anything the actor has since moved off
+//! is dropped rather than acted on, which is what keeps a stale timer from
+//! stacking a second `phx_join` on a live one, or a second clock on a socket
+//! that replaced the one the tick was armed against.
+//!
+//! The heartbeat clock is *self-clocking* on top of that: each tick is armed by
+//! the one before it, from the point where the heartbeat was actually written to
+//! the socket. Nothing here runs on a wall clock the actor cannot see, so the
+//! actor can never find two ticks queued and read the second as proof that the
+//! first went unanswered.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
+use futures_util::task::noop_waker_ref;
 use futures_util::{FutureExt, SinkExt, StreamExt, select_biased};
 use serde_json::{Value, json};
 
@@ -31,6 +41,14 @@ use crate::frame::{
     Frame, Message, Reply, ReplyStatus, TOPIC_PHOENIX,
 };
 use crate::seams::{Connector, Socket, Spawner, Timer};
+
+/// How many wake-ups in a row the actor's inbox may take before a ready inbound
+/// frame gets the first look.
+///
+/// High enough that a burst of handle traffic is still handled in the order it
+/// was posted, low enough that a sustained one cannot hold the socket unread
+/// for a heartbeat interval.
+const FAIRNESS_BUDGET: u32 = 32;
 
 /// Messages the actor accepts. Every handle method and every timer task is a
 /// sender; the actor is the only consumer.
@@ -64,7 +82,11 @@ pub(crate) enum ActorMsg {
     },
     Connected(Result<Box<dyn Socket>, TransportError>),
     Reconnect,
-    HeartbeatTick,
+    HeartbeatTick {
+        /// The socket incarnation this tick was armed for. A tick that outlives
+        /// its socket is dropped, not beaten on the replacement.
+        epoch: u64,
+    },
     Timeout {
         msg_ref: u64,
     },
@@ -174,8 +196,10 @@ pub(super) struct Actor {
     reconnect_scheduled: bool,
     closed: bool,
     backoff: Backoff,
-    /// Dropping this cancels the heartbeat task bound to the current socket.
-    heartbeat_cancel: Option<oneshot::Sender<()>>,
+    /// Names the socket incarnation the heartbeat clock is currently running
+    /// for. Bumped once per connected socket, and carried by every tick that
+    /// socket arms, so a tick that outlives it is recognised and dropped.
+    heartbeat_epoch: u64,
     /// The ref of a heartbeat still awaiting its reply.
     pending_heartbeat: Option<u64>,
     /// The liveness watch shared with every
@@ -212,43 +236,125 @@ impl Actor {
             reconnect_scheduled: false,
             closed: false,
             backoff: Backoff::default(),
-            heartbeat_cancel: None,
+            heartbeat_epoch: 0,
             pending_heartbeat: None,
         };
 
         spawner.spawn(Box::pin(actor.run()));
     }
 
+    /// The actor loop: one wake-up at a time, from the inbox or the socket.
+    ///
+    /// The selection is biased rather than random, and deliberately so: the
+    /// protocol suites drive this loop on a hand-pumped single-threaded pool,
+    /// where `futures::select!`'s randomised poll order would make frame
+    /// ordering irreproducible. The bias is inbox-first — a handle's join or
+    /// push should not queue behind an inbound broadcast — but a bias with no
+    /// ceiling is starvation: a producer that can outrun frame handling (an
+    /// upload's progress reports, say) would keep `socket.next()` from ever
+    /// being polled, and a socket whose frames go unread is indistinguishable
+    /// from a dead one. [`FAIRNESS_BUDGET`] caps how many wake-ups in a row the
+    /// inbox may take before a ready frame gets the first look.
     async fn run(mut self) {
+        let mut inbox_streak: u32 = 0;
+
         loop {
             let next = match self.socket.as_mut() {
                 Some(socket) => {
                     let mut msg = self.rx.next().fuse();
                     let mut frame = socket.next().fuse();
 
-                    select_biased! {
-                        msg = msg => Next::Msg(msg),
-                        frame = frame => Next::Frame(frame),
+                    if inbox_streak < FAIRNESS_BUDGET {
+                        select_biased! {
+                            msg = msg => Next::Msg(msg),
+                            frame = frame => Next::Frame(frame),
+                        }
+                    } else {
+                        // The socket only holds the lead until it actually
+                        // supplies a frame, so this can never starve the inbox
+                        // in turn.
+                        select_biased! {
+                            frame = frame => Next::Frame(frame),
+                            msg = msg => Next::Msg(msg),
+                        }
                     }
                 }
                 None => Next::Msg(self.rx.next().await),
             };
 
+            inbox_streak = match next {
+                Next::Msg(_) => inbox_streak.saturating_add(1),
+                Next::Frame(_) => 0,
+            };
+
             match next {
                 Next::Msg(None) | Next::Msg(Some(ActorMsg::Shutdown)) => break,
                 Next::Msg(Some(msg)) => self.handle_msg(msg).await,
-                Next::Frame(Some(Ok(frame))) => self.handle_frame(frame).await,
-                Next::Frame(Some(Err(error))) => {
-                    tracing::debug!(%error, "socket read failed");
-                    self.drop_socket(ChannelErrorReason::SocketClosed);
-                    self.schedule_reconnect();
-                }
-                Next::Frame(None) => {
-                    tracing::debug!("socket stream ended");
-                    self.drop_socket(ChannelErrorReason::SocketClosed);
-                    self.schedule_reconnect();
+                Next::Frame(frame) => {
+                    self.handle_socket(frame).await;
                 }
             }
+        }
+    }
+
+    /// Handles one wake-up from the socket — a frame, a read failure or the end
+    /// of the stream — and reports whether the socket survived it.
+    async fn handle_socket(&mut self, next: Option<Result<Frame, TransportError>>) -> bool {
+        match next {
+            Some(Ok(frame)) => {
+                self.handle_frame(frame).await;
+                // A frame can take the socket with it: an undeliverable write
+                // on the reply path drops it.
+                self.socket.is_some()
+            }
+            Some(Err(error)) => {
+                tracing::debug!(%error, "socket read failed");
+                self.drop_socket(ChannelErrorReason::SocketClosed);
+                self.schedule_reconnect();
+                false
+            }
+            None => {
+                tracing::debug!("socket stream ended");
+                self.drop_socket(ChannelErrorReason::SocketClosed);
+                self.schedule_reconnect();
+                false
+            }
+        }
+    }
+
+    /// Handles every frame the transport has already delivered, without waiting
+    /// for more.
+    ///
+    /// The loop is inbox-first, so a frame that is merely *unread* is a normal
+    /// state to be in. It matters for exactly one decision — whether an
+    /// unanswered heartbeat proves the socket dead — because the frame sitting
+    /// there may be the reply that answers it. Everything else in the actor is
+    /// happy to read frames a wake-up later.
+    async fn drain_readable(&mut self) {
+        loop {
+            match self.poll_readable() {
+                Poll::Pending => return,
+                Poll::Ready(next) => {
+                    if !self.handle_socket(next).await {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whatever the socket has for the taking right now, or
+    /// [`Poll::Pending`] if it has nothing — or if there is no socket.
+    ///
+    /// Kept out of `async fn` on purpose: a [`Context`] is not `Send`, and the
+    /// actor loop has to be. The waker is a no-op because nothing waits on it —
+    /// the loop registers a real one the moment the caller returns to it.
+    fn poll_readable(&mut self) -> Poll<Option<Result<Frame, TransportError>>> {
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        match self.socket.as_mut() {
+            Some(socket) => socket.poll_next_unpin(&mut cx),
+            None => Poll::Pending,
         }
     }
 
@@ -278,7 +384,7 @@ impl Actor {
                 self.reconnect_scheduled = false;
                 self.connect();
             }
-            ActorMsg::HeartbeatTick => self.heartbeat_tick().await,
+            ActorMsg::HeartbeatTick { epoch } => self.heartbeat_tick(epoch).await,
             ActorMsg::Timeout { msg_ref } => self.timeout(msg_ref).await,
             ActorMsg::Disconnect { ack } => {
                 self.closed = true;
@@ -543,13 +649,32 @@ impl Actor {
         }
     }
 
-    async fn heartbeat_tick(&mut self) {
+    /// One beat of the heartbeat clock: judge the previous heartbeat, send the
+    /// next, and arm the tick after it.
+    async fn heartbeat_tick(&mut self, epoch: u64) {
+        // The fence: a tick armed against a socket that has since been replaced
+        // would put a second clock on its successor, halving the interval and
+        // making every other tick look like a missed reply.
+        if epoch != self.heartbeat_epoch {
+            return;
+        }
+
+        if self.pending_heartbeat.is_some() {
+            // Before passing sentence: the reply that answers it may already be
+            // sitting in the socket, delivered by the transport but unread
+            // because the loop is inbox-first. An unread reply is not a missed
+            // one.
+            self.drain_readable().await;
+        }
+
+        // Nothing to beat on — or the drain took the socket down with it, which
+        // has already scheduled the reconnect that re-arms the clock.
         if self.socket.is_none() {
             return;
         }
 
-        // A heartbeat still unanswered when the next one is due means the
-        // socket is dead even though the transport has not noticed.
+        // A heartbeat still unanswered a full interval after it went out means
+        // the socket is dead even though the transport has not noticed.
         if self.pending_heartbeat.is_some() {
             tracing::debug!("heartbeat timeout, tearing the socket down");
             self.drop_socket(ChannelErrorReason::HeartbeatTimeout);
@@ -567,6 +692,19 @@ impl Actor {
             payload: json!({}),
         })
         .await;
+
+        // The clock is armed here, *after* the write, and nowhere else. That is
+        // what makes the interval a measure of how long this heartbeat has gone
+        // unanswered rather than of how long ago some other timer thought one
+        // was due — and it is why the actor can never find two ticks queued.
+        //
+        // Whatever moves socket writes off this loop must keep that anchor: arm
+        // the next tick when the heartbeat is actually *sent*, not when it is
+        // handed to a writer. Arming on the queueing would restore the very
+        // decoupling this replaced.
+        if self.socket.is_some() {
+            self.arm_heartbeat();
+        }
     }
 
     async fn timeout(&mut self, msg_ref: u64) {
@@ -818,12 +956,16 @@ impl Actor {
         self.status.set(SocketStatus::Reconnecting);
     }
 
-    /// Tears the socket down: cancels the heartbeat, fails everything in
-    /// flight, and reports `reason` to every channel that wanted to be joined.
+    /// Tears the socket down: fails everything in flight and reports `reason` to
+    /// every channel that wanted to be joined.
+    ///
+    /// The heartbeat needs no cancelling. Its clock only advances from a tick
+    /// the actor itself handled, so clearing the socket stops it: the tick that
+    /// is already armed arrives naming an incarnation that is over, and the
+    /// fence drops it. The next socket starts a new epoch of its own.
     fn drop_socket(&mut self, reason: ChannelErrorReason) {
         self.report_lost();
         self.socket = None;
-        self.heartbeat_cancel = None;
         self.pending_heartbeat = None;
 
         for (_, inflight) in self.inflight.drain() {
@@ -912,30 +1054,27 @@ impl Actor {
         );
     }
 
+    /// Starts the clock for a freshly connected socket.
+    ///
+    /// Called exactly once per socket, which is what makes the epoch it bumps a
+    /// name for that socket's incarnation.
     fn start_heartbeat(&mut self) {
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let timer = Arc::clone(&self.timer);
-        let tx = self.tx.clone();
-        let interval = self.heartbeat;
+        self.heartbeat_epoch += 1;
+        self.arm_heartbeat();
+    }
 
-        self.spawner.spawn(Box::pin(async move {
-            let mut cancel = cancel_rx.fuse();
-
-            loop {
-                let mut tick = timer.sleep(interval).fuse();
-
-                select_biased! {
-                    _ = cancel => break,
-                    () = tick => {}
-                }
-
-                if tx.unbounded_send(ActorMsg::HeartbeatTick).is_err() {
-                    break;
-                }
-            }
-        }));
-
-        self.heartbeat_cancel = Some(cancel_tx);
+    /// Arms the next tick, stamped with the incarnation it beats for.
+    ///
+    /// Like every other timer here it cannot be cancelled, so one armed against
+    /// a socket that then dies survives until its interval elapses and is
+    /// dropped on arrival by the fence in [`heartbeat_tick`](Self::heartbeat_tick).
+    fn arm_heartbeat(&self) {
+        self.spawn_after(
+            self.heartbeat,
+            ActorMsg::HeartbeatTick {
+                epoch: self.heartbeat_epoch,
+            },
+        );
     }
 
     fn spawn_timeout(&self, msg_ref: u64, after: Duration) {

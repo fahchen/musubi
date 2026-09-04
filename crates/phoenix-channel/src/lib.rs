@@ -40,6 +40,10 @@
 //! The socket reconnects on its own with the `phoenix.js` backoff ladder plus
 //! jitter, and rejoins every registered channel afterwards. A missed heartbeat
 //! reply within one interval declares the socket dead and starts that cycle.
+//! "Within one interval" is measured from the heartbeat's own write — each tick
+//! is armed by the one before it, once that heartbeat is actually out — and any
+//! frame the transport has already delivered is read before the verdict, so
+//! neither a busy client nor an unread reply can fake a dead socket.
 //! A deliberate [`Channel::leave`] suppresses the resulting `phx_close`, so it
 //! neither surfaces as an event nor triggers a rejoin.
 //!

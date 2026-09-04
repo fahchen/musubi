@@ -419,6 +419,126 @@ fn an_answered_heartbeat_keeps_the_socket_alive() {
 }
 
 #[test]
+fn the_heartbeat_clock_is_armed_from_the_send_not_from_the_tick() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let sent = server.sent(&mut harness);
+    server.reply(&sent[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    drain(&mut events);
+
+    // Park the actor inside the heartbeat's own write. A write is where it can
+    // fall behind for real — the reply path awaits the sink too, since an
+    // unreadable reply owes the server a `phx_leave`.
+    server.stall_writes();
+    harness.fire(HEARTBEAT);
+
+    // A clock the actor does not drive would have armed the next tick the
+    // moment it queued this one, and that tick would land on a heartbeat whose
+    // ink is still wet. The interval has to start at the write.
+    let armed_mid_write = harness.armed(HEARTBEAT);
+    harness.fire(HEARTBEAT);
+
+    server.resume_writes();
+    harness.pump();
+
+    assert!(
+        drain(&mut events).is_empty(),
+        "a heartbeat that was only just sent was judged as missed"
+    );
+    assert!(matches!(
+        server.sent(&mut harness).as_slice(),
+        [Message { event, .. }] if event == "heartbeat"
+    ));
+    assert_eq!(armed_mid_write, 0, "the clock ran ahead of the write");
+    assert_eq!(harness.armed(HEARTBEAT), 1, "one clock, not two");
+}
+
+#[test]
+fn a_readable_heartbeat_reply_is_read_before_the_heartbeat_is_judged() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let sent = server.sent(&mut harness);
+    server.reply(&sent[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    drain(&mut events);
+
+    harness.fire(HEARTBEAT);
+    let beat = server.sent(&mut harness);
+
+    // Park the actor inside an unrelated write, so that what arrives next is
+    // delivered by the transport but not yet read.
+    server.stall_writes();
+    let _push = harness.push_later(&channel, "command", json!({}));
+    harness.pump();
+
+    // The reply lands first, the tick second — but the loop is inbox-first, so
+    // on waking the actor is offered the tick while the reply is still unread.
+    server.reply(&beat[0], ReplyStatus::Ok, json!({}));
+    harness.fire(HEARTBEAT);
+    server.resume_writes();
+    harness.pump();
+
+    assert!(
+        drain(&mut events).is_empty(),
+        "an unread reply was treated as a missed one"
+    );
+    assert!(matches!(
+        server.sent(&mut harness).as_slice(),
+        [Message { event: push, .. }, Message { event: next_beat, .. }]
+            if push == "command" && next_beat == "heartbeat"
+    ));
+}
+
+#[test]
+fn a_tick_armed_for_a_dead_socket_does_not_beat_on_its_replacement() {
+    let mut harness = Harness::new();
+    let mut first = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let joined = first.sent(&mut harness);
+    first.reply(&joined[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+
+    // The transport dies with a tick already armed against it. No timer here
+    // can be cancelled, so that tick outlives the socket it was armed for.
+    let mut second = harness.queue_socket();
+    first.disconnect();
+    harness.pump();
+    harness.fire_backoff();
+    let rejoined = second.sent(&mut harness);
+    second.reply(&rejoined[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    drain(&mut events);
+
+    // Both intervals now come due at once: the dead socket's and the live
+    // one's. Honouring the stale one would beat off-phase and leave the
+    // replacement running two clocks, whose ticks read as missed replies.
+    assert_eq!(harness.armed(HEARTBEAT), 2, "the stale tick is still armed");
+    harness.fire(HEARTBEAT);
+
+    assert!(matches!(
+        second.sent(&mut harness).as_slice(),
+        [Message { event, .. }] if event == "heartbeat"
+    ));
+    assert!(
+        drain(&mut events).is_empty(),
+        "the replacement socket was torn down by its predecessor's tick"
+    );
+    assert_eq!(harness.armed(HEARTBEAT), 1, "one clock, not two");
+}
+
+#[test]
 fn replies_are_correlated_by_ref_regardless_of_arrival_order() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
