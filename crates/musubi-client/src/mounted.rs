@@ -207,6 +207,13 @@ impl<St: Store> Mounted<St> {
     /// the channel rejoins and is swapped atomically when the fresh initial
     /// patch arrives (`docs/rust-client.md` §9).
     ///
+    /// [`Connection::disconnect`](crate::Connection::disconnect) does clear it,
+    /// and nothing rejoins afterwards: a handle still held across a disconnect
+    /// reads `None` **forever**, which is indistinguishable here from a root
+    /// whose initial patch has not landed yet. There is no terminal variant to
+    /// read; the ended [`updates`](Self::updates) stream is the terminal
+    /// signal.
+    ///
     /// ```text
     /// let Some(state) = cart.snapshot() else { return };
     ///
@@ -246,6 +253,14 @@ impl<St: Store> Mounted<St> {
     /// socket drop / heartbeat timeout / version-gap recovery until the
     /// rejoin's fresh initial patch lands. Terminal outcomes stay on the
     /// mount error path; there is no error arm here.
+    ///
+    /// That has a consequence after
+    /// [`Connection::disconnect`](crate::Connection::disconnect): teardown puts
+    /// the cell back to the pre-initial baseline, so a handle still held across
+    /// a disconnect reports [`MountStatus::Connecting`] **forever** — a root
+    /// that will never connect, reading exactly like one that has not connected
+    /// yet. As with [`snapshot`](Self::snapshot), the ended
+    /// [`status_updates`](Self::status_updates) stream is the terminal signal.
     ///
     /// ```text
     /// if cart.status() == MountStatus::Reconnecting {

@@ -6,6 +6,13 @@
 //! Inbound channel events reach the actor through one forwarding task per
 //! channel incarnation, stamped with the generation that was current when the
 //! channel was attached — anything from a superseded incarnation is dropped.
+//!
+//! The mount cache (§6.4) lives here too, for the same reason: seeding,
+//! throttled writes and armed evictions are all per-root decisions taken
+//! against the registry, so they are `ActorMsg`s and cache slots on this task
+//! rather than a subsystem with its own state to keep in step. The `CacheStore`
+//! itself is the embedder's and is always touched from a spawned task, never on
+//! the actor.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -771,6 +778,17 @@ impl Actor {
                     // envelope fails and the last-good rendering is kept. The
                     // waiting mounts learn it is codegen drift (§11) before the
                     // root goes into recovery.
+                    //
+                    // This is *not* a rollback, and `PatchEngine::apply`'s
+                    // atomicity does not reach here: the engine has already
+                    // committed this envelope — `version` bumped, the tree
+                    // patched, the upload ops published to their subscribers —
+                    // so the root is now a version ahead of the snapshot the
+                    // embedder can read, and its upload handles reflect a state
+                    // that was never published. `recover` below is what closes
+                    // the gap: the rejoin's initial patch replaces the whole
+                    // tree from version 0. Making the boundary atomic (publish
+                    // before commit) is the real fix.
                     tracing::error!(root_id = %root_id, %error, "root state did not match the generated types");
                     self.fail_mounts_with(root_id, error);
                     self.recover(root_id).await;

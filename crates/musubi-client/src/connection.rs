@@ -1,8 +1,11 @@
 //! The connection handle and its builder (`docs/rust-client.md` §7).
 //!
 //! [`Connection`] is a cheap `Clone` over the actor's inbox; all the state
-//! lives on the actor task (§2.4). The four runtime seams are supplied here and
-//! shared with the [`phoenix_channel`] socket underneath.
+//! lives on the actor task (§2.4). Three of [`phoenix_channel`]'s four runtime
+//! seams are supplied here — [`Connector`], [`Spawner`] and [`Timer`] — and
+//! shared with the socket underneath, which is what builds the fourth: a
+//! [`Socket`](phoenix_channel::Socket) is what the connector returns, never
+//! something the embedder hands to this builder.
 
 use std::collections::HashMap;
 use std::sync::Arc;

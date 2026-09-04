@@ -724,6 +724,18 @@ impl UploadCell {
     fn publish(&self, snapshot: UploadHandle) {
         lock(&self.updates).retain(|sender| sender.unbounded_send(snapshot.clone()).is_ok());
     }
+
+    /// Ends every [`Upload::updates`] stream on this cell.
+    ///
+    /// Dropping the senders with the cell is not enough: the registry is not
+    /// the cell's only owner, and every live [`Upload`] holds an `Arc` of it.
+    /// A handle the embedder is still holding would otherwise keep the senders
+    /// — and its subscriber's receiver — alive forever, so removal from the
+    /// registry has to end them explicitly, exactly as `RootSink::clear` does
+    /// for a root's own subscriptions.
+    fn end_updates(&self) {
+        lock(&self.updates).clear();
+    }
 }
 
 /// Every upload handle of one mounted root, keyed by `(store_id, name)`.
@@ -811,12 +823,29 @@ impl Uploads {
     /// Uploads are not resumable (BDR-0003), and a store that reappears mounts
     /// fresh (BDR-0011), so a vanished store must not leave its handles behind.
     pub(crate) fn prune(&self, live_store_ids: &HashSet<StoreId>) {
-        lock(&self.handles).retain(|key, _| live_store_ids.contains(&key.store_id));
+        lock(&self.handles).retain(|key, cell| {
+            if live_store_ids.contains(&key.store_id) {
+                return true;
+            }
+
+            // Explicit, because an `Upload` the embedder still holds keeps the
+            // cell alive past its removal from the index.
+            cell.end_updates();
+
+            false
+        });
     }
 
-    /// Drops every handle. Called when the root leaves the registry.
+    /// Drops every handle, ending its `updates()` streams. Called when the root
+    /// leaves the registry.
     pub(crate) fn clear(&self) {
-        lock(&self.handles).clear();
+        let mut handles = lock(&self.handles);
+
+        for cell in handles.values() {
+            cell.end_updates();
+        }
+
+        handles.clear();
     }
 }
 
@@ -1227,6 +1256,35 @@ mod tests {
         uploads.clear();
 
         assert!(matches!(updates.next().now_or_never(), Some(None)));
+    }
+
+    // The two tests above drop the `Upload` the moment `updates()` returns, so
+    // the cell dies with its registry entry. Holding the handle — what every
+    // real consumer does — keeps the cell's `Arc` alive, and the streams must
+    // still end.
+
+    #[test]
+    fn pruning_a_store_ends_its_update_streams_while_the_handle_is_held() {
+        let uploads = Uploads::default();
+        let held = uploads.handle(&store_id(&["panel"]), "avatar");
+        let mut updates = held.updates();
+
+        uploads.prune(&HashSet::from([StoreId::root()]));
+
+        assert!(matches!(updates.next().now_or_never(), Some(None)));
+        assert_eq!(held.snapshot().store_id, store_id(&["panel"]));
+    }
+
+    #[test]
+    fn clearing_the_registry_ends_every_update_stream_while_the_handle_is_held() {
+        let uploads = Uploads::default();
+        let held = uploads.handle(&StoreId::root(), "avatar");
+        let mut updates = held.updates();
+
+        uploads.clear();
+
+        assert!(matches!(updates.next().now_or_never(), Some(None)));
+        assert_eq!(held.snapshot().store_id, StoreId::root());
     }
 
     // ---- wire ------------------------------------------------------------

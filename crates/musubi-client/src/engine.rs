@@ -206,10 +206,19 @@ impl PatchEngine {
     /// hydrated state, and its live state is read through
     /// [`uploads`](Self::uploads) (§10).
     ///
-    /// Nothing is mutated unless every step succeeds — `json_patch::patch` is
-    /// atomic, the op allowlist already ran at decode, and the version check
-    /// runs first — so a rejected envelope leaves the previous tree
-    /// authoritative and the caller can enter recovery (§9).
+    /// **Within this call**, nothing is mutated unless every step succeeds —
+    /// `json_patch::patch` is atomic, the op allowlist already ran at decode,
+    /// and the version check runs first — so a rejected envelope leaves the
+    /// previous tree authoritative and the caller can enter recovery (§9).
+    ///
+    /// The guarantee stops at the return. By the time this hands the tree back,
+    /// the envelope is already committed here — `version` is bumped and its
+    /// upload ops have been published to their subscribers — while the caller
+    /// has not yet deserialized it. A caller whose deserialize fails (codegen
+    /// drift, §11) is therefore left one version ahead of the state its own
+    /// consumers can see, with the upload handles of a state that was never
+    /// published. That heals on the next rejoin, whose initial patch replaces
+    /// the whole tree, but the publish boundary itself is not atomic.
     ///
     /// ```
     /// use musubi_client::{PatchEngine, PatchEnvelope};

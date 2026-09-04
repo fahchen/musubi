@@ -215,21 +215,71 @@ Actor {
 
 Public handles (`Connection`, `Mounted<S>`) are cheap `Clone` values holding an
 `mpsc::Sender<ActorMsg>`; every request carries a `oneshot::Sender` for its
-reply. The actor `select!`s over `{ inbound frames, inbox, heartbeat tick,
-timers }`.
+reply. The actor does **not** `select!` over several sources. It drains **one
+FIFO inbox**, and everything becomes an `ActorMsg` before it arrives there:
+
+```rust
+while let Some(msg) = self.rx.next().await {
+    if matches!(msg, ActorMsg::Shutdown) { break; }
+    self.handle(msg).await;              // one message, to completion
+}
+```
+
+Handle methods (`mount`, `command`, the `Drop` impls) send straight into it.
+Inbound channel events arrive through **one forwarding task per channel
+incarnation**, which pumps that channel's `ChannelEvents` stream into the same
+inbox, stamping each event with the generation the channel was attached under
+(§3.2). A command's `phx_reply` arrives through one task per push, awaiting the
+push's oneshot and re-entering as `CommandReply`. Cache reads, write throttles
+and evictions do the same. Socket-level timing — heartbeat ticks, join and push
+timeouts, reconnect backoff — belongs to the socket actor one layer down (§3)
+and only ever reaches this actor as `ChannelEvent`s.
 
 Why: it removes all shared-mutable state (no `Mutex<Tree>` contended between a
-UI thread and a socket thread), it keeps frame order intact **up to the socket
-actor**, and it makes the whole protocol layer testable by feeding a scripted
-`Socket` impl.
+UI thread and a socket thread), and it makes the whole protocol layer testable
+by feeding a scripted `Socket` impl. The single queue also gives **total
+ordering with no interleaving**: one producer-agnostic FIFO with one consumer
+means each message is handled to completion before the next is dequeued, so no
+other message can observe a half-applied envelope, and the order the actor sees
+is a single global sequence rather than a per-source race resolved by `select!`
+branch priority.
 
-Note what that does *not* buy: reply-before-patch ordering (BDR-0009) is **not**
-a client guarantee. A `phx_reply` reaches the Musubi actor through the per-push
+Note what that total order is *not*: it is **inbox** order, not frame order, so
+it does not buy reply-before-patch ordering (BDR-0009), which is **not** a
+client guarantee. A `phx_reply` reaches the Musubi actor through the per-push
 task that awaits the push's oneshot, while a `"patch"` push reaches it through
 the per-channel forwarding task; two independently woken tasks feeding one inbox
 means inbox order is executor-scheduling dependent, not frame order. §6.2 and
 `Mounted::command`'s `# Ordering` section are the contract: a resolved reply
 implies nothing about applied state. Read state from `snapshot()`/`updates()`.
+
+**Head-of-line blocking.** "One message to completion" is also the cost: the
+handler runs *on* the actor task, so an `.await` inside one stalls the whole
+inbox — every root's patch delivery, every command dispatch, every cache
+message queued behind it. The handlers that await are the ones that (re)attach a
+channel — a mount and a version-gap recovery, both through `attach_and_join` —
+plus `disconnect`, which is terminal anyway. `attach_and_join` awaits
+`PhoenixSocket::channel`: a round trip through the socket actor's own inbox, not
+to the server, since the join push that follows is fire-and-forget.
+Normally that window is microseconds. Under a concurrent channel-mode upload it
+widens: the socket actor serializes writes, and an upload chunk occupies it for
+one frame flush, so the `Attach` waits behind that flush. It is bounded by *one*
+chunk rather than the whole transfer only because chunks are sequential with one
+push in flight (§10.2) — the actor is never stalled for the length of a file,
+but a large `chunk_size` on a slow link is a real stall for every other root.
+
+**No backpressure, anywhere.** Every channel here is
+`futures_channel::mpsc::unbounded`: the actor's inbox, and every `updates()` /
+`status_updates()` / `events()` / upload `updates()` subscription. Sends are
+therefore non-blocking and infallible-until-closed, which is what lets the actor
+publish without ever awaiting a consumer — but it means there is **no
+backpressure path to the server**. A consumer that stops polling its stream does
+not slow the actor, does not slow the socket, and does not make the server send
+less; its queue simply grows without bound until the process runs out of memory.
+An embedder that cannot keep up must drop the stream (which unsubscribes, and
+the sender is pruned at the next send) and re-read `snapshot()`, or coalesce on
+its own side. The same applies to a stalled actor: the inbox grows while a
+handler is blocked.
 
 State delivery to the embedder is **not** through the actor's inbox. Each
 mounted root owns a snapshot cell:
@@ -244,9 +294,9 @@ pub(crate) struct RootCell<St: Store> {
 `std::sync::Mutex<Option<Arc<_>>>`, not `arc-swap`: a snapshot read happens once
 per render, not in a hot loop, and the write happens once per accepted envelope,
 so the uncontended-mutex cost is irrelevant and it drops a dependency. The
-`Option` is the pre-initial-patch / mid-reconnect hole `snapshot()` surfaces
-(§7). Swapping in `ArcSwap` later is a private change if profiling ever asks
-for it.
+`Option` is the pre-first-publish hole `snapshot()` surfaces, and the one
+teardown restores (§7, §9); a reconnect never empties it. Swapping in `ArcSwap`
+later is a private change if profiling ever asks for it.
 
 plus, per `updates()`/`events()` subscription, a `futures_channel::mpsc`
 sender on the same cell, driven from the actor task. There is **no callback
@@ -906,7 +956,9 @@ pub trait Event<S: Store>: DeserializeOwned + Send + 'static {
 pub enum MountStatus { Connecting, Live, Reconnecting }
 
 impl<St: Store> Mounted<St> {
-    pub fn snapshot(&self) -> Option<Arc<St::State>>;          // None while version == 0 mid-reconnect
+    /// `None` until the first publish, and again after teardown. A reconnect
+    /// keeps the last-good tree — see the note below and §9.
+    pub fn snapshot(&self) -> Option<Arc<St::State>>;
 
     /// One item per accepted envelope. The subscription surface is a
     /// `Stream`, not a callback: dropping the stream unsubscribes.
@@ -958,9 +1010,12 @@ Notes on the shape:
   `_` turbofish except `events::<Payload, _>`). Embedders that need thread
   affinity (gpui) hop inside their own consuming task (`cx.spawn` +
   `while let`) — a callback API would force the same hop anyway.
-- **`snapshot()` returns `Option`.** It is `None` before the initial patch and
-  whenever the node is absent from the index mid-reconnect — same guard the TS
-  client requires. Callers must handle it; there is no panicking accessor.
+- **`snapshot()` returns `Option`.** It is `None` before the root's first
+  publish — the accepted initial patch, or a cache seed (§6.4) — and `None`
+  again after teardown, which a still-held handle can observe only via
+  `Connection::disconnect` (§9). A reconnect does **not** empty it: the
+  last-good tree keeps rendering and the rejoin's initial patch swaps it
+  atomically. Callers must handle the `None`; there is no panicking accessor.
 - **`status()` answers "am I current", `snapshot()` answers "have I loaded".**
   The two are deliberately separate (BDR-0033): a reconnect never clears the
   snapshot, so an idle disconnect is observable only on the status surface.
@@ -1031,6 +1086,24 @@ Notes on the shape:
 - **No UI binding layer.** There is no Rust equivalent of `@musubi/react`. A UI
   integrates against `snapshot()` and `updates()` directly, which is what makes
   the surface portable across GUI frameworks.
+- **The patch engine is a supported entry point, not an implementation leak.**
+  `PatchEngine`, `PatchEnvelope`, `PatchOp`, `StreamOp`, `UploadOp`, `PushEvent`
+  and `Uploads` are `pub` so an embedder can fold Musubi envelopes without a
+  `Connection` at all — replaying a recorded session, driving a test fixture, or
+  running the protocol over a transport this crate does not own. The TypeScript
+  package sets the precedent: `packages/client/src/index.ts` exports
+  `applyPatch`, `applyStreamOps` and `applyUploadOps` beside `connect`, for the
+  same reason. Semver applies to them like anything else here; they are not
+  `#[doc(hidden)]`.
+- **`BinaryPush` is re-exported as a test-harness affordance.** The seams
+  (`Connector`, `Socket`, `Spawner`, `Timer`, `Frame`, `TransportError`) are
+  re-exported so an embedder implements them against `musubi_client` alone
+  (§2.2); `BinaryPush` rides along because a scripted `Socket` has to *decode*
+  what the client sent to assert on it, and upload chunks are binary frames
+  (§10.2). `examples/chat_room/desktop` does exactly this — it asserts on
+  `BinaryPush { event, payload, .. }` in its fake socket — without ever naming
+  `phoenix-channel` in its `Cargo.toml`. Re-exporting it is what keeps that
+  dependency out of embedders' manifests.
 
 ---
 
@@ -1135,7 +1208,13 @@ patch — not the rejoin itself — flips it back to `Live`. A root that never
 reached `Live` stays `Connecting` through socket churn; terminal outcomes stay
 on the mount error path. The status is a client-local projection of the
 signals in this section — no wire message carries it, and it never modifies
-the recovery behavior it reports on.
+the recovery behavior it reports on. One gap follows from having no terminal
+variant: after `Connection::disconnect` the teardown resets each root's cell to
+the pre-initial baseline, so a `Mounted` still held across it reports
+`snapshot() == None` and `status() == Connecting` forever, indistinguishable
+from a root that has not connected *yet* — the ended `updates()` /
+`status_updates()` streams are the terminal signal, and the handle should be
+dropped with the connection.
 
 Consequences the embedder must be told about, in rustdoc: reconnect re-runs
 server `mount`, so mount-time push events re-fire and stream contents are
