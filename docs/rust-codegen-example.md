@@ -1,10 +1,10 @@
 # Generated Rust code — full-surface worked example
 
-Status: **illustrative companion** to `docs/rust-codegen.md` (normative
-generator spec) and `docs/rust-client.md` (crate API). This document shows, for
-one synthetic app exercising **every Musubi feature that reaches the wire
-types**, what `mix compile.musubi_rust` emits and how an application consumes
-it. If this file and the two design docs disagree, the design docs win.
+An illustrative companion to `docs/rust-codegen.md` (the normative generator
+spec) and `docs/rust-client.md` (the crate API). It shows, for one synthetic app
+exercising **every Musubi feature that reaches the wire types**, what
+`mix compile.musubi_rust` emits and how an application consumes it. If this file
+and the two design docs disagree, the design docs win.
 
 Feature coverage map:
 
@@ -453,7 +453,7 @@ use generated::musubi::{AsyncResult, StoreId};
 
 A gpui embedder swaps only this section: depend on `musubi-client` alone (no
 tokio crate) and supply `Spawner`/`Timer`/`Connector` over gpui's executor —
-see `docs/rust-gpui-example.md` §5.
+see `examples/chat_room/desktop/src/transport.rs` for a worked adapter.
 
 ### 3.2 Connect and mount
 

@@ -1,15 +1,11 @@
 # Musubi Rust client — design
 
-Status: **implemented** (v1 scope; uploads are in, data plane and control plane
-both, per §10). This document specifies a Rust client crate
-that
-implements the Musubi client contract as a peer of `packages/client`
-(TypeScript). It is a design record, not an implementation guide for a
-specific milestone: every normative statement is derived from
-`docs/client-contract.md`, `docs/streams.md`, `docs/push-events.md`,
-`docs/uploads.md`, the `spec/decisions/BDR-*` records, and the current
-`packages/client/src/*.ts` behavior. Where those disagree, the runtime and
-`packages/client/src/types.ts` win (see §14).
+This document specifies the Rust client crates, which implement the Musubi
+client contract as a peer of `packages/client` (TypeScript). Every normative
+statement here is derived from `docs/client-contract.md`, `docs/streams.md`,
+`docs/push-events.md`, `docs/uploads.md`, the `spec/decisions/BDR-*` records,
+and `packages/client/src/*.ts`. Where those disagree, the runtime and
+`packages/client/src/types.ts` win.
 
 The Rust client is a **second consumer of the same wire contract**, not a port
 of the TypeScript runtime. The TS client is dynamically typed at the edges
@@ -119,8 +115,8 @@ crate choice (§2.3).
 | `musubi-client-tokio` | `tokio-tungstenite` | `0.24` (rustls-tls-webpki-roots) | `TungsteniteConnector` |
 
 `arc-swap` is deliberately **not** a dependency — see §2.4. `musubi-client`'s
-tree contains no runtime, which is what the gpui embedder needs
-(`docs/rust-gpui-example.md` §5.4); tokio embedders add `musubi-client-tokio`.
+tree contains no runtime, which is what a GUI embedder needs; tokio embedders
+add `musubi-client-tokio`.
 
 ---
 
@@ -200,8 +196,9 @@ There is no `gpui` crate. gpui embedders implement `Spawner`/`Timer` in three
 lines each against their own executor and supply a `Connector` over whatever
 WS client they already link (or `tokio-tungstenite` driven on a dedicated
 thread). A `gpui` adapter crate would put a fast-moving, unpublished-ABI
-dependency in the workspace for no API benefit. The reference adapter lives in
-the gpui example (`docs/rust-gpui-example.md`).
+dependency in the workspace for no API benefit. A reference adapter — the three
+seams over gpui's executor, meant to be copied verbatim — ships as
+`examples/chat_room/desktop/src/transport.rs`.
 
 ### 2.4 Concurrency shape: one actor, no locks
 
@@ -525,12 +522,12 @@ changed, **or** its `store_id` appears in this envelope's `stream_ops`
 (`touched_store_keys`), **or** it had stream keys before and none after
 (prune), **or** its `store_id` appears in `upload_ops`.
 
-**Deferred.** v1 has no per-store subscription — `Mounted::updates` publishes
-one whole-root snapshot per envelope, so an upload-only cycle already wakes
-every root subscriber — so the engine computes no change set and this rule is
-unimplemented. It lands with the per-store snapshot cache; see the `ponytail:`
-note on `PatchEngine::apply`. Per-**upload** notification is not deferred: an
-`Upload`'s `updates()` stream fires for exactly the ops that touched it (§10).
+**Not implemented.** There is no per-store subscription: `Mounted::updates`
+publishes one whole-root snapshot per envelope, so an upload-only cycle already
+wakes every root subscriber, and the engine computes no change set. The rule is
+specified here because a per-store snapshot cache would need it. Per-**upload**
+notification *is* implemented: an `Upload`'s `updates()` stream fires for
+exactly the ops that touched it (§10).
 
 Exposure to the app: the hydration pass substitutes the materialized item
 values (in list order) for the stream marker, so the generated field type is a
@@ -1031,6 +1028,9 @@ Notes on the shape:
   grace can be added later if a real embedder needs it.
 - **Streams as views.** Materialized streams appear as ordinary `Vec<Item>`
   fields on the snapshot (§4.6), so there is no separate stream API surface.
+- **No UI binding layer.** There is no Rust equivalent of `@musubi/react`. A UI
+  integrates against `snapshot()` and `updates()` directly, which is what makes
+  the surface portable across GUI frameworks.
 
 ---
 
@@ -1039,8 +1039,8 @@ Notes on the shape:
 `docs/rust-codegen.md` is the **normative** specification of the generator:
 compiler and config names, the Elixir → Rust type mapping, hoisting/naming
 rules, the module tree, and the exact emission shape. This section carries only
-what the *client crate* owes the generator, plus the one prerequisite refactor
-that is shared between the two.
+what the *client crate* owes the generator, plus the manifest layer the two
+targets share.
 
 Names, fixed once and used in both documents: compiler atom `:musubi_rust`,
 task `mix compile.musubi_rust` (`Mix.Tasks.Compile.MusubiRust`), config keys
@@ -1048,37 +1048,24 @@ task `mix compile.musubi_rust` (`Mix.Tasks.Compile.MusubiRust`), config keys
 `:rust_codegen_root_module` (default `"musubi"`, a **sibling** prelude module),
 and `:rust_codegen_runtime_path` (default `"musubi_client"`).
 
-### 8.1 Prerequisite refactor (shared manifest)
+### 8.1 The shared manifest
 
-Today `Musubi.Codegen.TypeScript.Manifest` stamps
-`_build/<env>/musubi-codegen-ts/<inspect(module)>/state.term` with
-`%{module, kind, fields, commands, events, uploads, source}` — a payload that
-was already **fully target-agnostic** (raw Musubi reflection with quoted Elixir
-type ASTs; no TS strings, no marker names, no output path). Only the naming is
-TS-coupled.
+`Musubi.Plugin.Codegen` stamps
+`_build/<env>/musubi-codegen/<inspect(module)>/state.term` with
+`%{module, kind, fields, commands, events, attrs, uploads, source}`, and
+`Musubi.Codegen.Manifest` reads it back. The payload is **fully
+target-agnostic**: raw Musubi reflection with quoted Elixir type ASTs, no TS
+strings, no marker names, no output path.
 
-This landed ahead of the Rust renderer, hoisting:
+One stamp, N renderers. A second `@after_compile` per target is explicitly
+rejected — it doubles compile-time IO for identical data. For the same reason
+the `:__streams__` field filter lives on the shared layer as
+`Manifest.renderable_fields/1` rather than being re-derived per renderer; see
+`docs/rust-codegen.md` §1.1–§1.2 for the full manifest contract.
 
-| From | To |
-|---|---|
-| `Musubi.Plugin.TypeScript` | `Musubi.Plugin.Codegen` |
-| `Musubi.Codegen.TypeScript.Manifest` | `Musubi.Codegen.Manifest` |
-| `@subdir "musubi-codegen-ts"` | `"musubi-codegen"` |
-| `:__musubi_ts_target_dir__` process key | `:__musubi_codegen_target_dir__` |
-| `@after_compile {TypeScript.Manifest, ...}` | the shared manifest — **one** `@after_compile`, N renderers |
-
-One stamp, two renderers. Adding a second `@after_compile` per target was
-explicitly rejected: it doubles compile-time IO for identical data. The same
-commit fixed the stale `@type entry()` definitions (both omitted `:events`) and
-hoisted the `:__streams__` field filter to `Manifest.renderable_fields/1` so
-Rust does not re-derive a target-agnostic policy. The record of everything the
-rename touched is `docs/rust-codegen.md` §1.2.
-
-`:attrs` was added to that payload afterwards, by the typed-mount-params
-change: the stamp is now
-`%{module, kind, fields, commands, events, attrs, uploads, source}` and the Rust
-target generates a `Params` struct per store (§7, `docs/rust-codegen.md` §4.6).
-The TS renderer ignores the key.
+`:attrs` is what makes typed mount params possible: the Rust target generates a
+`Params` struct per store from it (§7, `docs/rust-codegen.md` §4.6), and the TS
+renderer ignores the key.
 
 ### 8.2 What the generated file depends on
 
@@ -1336,9 +1323,10 @@ in-flight entry the server dropped is only cleared once its store leaves the
 index or the server emits a `reset`, and a transfer that was running fails on
 its own push — disconnected, or the push timeout — rather than being retried.
 
-The stale-while-revalidate cache has since landed and is specified in §6.4,
-together with the dispatch queueing it makes meaningful (§6.2). Still deferred:
-any React-equivalent binding layer.
+**Not supported.** The crate reads no files and streams nothing off disk: you
+hand it an `UploadFile`, so entry bytes are held in memory for the duration of
+the transfer. Size is bounded by the store's `max_file_size` declaration, which
+the server enforces at preflight.
 
 ---
 
@@ -1420,9 +1408,9 @@ No live-server tests in v1. Three layers:
    in; the regenerate-and-diff CI job in §12.4 fails the build when a
    server-side wire change makes them stale.
 
-   **Shipped.** The harness — endpoint, `Musubi.Socket`, fixture root stores,
-   recorder, scenario list — lives in `test/support/wire_capture/`, and so does
-   the task itself (`test/support/mix/tasks/musubi.capture_wire.ex`): the
+   The harness — endpoint, `Musubi.Socket`, fixture root stores, recorder,
+   scenario list — lives in `test/support/wire_capture/`, and so does the task
+   itself (`test/support/mix/tasks/musubi.capture_wire.ex`): the
    stores it drives are test-only and must not ship in the Hex tarball. The
    same modules back `test/musubi/transport/connection_channel_test.exs`, which
    is what "one mechanism" means here. `test/musubi/wire_capture_test.exs`
@@ -1540,14 +1528,14 @@ fixtures (which already cover streams, `AsyncResult.of(stream(...))`,
 union-of-maps, `Child.state()`, `list(String.t())`, uploads, commands with and
 without payloads, and events).
 
-Deferred to a later milestone: an `#[ignore]`d integration test booting the
-Elixir example app and driving a real socket, run on demand rather than in the
-default `cargo test`.
+Not covered: an integration test booting the Elixir example app and driving a
+real socket. The captured fixtures stand in for it, and they are regenerated
+from the live server rather than hand-written.
 
 ### 12.4 CI jobs
 
-`.github/workflows/ci.yml` gains a `rust` job (the gpui example stays out of
-CI — `docs/rust-gpui-example.md` §8):
+`.github/workflows/ci.yml` carries a `rust` job (the gpui example stays out of
+CI):
 
 | Job | Command |
 |---|---|
@@ -1574,43 +1562,5 @@ CI — `docs/rust-gpui-example.md` §8):
   the crate both come from the same fetched `deps/musubi`, they cannot skew.
 
 Version-skew enforcement (`MUSUBI_PROTOCOL` consts, wire protocol versions)
-becomes relevant only if the crates are ever published to crates.io — deferred
-with that decision.
-
----
-
-## 14. Contract discrepancies (resolved)
-
-Nothing open. `docs/client-contract.md` now agrees with the sources this design
-implements against — `packages/client/src/types.ts`,
-`lib/musubi/page/patch_envelope.ex`, and `lib/musubi/async_result.ex` — on the
-three points this section used to track: `upload_ops` on `PatchEnvelope` (with
-the "any of `ops` / `stream_ops` / `upload_ops` / `events` non-empty" emission
-rule), the `__musubi_async__: true` discriminator on the wire async shape, and
-the four-parameter `StoreDef<Module, Shape, Commands, Events = {}>` the Rust
-design assumes (`docs/rust-codegen.md` §4.6).
-
-The `Mix.Tasks.Compile.MusubiTs` moduledoc's stale `musubi.ts` default output
-path is fixed as well; `AGENTS.md` and the two `@type entry()` definitions were
-fixed earlier with the §8.1 refactor.
-
----
-
-## 15. Milestones
-
-R0–R9 have landed.
-
-| M | Contents | Exit criterion |
-|---|---|---|
-| R0 | §8.1 shared-manifest refactor (Elixir only) | TS bundle byte-identical before/after; `mix precommit` green |
-| R1 | `phoenix-channel` crate: framing, refs, join/leave/push, heartbeat, backoff, rejoin | Protocol tests over `MockSocket` |
-| R2 | Patch engine + hydration + index + `AsyncResult` | §12 layer-2/3 golden tests pass (the layer-1 wire fixtures are R9's criterion, not this one) |
-| R3 | Stream materialization | Full `at` × `limit` matrix passes |
-| R4 | Connection/mount lifecycle, refcounting, `Drop`-based unmount, recovery (§9) | Scripted reconnect + version-gap tests pass |
-| R5 | Commands + push events | Reply-before-patch ordering test passes |
-| R6 | `Musubi.Codegen.Rust` + `mix compile.musubi_rust`, `--check` (per `docs/rust-codegen.md`) | Generated bundle compiles against R2–R5 and round-trips the probe fixtures |
-| R7 | Ship `crates/` in the Hex package (`package/0` `:files`) + crate READMEs | A consumer app path-depends on `../deps/musubi/crates/*` and compiles |
-| R8a | Upload data plane: `upload_ops` → `(store_id, name)` handles, `Mounted::upload` (§10.1) | Op/status table-driven tests mirror `packages/client/src/uploads.ts` |
-| R8b | Upload control plane: binary frames, preflight, channel mode, external uploaders (§10.2) | Protocol tests over `MockSocket`, including binary chunk frames |
-| R8c | SWR cache (§6.4): `CacheStore`, seeded mounts, throttled writes, flush+evict, seeded-root dispatch queueing | Protocol tests over `MockSocket`: a seeded mount renders before the initial patch, queued dispatches flush in order at `version == 1`, and a version gap rejects them |
-| R9 | `mix musubi.capture_wire` + checked-in `crates/musubi-client/tests/fixtures/*.json` + `crates/musubi-client/tests/fixtures.rs` (replay) + the §12.4 fixture-drift CI row | the §12.4 fixture-drift gate is clean, `mix test` asserts the checked-in files match the live server, and `cargo test --workspace` replays all 21 through a real `Connection` |
+becomes relevant only if the crates are ever published to crates.io, and is not
+implemented.

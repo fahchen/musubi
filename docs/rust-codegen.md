@@ -1,18 +1,14 @@
 # Rust Codegen (`:musubi_rust`)
 
-Design document for a second codegen target that mirrors `:musubi_ts`: one Mix
+`:musubi_rust` is a second codegen target mirroring `:musubi_ts`: one Mix
 compiler that renders a single `.rs` bundle of typed store/state definitions
-from the same per-module compile-time manifest the TypeScript target already
-consumes.
+from the same per-module compile-time manifest the TypeScript target consumes.
+It is implemented by `Musubi.Codegen.Rust`, `Musubi.Codegen.Rust.Names`,
+`Musubi.Codegen.Rust.TypeRenderer` and `Mix.Tasks.Compile.MusubiRust`.
 
-Status: **implemented**. `Musubi.Codegen.Rust`, `Musubi.Codegen.Rust.Names`,
-`Musubi.Codegen.Rust.TypeRenderer` and `Mix.Tasks.Compile.MusubiRust` ship the
-behaviour described here; `mix compile.musubi_rust --check` runs in
-`mix precommit`.
-
-Scope note: this document covers the **generator**, and it is the **normative**
-source for everything the generator emits — compiler and config names, type
-mapping, hoisting and naming, and the shape of the generated bundle.
+This document covers the **generator**, and it is the **normative** source for
+everything the generator emits — compiler and config names, type mapping,
+hoisting and naming, and the shape of the generated bundle.
 `docs/rust-client.md` §8 defers to it.
 
 Building the Rust client *runtime* (transport, patch application, stream
@@ -28,10 +24,14 @@ emits types that `packages/client` consumes.
 
 ## 1. Manifest strategy
 
-### 1.1 Decision: reuse the existing manifest, renamed to a target-neutral name
+### 1.1 One manifest, many renderers
 
-The persisted `state.term` payload is already target-agnostic. It contains raw
-Musubi reflection and nothing else:
+Both targets read one stamp. `Musubi.Plugin.Codegen` writes
+`_build/<env>/musubi-codegen/<inspect(module)>/state.term` from a single
+`@after_compile` hook, and `Musubi.Codegen.Manifest` reads it back.
+
+The persisted `state.term` payload is target-agnostic. It contains raw Musubi
+reflection and nothing else:
 
 | key | value |
 | :-- | :---- |
@@ -40,76 +40,30 @@ Musubi reflection and nothing else:
 | `:fields` | `[%{name: atom, type: Macro.t(), opts: keyword}]`, `:type` alias-expanded |
 | `:commands` | `[%{name, payload_fields, reply_fields, opts}]`, both field lists alias-expanded |
 | `:events` | `[%{name, payload_fields}]`, payload alias-expanded |
+| `:attrs` | `[%{name, type: Macro.t(), opts}]`, `:type` alias-expanded — the mount params of §4.6 |
 | `:uploads` | `[%Musubi.Upload.Config{name, accept, max_entries, max_file_size, chunk_size, chunk_timeout}]` (no AST, not expanded) |
 | `:source` | `env.file` (stored, never read back) |
 
-No TypeScript string, marker name, or output path is encoded. Only three
-*names* are TS-coupled: the module names, the `@subdir "musubi-codegen-ts"`
-build directory, and the `:__musubi_ts_target_dir__` test-isolation process key.
+No TypeScript string, marker name, or output path is encoded, which is what
+makes one stamp serve both targets. A second `@after_compile` hook writing a
+parallel `musubi-codegen-rust/` tree was rejected: it would double the
+compile-time file writes, double the `mix clean` surface, and create two
+sources of truth that can drift when one plugin is attached and the other is
+not.
 
-**Decision: rename to target-neutral names and stamp exactly once.** A second
-`@after_compile` hook stamping a parallel `musubi-codegen-rust/` tree would
-double the compile-time file writes, double the `mix clean` surface, and create
-two sources of truth that can drift when one plugin is attached and the other
-is not.
-
-| Today | After |
-| :---- | :---- |
-| `Musubi.Plugin.TypeScript` | `Musubi.Plugin.Codegen` |
-| `Musubi.Codegen.TypeScript.Manifest` | `Musubi.Codegen.Manifest` |
-| `@subdir "musubi-codegen-ts"` | `@subdir "musubi-codegen"` |
-| `:__musubi_ts_target_dir__` | `:__musubi_codegen_target_dir__` |
-| `plugin(Musubi.Plugin.TypeScript)` in `Musubi.DSL.State.state/1` | `plugin(Musubi.Plugin.Codegen)` |
-
-`Musubi.Codegen.TypeScript` (the bundle assembler) and
-`Musubi.Codegen.TypeScript.TypeRenderer` keep their names — they are genuinely
-TS-specific. The new siblings are `Musubi.Codegen.Rust` and
+The target-specific layer is the renderers. `Musubi.Codegen.TypeScript` (the
+bundle assembler) and `Musubi.Codegen.TypeScript.TypeRenderer` are genuinely
+TS-specific; their Rust siblings are `Musubi.Codegen.Rust` and
 `Musubi.Codegen.Rust.TypeRenderer`.
 
-### 1.2 What the rename changed
+### 1.2 Invariants every renderer inherits
 
-The rename landed as one standalone preparatory commit ahead of the Rust
-renderer, with **no deprecation shim** — both renamed modules are internal and
-pre-1.0. `Musubi.Codegen.TypeScript.Manifest` was `@moduledoc false` and listed
-in `mix.exs` `skipped_doc_references/0`; `Musubi.Plugin.TypeScript` was covered
-by the `"Musubi.Plugin."` prefix in the same list, absent from `docs_modules/0`,
-and referenced only from `Musubi.DSL.State.state/1`, so no consumer ever named
-either.
+Two rules live on the shared layer rather than in any one renderer, and both
+are normative for any future target:
 
-Beyond the two module names and the `@subdir` / process-key constants, the
-commit touched four non-test sites a naive grep misses, and they are the places
-to check first if the naming ever drifts again:
-
-- `lib/musubi/plugin/type_script.ex` moved to `lib/musubi/plugin/codegen.ex`,
-  carrying its module name, moduledoc, and the `@after_compile` literal.
-- The "Discovery" section of the `Mix.Tasks.Compile.MusubiTs` moduledoc, which
-  spells the manifest path and the plugin module out in prose.
-- The `@typedoc` on the manifest entry type in
-  `lib/musubi/codegen/type_script.ex`.
-- `.github/copilot-instructions.md`.
-
-`mix.exs` `skipped_doc_references/0` moved to `"Musubi.Codegen.Manifest"`, the
-two `AGENTS.md` codegen bullets were rewritten onto the current `StoreDef`
-output shape and the `priv/codegen/ts/musubi.d.ts` default, and the two stale
-`@type entry()` definitions (`manifest.ex`, `type_script.ex`) that omitted
-`:events` were fixed in the same pass.
-
-Consumer impact: the old `_build/<env>/musubi-codegen-ts/` directory became an
-orphan. Nothing reads it and the TypeScript compiler's `manifests/0` callback
-no longer points at it, but `mix clean` does **not** remove it — `clean/0`
-`rm_rf`s `Manifest.target_dir()`, which after the rename is the *new*
-directory. The orphan survives until the next `_build` wipe. No consumer app
-needed a code change; the next `mix compile` restamps into `musubi-codegen/`
-because `@after_compile` fires on recompilation of every `state do` module
-(which the plugin change itself forces).
-
-Two target-agnostic generalizations landed in the same commit, and both are
-normative for any future renderer:
-
-- **`:__streams__` filtering** lives on the shared layer as
-  `Musubi.Codegen.Manifest.renderable_fields/1`, not in a renderer. Every
-  renderer calls it rather than re-deriving the exclusion list.
-- **`stamp/3` performs no alias expansion.** It builds the same 7-key map from
+- **`:__streams__` filtering** is `Musubi.Codegen.Manifest.renderable_fields/1`.
+  Every renderer calls it rather than re-deriving the exclusion list.
+- **`stamp/3` performs no alias expansion.** It builds the manifest map from
   module reflection alone, having no `Macro.Env`, so entries it writes can
   carry single-segment `{:__aliases__, _, [:Child]}` nodes the real compile
   path never produces. Its `@doc false` says so; renderers are written against
@@ -119,7 +73,7 @@ normative for any future renderer:
 ### 1.3 What the Rust target consumes
 
 `Musubi.Codegen.Manifest.list/1` verbatim: a list of
-`{module, %{kind, fields, commands, events, uploads}}` sorted by
+`{module, %{kind, fields, commands, events, attrs, uploads}}` sorted by
 `Module.split/1`, with every `{:__aliases__, _, parts}` node already
 fully-qualified. The Rust renderer therefore needs **no** `Macro.Env`, alias
 table, or heuristic module resolution — exactly like the TS renderer. This is
@@ -256,20 +210,18 @@ compilers: Mix.compilers() ++ [:musubi_ts, :musubi_rust]
 
 Either target can be enabled alone; both read the same manifest.
 
-Musubi's own repo:
+Musubi's own repo wires the target the same way, in `mix.exs`:
 
-- `mix.exs` `aliases/0` `precommit:` gains `"compile.musubi_rust --check"`
-  directly after `"compile.musubi_ts --check"`.
-- `docs` `groups_for_modules` `Codegen:` gains `Mix.Tasks.Compile.MusubiRust`.
-- `docs_modules/0` gains the same module.
-- `skipped_doc_references/0` — no change needed beyond the manifest rename;
-  `Musubi.Codegen.Rust` and `Musubi.Codegen.Rust.TypeRenderer` are
-  `@moduledoc false` internals reached only through the Mix task, so add
-  `"Musubi.Codegen.Rust"` alongside the existing entries if they end up
-  cross-referenced.
-- `config/test.exs` gains
-  `config :musubi, :rust_codegen_output_path, "test/tmp/musubi_rust_bundle.rs"`
-  with the same explanatory comment as the TS key.
+- `aliases/0` `precommit:` runs `"compile.musubi_rust --check"` directly after
+  `"compile.musubi_ts --check"`, so a stale bundle fails the build.
+- `docs` `groups_for_modules` `Codegen:` and `docs_modules/0` both list
+  `Mix.Tasks.Compile.MusubiRust`. `Musubi.Codegen.Rust` and
+  `Musubi.Codegen.Rust.TypeRenderer` stay out: they are `@moduledoc false`
+  internals reached only through the Mix task.
+- `config/test.exs` holds
+  `config :musubi, :rust_codegen_output_path, "test/tmp/musubi_rust_bundle.rs"`,
+  alongside the TS key. The output path is app env, so it belongs in config
+  rather than in a test that would make its siblings order-dependent (§6.3).
 
 ---
 
@@ -1138,16 +1090,15 @@ those keys makes every sibling suite order-dependent.
 
 ### 6.4 Manifest reuse test
 
-`test/musubi/codegen/manifest_test.exs` (renamed from
-`type_script/manifest_test.exs`) carries the single-stamp regression: drive
-`__after_compile__/2` once against a tmp target, then assert that both
+`test/musubi/codegen/manifest_test.exs` carries the single-stamp regression:
+drive `__after_compile__/2` once against a tmp target, then assert that both
 `Musubi.Codegen.TypeScript.render(Manifest.list(target))` and
 `Musubi.Codegen.Rust.render(Manifest.list(target))` produce non-empty output
 from that one `state.term`. That is what catches anyone re-introducing a
 per-target stamp.
 
-The rename left the rest of the manifest suite's coverage intact: idempotent
-stamping, sorted `list/1`, corrupt-term skipping, missing-dir `[]` / `:ok`,
+The rest of the suite covers the shared layer itself: idempotent stamping,
+sorted `list/1`, corrupt-term skipping, missing-dir `[]` / `:ok`,
 orphan-module sweeping, both `test/` skip variants, `renderable_fields/1`, and
 alias expansion.
 
@@ -1220,10 +1171,9 @@ Scope is deliberately capped at "what `:musubi_ts` does, for Rust".
   Emitting them would ship seven types nothing deserializes.
 - **Typed mount params for the TS target.** `:attrs` is in the shared manifest
   and the Rust target generates a `Params` struct from it (§4.6), but the TS
-  renderer still ignores the key: `StoreDef<Module, Shape, Commands, Events>`
-  has no params slot and `connect()` takes an untyped object. A deliberate,
-  recorded parity gap — Rust needs a nominal type to call `mount` at all,
-  TypeScript does not. Adding a `params` slot to `StoreDef` is the follow-up.
+  renderer ignores the key: `StoreDef<Module, Shape, Commands, Events>` has no
+  params slot and `connect()` takes an untyped object. A deliberate parity gap
+  — Rust needs a nominal type to call `mount` at all, TypeScript does not.
 - **Per-store `Command` / `Event` sum enums** and any `AnyStore` enum. Re-add
   only if a consumer needs exhaustive matching.
 - **`:input` modules**, stream options, upload config values, root-ness (§5).
@@ -1233,24 +1183,3 @@ Scope is deliberately capped at "what `:musubi_ts` does, for Rust".
   TS (§4.6).
 - **Versioning / compatibility shims** between a generated bundle and a running
   server. Drift is caught by `--check` at build time, not at runtime.
-
----
-
-## 9. Landing order (historical)
-
-The feature shipped in seven steps, recorded here only because other documents
-cite them by number (`docs/rust-gpui-example.md` §7 keys its D2 milestone to
-steps 2–6). Nothing here is outstanding.
-
-1. Rename commit (§1.2): `Musubi.Plugin.Codegen`, `Musubi.Codegen.Manifest`,
-   subdir, process key, `renderable_fields/1` hoist, stale `@type entry()`
-   fixes, `AGENTS.md` codegen bullets. TS behavior unchanged; TS tests updated
-   in place.
-2. `Musubi.Codegen.Rust.Names` + its table test.
-3. `Musubi.Codegen.Rust.TypeRenderer` + its table test (hoisting context, all
-   §3 rows).
-4. `Musubi.Codegen.Rust` prelude + module tree + `Store` trait emission +
-   golden bundle test.
-5. `Mix.Tasks.Compile.MusubiRust` + integration test + `config/test.exs` key.
-6. `mix.exs` wiring (precommit, docs groups, `docs_modules/0`).
-7. Manifest reuse regression test.

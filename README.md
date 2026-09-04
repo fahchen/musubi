@@ -216,14 +216,17 @@ await counter.dispatchCommand("increment", { amount: 1 })
 await unmount()
 ```
 
-The `R` generic is bound once on `connect`; the `module` string literal
-drives type inference for every later `mountStore` call. Command
-failures and timeouts throw a `MusubiCommandError` (from
-`@musubi/client`) with `kind`, `command`, `storeId`, `reply`, and an
+`Musubi.Stores` is the store registry the `:musubi_ts` compiler writes into
+your `.d.ts` bundle — one entry per declared store, with its state shape,
+commands and events. You name it once, on `connect`; from there the `module`
+string literal drives type inference for every later `mountStore` call, so
+`counter` is fully typed and `dispatchCommand` only accepts commands that
+store declares. Command failures and timeouts throw a `MusubiCommandError`
+(from `@musubi/client`) with `kind`, `command`, `storeId`, `reply`, and an
 extracted `code`.
 
 React consumers typically go through `createMusubi<Musubi.Stores>()`
-from `@musubi/react`, which binds `R` once and returns the full hook
+from `@musubi/react`, which takes the registry once and returns the full hook
 set — `MusubiProvider` (accepts `connection` or `socket`),
 `useMusubiConnectionStatus`, `useMusubiRoot`, `useMusubiRootSuspense`,
 `useMusubiSnapshot`, and `useMusubiCommand` (mutation-shaped:
