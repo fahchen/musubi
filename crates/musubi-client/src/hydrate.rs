@@ -19,37 +19,41 @@
 //!   rewritten by the ordinary recursion, which is what makes `stream_async`
 //!   render as `AsyncResult<Vec<Item>>`.
 //!
-//! The walk produces an owned copy. The shadow document is never hydrated in
-//! place: patch pointers address the wire tree, so the wire tree must stay
-//! pristine across cycles.
+//! The walk rewrites a tree **in place**, and the tree it is handed is the
+//! engine's working copy — never the shadow document itself. Patch pointers
+//! address the wire tree, so the wire tree stays pristine across cycles; making
+//! the working copy do double duty as the hydration target is what keeps one
+//! copy of the tree per cycle (§4.2).
 
 use serde_json::{Map, Value};
 
 use crate::generated::StoreId;
 use crate::index::{STORE_ID_KEY, parse_store_id};
-use crate::streams::{StreamEntry, StreamStore};
+use crate::streams::{StreamEntry, StreamsView};
 
 /// The wire key marking a stream slot.
 const STREAM_MARKER_KEY: &str = "__musubi_stream__";
 
 /// Substitutes every stream marker in `doc` with its materialized array.
-pub(crate) fn hydrate(doc: &Value, streams: &StreamStore) -> Value {
-    walk(doc, &StoreId::root(), streams)
+pub(crate) fn hydrate(doc: &mut Value, streams: StreamsView<'_>) {
+    walk(doc, &StoreId::root(), streams);
 }
 
 /// Recurses, rewriting stream markers and re-basing the nearest-enclosing
 /// store id on the way down.
-fn walk(value: &Value, store_id: &StoreId, streams: &StreamStore) -> Value {
+fn walk(value: &mut Value, store_id: &StoreId, streams: StreamsView<'_>) {
     match value {
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| walk(item, store_id, streams))
-                .collect(),
-        ),
+        Value::Array(items) => {
+            for item in items {
+                walk(item, store_id, streams);
+            }
+        }
         Value::Object(fields) => {
-            if let Some(name) = stream_marker(fields) {
-                return materialize(streams.entries(store_id, name));
+            // Read out of the borrow before the node is replaced: the name
+            // belongs to the very map that is about to go away.
+            if let Some(name) = stream_marker(fields).map(str::to_owned) {
+                *value = materialize(streams.entries(store_id, &name));
+                return;
             }
 
             let context = fields
@@ -57,14 +61,11 @@ fn walk(value: &Value, store_id: &StoreId, streams: &StreamStore) -> Value {
                 .and_then(parse_store_id)
                 .unwrap_or_else(|| store_id.clone());
 
-            Value::Object(
-                fields
-                    .iter()
-                    .map(|(key, field)| (key.clone(), walk(field, &context, streams)))
-                    .collect(),
-            )
+            for field in fields.values_mut() {
+                walk(field, &context, streams);
+            }
         }
-        other => other.clone(),
+        _ => {}
     }
 }
 
@@ -96,14 +97,15 @@ mod tests {
 
     use super::*;
     use crate::envelope::StreamOp;
+    use crate::streams::StreamStore;
 
     #[test]
     fn substitutes_a_marker_at_the_root_of_the_store() {
         let streams = seeded(StoreId::root(), "messages", &["a", "b"]);
 
         assert_eq!(
-            hydrate(
-                &json!({"__musubi_store_id__": [], "messages": {"__musubi_stream__": "messages"}}),
+            hydrated(
+                json!({"__musubi_store_id__": [], "messages": {"__musubi_stream__": "messages"}}),
                 &streams
             ),
             json!({
@@ -118,8 +120,8 @@ mod tests {
         let streams = seeded(StoreId::root(), "messages", &["a"]);
 
         assert_eq!(
-            hydrate(
-                &json!({
+            hydrated(
+                json!({
                     "__musubi_store_id__": [],
                     "deep": {"deeper": {"deepest": {"__musubi_stream__": "messages"}}},
                     "list": [{"__musubi_stream__": "messages"}, 7]
@@ -148,8 +150,8 @@ mod tests {
         }]);
 
         assert_eq!(
-            hydrate(
-                &json!({
+            hydrated(
+                json!({
                     "__musubi_store_id__": [],
                     "messages": {"__musubi_stream__": "messages"},
                     "panel": {
@@ -175,8 +177,8 @@ mod tests {
         let streams = seeded(StoreId::root(), "messages", &["a"]);
 
         assert_eq!(
-            hydrate(
-                &json!({
+            hydrated(
+                json!({
                     "__musubi_store_id__": [],
                     "feed": {
                         "__musubi_async__": true,
@@ -202,8 +204,8 @@ mod tests {
     #[test]
     fn an_unknown_stream_materializes_as_an_empty_array() {
         assert_eq!(
-            hydrate(
-                &json!({"__musubi_store_id__": [], "messages": {"__musubi_stream__": "absent"}}),
+            hydrated(
+                json!({"__musubi_store_id__": [], "messages": {"__musubi_stream__": "absent"}}),
                 &StreamStore::default()
             ),
             json!({"__musubi_store_id__": [], "messages": []})
@@ -215,8 +217,8 @@ mod tests {
         let streams = seeded(StoreId::root(), "messages", &["a"]);
 
         assert_eq!(
-            hydrate(
-                &json!({
+            hydrated(
+                json!({
                     "__musubi_store_id__": [],
                     "two_keys": {"__musubi_stream__": "messages", "other": 1},
                     "not_a_string": {"__musubi_stream__": 7},
@@ -233,6 +235,14 @@ mod tests {
                 "nested_lookalike": {"__musubi_stream__": [{"id": "a"}]}
             })
         );
+    }
+
+    /// Hydrates a standalone tree against the committed streams — what the
+    /// engine does to its working copy.
+    fn hydrated(mut doc: Value, streams: &StreamStore) -> Value {
+        hydrate(&mut doc, StreamsView::committed(streams));
+
+        doc
     }
 
     fn seeded(store_id: StoreId, name: &str, item_keys: &[&str]) -> StreamStore {

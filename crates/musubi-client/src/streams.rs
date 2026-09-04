@@ -5,6 +5,11 @@
 //! This module is a deliberate op-for-op port of
 //! `packages/client/src/streams.ts` — the two clients must materialize
 //! identically or the same page renders differently in each.
+//!
+//! The fold is two-phase — [`StreamStore::stage`], then
+//! [`StreamStore::commit`] — because the patch engine hydrates and the caller
+//! deserializes before the envelope is accepted (§4.3). Ops are folded over
+//! copies of the streams they name; a rejected envelope drops them.
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,21 +45,32 @@ pub(crate) struct StreamStore {
 }
 
 impl StreamStore {
-    /// Folds one envelope's stream ops in array order.
-    pub(crate) fn apply_ops(&mut self, ops: &[StreamOp]) {
+    /// Folds one envelope's stream ops in array order, over **copies** of the
+    /// streams those ops name.
+    ///
+    /// The fold is held off the store because hydration runs before the
+    /// envelope is accepted (§4.3): the walk has to see this envelope's entries
+    /// while the store still holds the last accepted ones, so that a rejected
+    /// envelope leaves the store exactly as it was.
+    ///
+    /// Only the named streams are copied, and a `reset` copies nothing — the
+    /// cost is bounded by the ops' own reach, and by what the hydration walk
+    /// already spends copying those same entries into the state.
+    pub(crate) fn stage(&self, ops: &[StreamOp]) -> StagedStreams {
+        let mut staged = StagedStreams::default();
+
         for op in ops {
             match op {
                 StreamOp::Reset { stream, store_id } => {
-                    self.entries.insert(Self::key(store_id, stream), Vec::new());
+                    // Nothing to copy: the fold starts from empty either way.
+                    staged.entries.insert(key(store_id, stream), Vec::new());
                 }
                 StreamOp::Delete {
                     stream,
                     store_id,
                     item_key,
                 } => {
-                    self.entries
-                        .entry(Self::key(store_id, stream))
-                        .or_default()
+                    self.working(&mut staged, store_id, stream)
                         .retain(|entry| &entry.item_key != item_key);
                 }
                 StreamOp::Insert {
@@ -65,12 +81,27 @@ impl StreamStore {
                     item,
                     limit,
                 } => {
-                    let entries = self.entries.entry(Self::key(store_id, stream)).or_default();
+                    let entries = self.working(&mut staged, store_id, stream);
 
                     apply_insert(entries, item_key, item, *at, *limit);
                 }
             }
         }
+
+        staged
+    }
+
+    /// Adopts an accepted fold. Only the streams it touched are replaced.
+    pub(crate) fn commit(&mut self, staged: StagedStreams) {
+        self.entries.extend(staged.entries);
+    }
+
+    /// Folds one envelope's stream ops straight into the store.
+    #[cfg(test)]
+    pub(crate) fn apply_ops(&mut self, ops: &[StreamOp]) {
+        let staged = self.stage(ops);
+
+        self.commit(staged);
     }
 
     /// Drops every stream whose owning store is gone from the freshly rebuilt
@@ -86,17 +117,84 @@ impl StreamStore {
     /// The materialized entries of one stream, in list order.
     pub(crate) fn entries(&self, store_id: &StoreId, name: &str) -> &[StreamEntry] {
         self.entries
-            .get(&Self::key(store_id, name))
+            .get(&key(store_id, name))
             .map_or(&[], Vec::as_slice)
     }
 
-    /// Builds the lookup key. One `StoreId` clone per access is the price of
-    /// hashing the pair instead of a flattened string.
-    fn key(store_id: &StoreId, name: &str) -> StreamKey {
-        StreamKey {
-            store_id: store_id.clone(),
-            name: name.to_owned(),
+    /// The staged copy of one stream, seeded from the committed entries on
+    /// first touch.
+    fn working<'a>(
+        &self,
+        staged: &'a mut StagedStreams,
+        store_id: &StoreId,
+        name: &str,
+    ) -> &'a mut Vec<StreamEntry> {
+        let key = key(store_id, name);
+
+        staged
+            .entries
+            .entry(key.clone())
+            .or_insert_with(|| self.entries.get(&key).cloned().unwrap_or_default())
+    }
+}
+
+/// One envelope's stream fold, not yet adopted by the store.
+///
+/// Dropping it is what makes a rejected envelope leave stream state untouched;
+/// [`StreamStore::commit`] is what makes an accepted one land.
+#[derive(Debug, Default)]
+pub(crate) struct StagedStreams {
+    entries: HashMap<StreamKey, Vec<StreamEntry>>,
+}
+
+impl StagedStreams {
+    /// The staged entries of one stream, or `None` when this envelope's ops did
+    /// not name it.
+    fn entries(&self, store_id: &StoreId, name: &str) -> Option<&[StreamEntry]> {
+        self.entries.get(&key(store_id, name)).map(Vec::as_slice)
+    }
+}
+
+/// What one hydration walk reads: the committed streams, with an uncommitted
+/// fold layered over them.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamsView<'a> {
+    committed: &'a StreamStore,
+    staged: Option<&'a StagedStreams>,
+}
+
+impl<'a> StreamsView<'a> {
+    /// The committed streams alone — what a cache seed hydrates against, since
+    /// a cached tree carries no stream ops.
+    pub(crate) fn committed(committed: &'a StreamStore) -> Self {
+        Self {
+            committed,
+            staged: None,
         }
+    }
+
+    /// The committed streams with one envelope's staged fold over them.
+    pub(crate) fn staged(committed: &'a StreamStore, staged: &'a StagedStreams) -> Self {
+        Self {
+            committed,
+            staged: Some(staged),
+        }
+    }
+
+    /// The entries one stream slot materializes to.
+    pub(crate) fn entries(&self, store_id: &StoreId, name: &str) -> &'a [StreamEntry] {
+        self.staged
+            .and_then(|staged| staged.entries(store_id, name))
+            .unwrap_or_else(|| self.committed.entries(store_id, name))
+    }
+}
+
+/// Builds the lookup key. One `StoreId` clone per access is the price of
+/// hashing the pair instead of a flattened string.
+fn key(store_id: &StoreId, name: &str) -> StreamKey {
+    StreamKey {
+        store_id: store_id.clone(),
+        name: name.to_owned(),
     }
 }
 

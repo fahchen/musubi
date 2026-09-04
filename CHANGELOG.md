@@ -160,6 +160,19 @@ not in lockstep yet; entries note which surface they affect.
 
 ### Fixed
 
+- **`musubi-client` (Rust)** — An envelope whose state does not match the
+  generated types no longer lands in pieces. The engine used to commit an
+  envelope — bump `version`, patch the shadow tree, publish its `upload_ops` to
+  their subscribers — and only then hand the tree to the caller to deserialize,
+  so codegen drift (`docs/rust-client.md` §11) left the root a version ahead of
+  the snapshot its embedder could read, with upload progress that had run ahead
+  of a state nobody ever saw. Applying is now two-phase: everything that can
+  fail runs against a working copy, the deserialize happens between the phases,
+  and only then does the engine commit and its upload subscribers hear about it.
+  A rejected envelope leaves the version, the tree, the streams and every
+  upload handle exactly as they were, and recovery is a restart rather than a
+  repair. The working copy is not an extra copy per cycle — it is the one
+  hydration already made.
 - **`musubi`** — Channel-mode upload chunks no longer crash the
   `musubi_upload:<ref>` sub-channel. Over a real WebSocket, Phoenix's v2 JSON
   serializer delivers a binary frame's payload as

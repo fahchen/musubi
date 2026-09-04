@@ -85,6 +85,7 @@
 
 mod actor;
 mod cache;
+mod cache_coordinator;
 mod connection;
 mod engine;
 mod envelope;

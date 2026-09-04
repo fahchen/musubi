@@ -242,7 +242,10 @@ ordering with no interleaving**: one producer-agnostic FIFO with one consumer
 means each message is handled to completion before the next is dequeued, so no
 other message can observe a half-applied envelope, and the order the actor sees
 is a single global sequence rather than a per-source race resolved by `select!`
-branch priority.
+branch priority. That covers the gaps *between* messages; the one inside a
+single envelope is §4.3's job — the engine stages an envelope and commits it
+only once the state has deserialized, so a rejected envelope leaves nothing
+half-applied either.
 
 Note what that total order is *not*: it is **inbox** order, not frame order, so
 it does not buy reply-before-patch ordering (BDR-0009), which is **not** a
@@ -450,21 +453,45 @@ invalidation). That optimization is additive and does not change the API.
 
 ### 4.3 Application order and atomicity
 
-Per accepted envelope, in order:
+An envelope is applied in two phases, with the typed deserialize between them.
+Everything that can fail happens before anything moves.
+
+**Stage** — against a working copy, mutating nothing:
 
 1. Validate the envelope (§4.4) and the version (§4.5).
-2. Apply `ops` to the shadow doc via `json_patch::patch`, which is atomic:
-   on any error the document is left untouched — the previous tree stays
-   authoritative — and the client enters version-mismatch recovery (§9).
-3. Apply `stream_ops` in array order (§5).
-4. Apply `upload_ops` into the root's upload registry, in array order (§10).
-5. Rebuild derived indices: `store_id -> pointer`, prune stream/upload state
-   for vanished `store_id`s (BDR-0011).
-6. Hydrate + deserialize (§4.6), publish the new `Arc<S::State>` to the
-   `updates()` senders.
-7. Dispatch `events` (§8) into the `events()` senders — after state
+2. Apply `ops` to a copy of the shadow doc via `json_patch::patch`, which is
+   atomic: on any error the copy is dropped, the previous tree stays
+   authoritative, and the client enters version-mismatch recovery (§9).
+3. Rebuild `store_id -> pointer` off the working copy.
+4. Fold `stream_ops` in array order (§5) over copies of the streams those ops
+   name — only those, and a `reset` copies nothing.
+5. Hydrate the working copy in place (§4.6).
+
+**Deserialize** — the last step that can fail:
+
+6. Deserialize the hydrated tree and publish the new `Arc<S::State>` to the
+   `updates()` senders. A tree that does not match the generated types is
+   codegen drift (§11): the staged work is dropped whole, so the engine is
+   still on the previous version, its shadow doc and streams are untouched, no
+   upload subscriber has heard about the envelope, and recovery (§9) is a
+   restart rather than a repair.
+
+**Commit** — nothing here can fail:
+
+7. Adopt the tree, the index and the stream fold, and set
+   `version = envelope.version`.
+8. Apply `upload_ops` into the root's upload registry, in array order (§10) —
+   the first thing outside the engine to learn the envelope was accepted — then
+   prune stream/upload state for vanished `store_id`s (BDR-0011).
+9. Dispatch `events` (§8) into the `events()` senders — after state
    publication.
-8. Set `version = envelope.version`.
+
+The working copy is not an extra copy: hydration used to allocate one and now
+rewrites this one in place, so a cycle still allocates one tree. What commit
+pays instead is a *replay* — the ops are applied a second time, to the shadow
+doc, because the copy they were validated on has since become the hydrated
+state. That is a delta-sized cost, and the same ops on the same tree cannot
+fail twice.
 
 ### 4.4 Envelope validation
 
@@ -531,14 +558,17 @@ nearest enclosing `__musubi_store_id__`, and rewrites:
   async node's `result` are still rewritten by the same walk, which is what
   makes `stream_async` render as `AsyncResult<Vec<Item>>`.
 
-v1 hydrates into an owned copy (one extra deep copy per cycle, on top of the
-deserialize copy). The known optimization, deferred: implement hydration as a
-`serde::Deserializer` adapter wrapping `&Value` that substitutes stream arrays
-in place — zero extra copies, but ~300 lines of `Deserializer` plumbing. Not
-worth it before there is a profile.
+v1 hydrates one owned copy per cycle, on top of the deserialize copy: the
+working copy §4.3 stages the envelope on is the tree the walk rewrites, so the
+walk itself allocates nothing beyond the arrays it substitutes. The known
+optimization, deferred: implement hydration as a `serde::Deserializer` adapter
+wrapping `&Value` that substitutes stream arrays without a tree copy at all —
+but ~300 lines of `Deserializer` plumbing. Not worth it before there is a
+profile.
 
-The shadow doc itself is **never** hydrated in place: patch pointers address
-the wire tree, so the wire tree must stay pristine across cycles.
+The shadow doc itself is **never** hydrated: patch pointers address the wire
+tree, so the wire tree must stay pristine across cycles. Only the working copy
+is rewritten, and it is dropped at the end of the cycle.
 
 ---
 

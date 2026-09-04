@@ -17,8 +17,9 @@ use phoenix_channel::{Connector, PhoenixSocket, Spawner, Timer};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::actor::{Actor, ActorMsg, CacheConfig, ConnectionInner, MountRequest};
+use crate::actor::{Actor, ActorMsg, ConnectionInner, MountRequest};
 use crate::cache::{CacheStore, DEFAULT_CACHE_GC_TIME};
+use crate::cache_coordinator::CacheConfig;
 use crate::error::{MusubiError, Result};
 use crate::generated::Store;
 use crate::mounted::{Mounted, RootCell};

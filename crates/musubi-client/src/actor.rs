@@ -7,18 +7,16 @@
 //! channel incarnation, stamped with the generation that was current when the
 //! channel was attached — anything from a superseded incarnation is dropped.
 //!
-//! The mount cache (§6.4) lives here too, for the same reason: seeding,
-//! throttled writes and armed evictions are all per-root decisions taken
-//! against the registry, so they are `ActorMsg`s and cache slots on this task
-//! rather than a subsystem with its own state to keep in step. The `CacheStore`
-//! itself is the embedder's and is always touched from a spawned task, never on
-//! the actor.
+//! The mount cache (§6.4) is driven from here but does not live here: the
+//! actor decides *when* a root reads, writes back or ages out its slot, and
+//! [`CacheCoordinator`] owns the slots and the timers those decisions arm. What
+//! stays on the root is only what the cache does not own — the slot the mount
+//! identity resolves to, and whether a seed made the root renderable early.
 
 use std::any::Any;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
@@ -29,8 +27,9 @@ use phoenix_channel::{
 };
 use serde_json::{Value, json};
 
-use crate::cache::{CACHE_WRITE_THROTTLE, CacheEntry, CacheStore, cache_key, now_ms};
-use crate::engine::PatchEngine;
+use crate::cache::CacheEntry;
+use crate::cache_coordinator::{CacheConfig, CacheCoordinator};
+use crate::engine::{PatchEngine, StagedPatch};
 use crate::envelope::PatchEnvelope;
 use crate::error::{CommandError, MusubiError, Result};
 use crate::generated::StoreId;
@@ -214,47 +213,12 @@ pub(crate) struct Actor {
     socket: PhoenixSocket,
     base_topic: String,
     spawner: Arc<dyn Spawner>,
-    timer: Arc<dyn Timer>,
-    cache: Option<CacheConfig>,
+    cache: CacheCoordinator,
     tx: UnboundedSender<ActorMsg>,
     rx: UnboundedReceiver<ActorMsg>,
     roots: HashMap<Arc<str>, Root>,
-    /// Throttled writes in flight, keyed by cache slot.
-    cache_writes: HashMap<Arc<str>, CacheWriter>,
-    /// Armed evictions, keyed by cache slot; the value is the only epoch whose
-    /// [`ActorMsg::CacheEvict`] still counts.
-    cache_evictions: HashMap<Arc<str>, u64>,
-    next_eviction_epoch: u64,
     next_command_id: u64,
     closed: bool,
-}
-
-/// The connection-wide cache settings (`docs/rust-client.md` §6.4).
-#[derive(Clone)]
-pub(crate) struct CacheConfig {
-    pub(crate) store: Arc<dyn CacheStore>,
-    pub(crate) buster: Arc<str>,
-    pub(crate) gc_time: Duration,
-}
-
-impl CacheConfig {
-    fn gc_ms(&self) -> u64 {
-        u64::try_from(self.gc_time.as_millis()).unwrap_or(u64::MAX)
-    }
-
-    /// Whether an entry has aged out of the gc window, or was written under a
-    /// different shape token.
-    fn is_usable(&self, entry: &CacheEntry) -> bool {
-        entry.buster == *self.buster && now_ms().saturating_sub(entry.updated_at) <= self.gc_ms()
-    }
-}
-
-/// One cache slot's trailing throttle: the latest tree, and whether a flush is
-/// already armed.
-#[derive(Default)]
-struct CacheWriter {
-    pending: Option<CacheEntry>,
-    armed: bool,
 }
 
 impl Actor {
@@ -269,17 +233,13 @@ impl Actor {
         rx: UnboundedReceiver<ActorMsg>,
     ) -> Self {
         Self {
+            cache: CacheCoordinator::new(cache, Arc::clone(&spawner), timer, tx.clone()),
             socket,
             base_topic,
             spawner,
-            timer,
-            cache,
             tx,
             rx,
             roots: HashMap::new(),
-            cache_writes: HashMap::new(),
-            cache_evictions: HashMap::new(),
-            next_eviction_epoch: 0,
             next_command_id: 0,
             closed: false,
         }
@@ -323,8 +283,8 @@ impl Actor {
                 key,
                 entry,
             } => self.cache_seed(&root_id, &key, entry),
-            ActorMsg::CacheFlush { key } => self.cache_flush(&key),
-            ActorMsg::CacheEvict { key, epoch } => self.cache_evict(&key, epoch),
+            ActorMsg::CacheFlush { key } => self.cache.flush(&key),
+            ActorMsg::CacheEvict { key, epoch } => self.cache.evict(&key, epoch),
             ActorMsg::Disconnect { ack } => self.disconnect(ack).await,
             // Handled by the loop so it can break.
             ActorMsg::Shutdown => {}
@@ -352,10 +312,7 @@ impl Actor {
         let topic: Arc<str> = Arc::from(format!("{}:{}", self.base_topic, root_id));
         // The slot this mount reads and writes. `None` when the connection has
         // no cache store, which is what makes every cache path below a no-op.
-        let key: Option<Arc<str>> = self
-            .cache
-            .as_ref()
-            .map(|_| Arc::from(cache_key(request.module, &request.id, &request.params)));
+        let key = self.cache.key(request.module, &request.id, &request.params);
 
         self.roots.insert(
             Arc::clone(&root_id),
@@ -381,11 +338,7 @@ impl Actor {
         );
 
         if let Some(key) = key {
-            // A re-mount cancels the eviction its own unmount armed.
-            self.cache_evictions.remove(&key);
-            // Spawned rather than awaited: the read races the join below, so a
-            // slow store delays the seed, never the revalidation (§6.4).
-            self.read_cache(&root_id, key);
+            self.cache.on_mount(&root_id, key);
         }
 
         self.attach_and_join(&root_id).await;
@@ -778,29 +731,8 @@ impl Actor {
             return;
         }
 
-        match root.engine.apply(&envelope) {
-            Ok(state) => {
-                if let Err(error) = self.publish(root_id, &envelope, &state) {
-                    // A silent partial state is worse than a loud stall, so the
-                    // envelope fails and the last-good rendering is kept. The
-                    // waiting mounts learn it is codegen drift (§11) before the
-                    // root goes into recovery.
-                    //
-                    // This is *not* a rollback, and `PatchEngine::apply`'s
-                    // atomicity does not reach here: the engine has already
-                    // committed this envelope — `version` bumped, the tree
-                    // patched, the upload ops published to their subscribers —
-                    // so the root is now a version ahead of the snapshot the
-                    // embedder can read, and its upload handles reflect a state
-                    // that was never published. `recover` below is what closes
-                    // the gap: the rejoin's initial patch replaces the whole
-                    // tree from version 0. Making the boundary atomic (publish
-                    // before commit) is the real fix.
-                    tracing::error!(root_id = %root_id, %error, "root state did not match the generated types");
-                    self.fail_mounts_with(root_id, error);
-                    self.recover(root_id).await;
-                }
-            }
+        let staged = match root.engine.prepare(&envelope) {
+            Ok(staged) => staged,
             // §4.5: the initial envelope must be `0 -> 1`. Nothing is recovered
             // by rejoining a root that never started, so the mount just fails —
             // unless nothing was waiting, in which case only a rejoin can move
@@ -812,13 +744,33 @@ impl Actor {
                 if stalled {
                     self.recover(root_id).await;
                 }
+
+                return;
             }
             // A version gap or a failed op both mean client and server
             // diverged; the tree is untouched, so recovery keeps rendering it.
             Err(error) => {
                 tracing::warn!(%error, "patch envelope rejected; recovering the root");
                 self.recover(root_id).await;
+
+                return;
             }
+        };
+
+        if let Err(error) = self.publish(root_id, &envelope, staged) {
+            // A silent partial state is worse than a loud stall, so the
+            // envelope fails and the last-good rendering is kept. The waiting
+            // mounts learn it is codegen drift (§11) before the root goes into
+            // recovery.
+            //
+            // Nothing of this envelope survives: the deserialize ran against
+            // the staged tree, which went out with the failure, so the engine
+            // is still on the previous version and no upload subscriber was
+            // told otherwise. Recovery below is how the root gets moving again,
+            // not how it is repaired.
+            tracing::error!(root_id = %root_id, %error, "root state did not match the generated types");
+            self.fail_mounts_with(root_id, error);
+            self.recover(root_id).await;
         }
     }
 
@@ -852,8 +804,14 @@ impl Actor {
         }
     }
 
-    /// Publishes an accepted envelope: state first, then its push events, then
-    /// the mounts that were waiting for it (§4.3 steps 6–7).
+    /// Accepts a prepared envelope: deserialize, commit, then its push events,
+    /// then the mounts that were waiting for it (§4.3 steps 6–7).
+    ///
+    /// Deserializing runs **before** the commit, and it is the last thing that
+    /// can fail. That ordering is the whole atomicity story: on failure the
+    /// staged tree is dropped here, so the engine is still on the previous
+    /// version, its shadow document and streams are untouched, and no upload
+    /// subscriber has been told about an envelope the embedder never saw.
     ///
     /// Returns [`MusubiError::Decode`] when the tree did not match the
     /// generated types, which is codegen drift (§11).
@@ -861,7 +819,7 @@ impl Actor {
         &mut self,
         root_id: &Arc<str>,
         envelope: &PatchEnvelope,
-        state: &Value,
+        staged: StagedPatch<'_>,
     ) -> Result<()> {
         let Some(root) = self.roots.get_mut(root_id) else {
             return Ok(());
@@ -870,12 +828,13 @@ impl Actor {
         // The root's own subtree is what failed, so the reported store is the
         // root path even when a nested store node is the culprit.
         root.sink
-            .publish(state)
+            .publish(staged.state())
             .map_err(|source| MusubiError::Decode {
                 store_id: StoreId::root(),
                 source,
             })?;
 
+        root.engine.commit(staged);
         root.published = true;
         root.recovering = false;
         // Only an *accepted envelope* makes the root live — a cache seed
@@ -889,7 +848,11 @@ impl Actor {
 
         self.resolve_mounts(root_id);
         self.flush_dispatches(root_id);
-        self.schedule_cache_write(root_id);
+
+        if let Some(root) = self.roots.get(root_id) {
+            self.cache
+                .on_publish(root.cache_key.as_ref(), root.engine.document());
+        }
 
         Ok(())
     }
@@ -1038,7 +1001,7 @@ impl Actor {
         reject_commands(&mut root, &reason);
 
         if let Some(key) = root.cache_key.take() {
-            self.cache_teardown(key);
+            self.cache.on_teardown(key, self.closed);
         }
 
         for reply in root.pending_mounts.drain(..) {
@@ -1065,37 +1028,7 @@ impl Actor {
         let _ = ack.send(());
     }
 
-    // -- Cache (`docs/rust-client.md` §6.4) ---------------------------------
-
-    /// Reads one root's cache slot off the actor task.
-    ///
-    /// Staleness is decided here rather than in [`cache_seed`](Self::cache_seed)
-    /// so that dropping an unusable entry costs the actor nothing, and so the
-    /// entry that reaches the actor is already the one it may seed.
-    fn read_cache(&self, root_id: &Arc<str>, key: Arc<str>) {
-        let Some(cache) = self.cache.clone() else {
-            return;
-        };
-        let root_id = Arc::clone(root_id);
-        let tx = self.tx.clone();
-
-        self.spawner.spawn(Box::pin(async move {
-            let Some(entry) = cache.store.get(&key).await else {
-                return;
-            };
-
-            if !cache.is_usable(&entry) {
-                cache.store.evict(&key).await;
-                return;
-            }
-
-            let _ = tx.unbounded_send(ActorMsg::CacheSeed {
-                root_id,
-                key,
-                entry,
-            });
-        }));
-    }
+    // -- Cache seeding (`docs/rust-client.md` §6.4) -------------------------
 
     /// Seeds one root from its cache entry: the shadow document is adopted and
     /// published, and every mount waiting on the root resolves against it —
@@ -1137,7 +1070,7 @@ impl Actor {
             root.engine.discard_seed();
 
             if let Some(key) = root.cache_key.clone() {
-                self.evict_now(key);
+                self.cache.discard(key);
             }
 
             return;
@@ -1147,151 +1080,6 @@ impl Actor {
         root.seeded = true;
 
         self.resolve_mounts(root_id);
-    }
-
-    /// Queues one root's tree for persistence, at most one write per
-    /// [`CACHE_WRITE_THROTTLE`] per slot, always the latest tree.
-    ///
-    /// The *wire* tree is what is stored: seeding is then the same marker
-    /// substitution the engine already does, with no second decoding path.
-    fn schedule_cache_write(&mut self, root_id: &Arc<str>) {
-        let Some(cache) = self.cache.clone() else {
-            return;
-        };
-        let Some(root) = self.roots.get(root_id) else {
-            return;
-        };
-        let Some(key) = root.cache_key.clone() else {
-            return;
-        };
-        let entry = CacheEntry {
-            data: root.engine.document().clone(),
-            updated_at: now_ms(),
-            buster: cache.buster.to_string(),
-        };
-
-        let writer = self.cache_writes.entry(Arc::clone(&key)).or_default();
-
-        writer.pending = Some(entry);
-
-        if writer.armed {
-            return;
-        }
-
-        writer.armed = true;
-
-        let timer = Arc::clone(&self.timer);
-        let tx = self.tx.clone();
-
-        self.spawner.spawn(Box::pin(async move {
-            timer.sleep(CACHE_WRITE_THROTTLE).await;
-
-            let _ = tx.unbounded_send(ActorMsg::CacheFlush { key });
-        }));
-    }
-
-    /// Writes one slot's latest tree, ending its throttle window.
-    fn cache_flush(&mut self, key: &Arc<str>) {
-        let Some(writer) = self.cache_writes.get_mut(key) else {
-            return;
-        };
-
-        writer.armed = false;
-
-        let Some(entry) = writer.pending.take() else {
-            // Nothing accumulated during the window: the slot is idle, so it
-            // stops costing a map entry.
-            self.cache_writes.remove(key);
-            return;
-        };
-
-        self.write_now(Arc::clone(key), entry);
-    }
-
-    /// Flushes and arms the gc timer for a slot whose root has been torn down.
-    ///
-    /// The remaining window is measured from the entry's own `updated_at`, so
-    /// an entry that was already half-expired when the root unmounted is not
-    /// given a fresh full lifetime.
-    fn cache_teardown(&mut self, key: Arc<str>) {
-        let pending = self
-            .cache_writes
-            .remove(&key)
-            .and_then(|writer| writer.pending);
-
-        let Some(cache) = self.cache.clone() else {
-            return;
-        };
-
-        // A disconnect keeps whatever was flushed: the entry ages out on its
-        // own, and a reconnecting app can seed from it again.
-        if self.closed {
-            if let Some(entry) = pending {
-                self.write_now(key, entry);
-            }
-
-            return;
-        }
-
-        self.next_eviction_epoch += 1;
-        let epoch = self.next_eviction_epoch;
-
-        self.cache_evictions.insert(Arc::clone(&key), epoch);
-
-        let timer = Arc::clone(&self.timer);
-        let tx = self.tx.clone();
-        let gc_ms = cache.gc_ms();
-
-        self.spawner.spawn(Box::pin(async move {
-            if let Some(entry) = pending {
-                cache.store.put(&key, entry).await;
-            }
-
-            let age = cache
-                .store
-                .get(&key)
-                .await
-                .map_or(0, |entry| now_ms().saturating_sub(entry.updated_at));
-
-            timer
-                .sleep(Duration::from_millis(gc_ms.saturating_sub(age)))
-                .await;
-
-            let _ = tx.unbounded_send(ActorMsg::CacheEvict { key, epoch });
-        }));
-    }
-
-    /// Drops a slot whose gc window elapsed with no root holding it.
-    fn cache_evict(&mut self, key: &Arc<str>, epoch: u64) {
-        // A re-mount of the same slot dropped the epoch, which is how it
-        // cancels the eviction its own unmount armed.
-        if self.cache_evictions.get(key) != Some(&epoch) {
-            return;
-        }
-
-        self.cache_evictions.remove(key);
-        self.evict_now(Arc::clone(key));
-    }
-
-    /// Fire-and-forget write. Failures are the store's to swallow (§6.4), so
-    /// nothing here can throw into the patch path.
-    fn write_now(&self, key: Arc<str>, entry: CacheEntry) {
-        let Some(cache) = self.cache.clone() else {
-            return;
-        };
-
-        self.spawner
-            .spawn(Box::pin(async move { cache.store.put(&key, entry).await }));
-    }
-
-    /// Fire-and-forget removal.
-    fn evict_now(&self, key: Arc<str>) {
-        let Some(cache) = self.cache.clone() else {
-            return;
-        };
-
-        self.spawner
-            .spawn(Box::pin(async move { cache.store.evict(&key).await }));
     }
 }
 

@@ -1009,6 +1009,79 @@ fn state_that_does_not_match_the_generated_types_fails_the_mount_with_decode() {
 }
 
 #[test]
+fn an_envelope_the_generated_types_reject_lands_none_of_what_travelled_with_it() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+    let mut uploads = avatar.updates();
+    let mut updates = cart.updates();
+
+    // The replay of the state the mount already published.
+    assert_eq!(drain(&mut updates).len(), 1);
+
+    // `title` is gone (§11) — and a stream op and an upload op are travelling
+    // on the same envelope, neither of which the deserialize gets to see.
+    let mut payload = envelope(
+        1,
+        2,
+        json!([{
+            "op": "replace",
+            "path": "",
+            "value": {"__musubi_store_id__": [], "messages": {"__musubi_stream__": "messages"}}
+        }]),
+    );
+
+    payload["stream_ops"] = json!([{
+        "op": "insert", "stream": "messages", "store_id": [], "item_key": "m-2",
+        "at": -1, "item": {"id": "m-2", "body": "leaked"}, "limit": null
+    }]);
+    payload["upload_ops"] = json!([{
+        "op": "add", "upload": "avatar", "store_id": [], "ref": "u_1",
+        "entry": {
+            "ref": "u_1", "client_name": "me.png", "client_size": 1234,
+            "client_type": "image/png", "progress": 0, "status": "pending",
+            "errors": []
+        }
+    }]);
+
+    server.push_event(&join, "patch", payload);
+    harness.pump();
+
+    // The last-good rendering is kept, and nothing else moved either: an
+    // upload subscriber must not run ahead of an envelope the embedder never
+    // saw.
+    assert!(matches!(
+        cart.snapshot(),
+        Some(state) if state.title == "Cart" && state.messages.len() == 1
+    ));
+    assert!(drain(&mut updates).is_empty(), "no state was published");
+    assert!(avatar.snapshot().entry("u_1").is_none());
+    assert!(drain(&mut uploads).is_empty(), "no upload op was published");
+
+    // The root recovers, and the rejoin's fresh initial patch renders without a
+    // trace of the rejected envelope's stream op.
+    let sent = server.sent(&mut harness);
+    assert!(matches!(
+        sent.as_slice(),
+        [
+            Message { event: leave, .. },
+            Message { event: rejoin, .. },
+        ] if leave == "phx_leave" && rejoin == "phx_join"
+    ));
+
+    server.reply(&sent[1], ReplyStatus::Ok, json!({"root_id": ROOT_ID}));
+    harness.pump();
+    server.push_event(&sent[1], "patch", initial_envelope());
+    harness.pump();
+
+    assert!(matches!(
+        cart.snapshot(),
+        Some(state) if matches!(state.messages.as_slice(), [message] if message.id == "m-1")
+    ));
+}
+
+#[test]
 fn a_rejected_envelope_on_a_published_root_awaiting_its_initial_patch_recovers() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
