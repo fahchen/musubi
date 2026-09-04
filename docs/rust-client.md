@@ -1435,6 +1435,16 @@ store leaves the freshly rebuilt index are pruned alongside streams, which ends
 their `updates()` streams (BDR-0011 fresh-mount semantics; uploads are not
 resumable per BDR-0003). Unmounting the root clears the whole registry.
 
+Both are **recorded**, not merely emptied, exactly as `Mounted::events()`
+records its own closure: a subscription taken *after* a prune or a teardown
+is an already-ended stream, never one waiting on a publish that can no longer
+come. The record lives on the registry as well as on the cell, because a
+retained `Upload` and a fresh `Mounted::upload(…)` fail differently — the
+first still holds the closed cell, while the second asks a registry that no
+longer has one and would otherwise be handed a brand-new open one. A pruned
+store's tombstone lifts the moment the store is back in the index, so a store
+that comes and goes gets a live handle each time it returns.
+
 Types are the wire types: `UploadOp` is a `#[serde(tag = "op")]` enum over the
 seven variants with `error.ref` optional, `UploadAccept` is
 `Any | Extensions(Vec<String>)`, and `UploadErrorCode` is an **open** enum —
@@ -1484,8 +1494,18 @@ message is subsystem-agnostic: it answers with the raw push outcome, and the
 upload control plane maps it onto `TransferError` itself, so nothing about
 uploads is baked into the actor. Chunk sub-channels are opened straight on the
 `PhoenixSocket`: they are per-entry, short-lived, and the actor has no business
-tracking them. The two external-mode relays are *detached* pushes (no reply
-awaited), matching the TS client.
+tracking them. External-mode progress is **coalesced** rather than relayed
+report-for-report: `UploadProgress::report` overwrites a single pending value,
+and a relay driven on the caller's own task (no spawner) keeps at most one
+`upload_progress` push in flight, awaiting its reply before sending the newest
+value recorded meanwhile. That is deliberate — it is the only producer in this
+client whose rate an app controls, and an unthrottled one starves the socket
+read loop into a spurious reconnect mid-upload. The transfer's outcome is a
+barrier in the same relay: the final `100` (or `upload_error`) is pushed last,
+detached, since nothing follows it and a transfer must not hang on an
+acknowledgement no one reads. A failure discards progress the relay has not
+sent yet — the server moves an entry it already failed back to `uploading` for
+one — and a cancelled entry relays nothing at all, not even the `100`.
 
 **Preflight.** `select` sets `status = selecting`, clears the handle's errors,
 and pushes `allow_upload` with one offered entry per file, `client_ref` being
@@ -1496,6 +1516,28 @@ rejected selection still ends in `status = error`. Entries are seeded in
 selection order (the reply's map is sorted by `client_ref`) and merge with the
 `{op: add}`s that arrive **after** the reply (BDR-0009) — whichever lands
 first, there is exactly one entry.
+
+A preflight that does not finish leaves the handle in `status = error`, never
+in `selecting`: a rejected push, a timeout, a disconnect, a malformed reply, or
+the `select` future simply being dropped. The caller gets the `Err`, but it is
+rarely the only one watching — a spinner bound to `status` would otherwise
+never resolve — so the transition is a guard's `Drop` rather than code on the
+error path. An accepted entry keyed by a `client_ref` this call never offered
+is a `Protocol` error rather than a silently skipped entry: there is no file to
+transfer and no entry for an error to attach to, and a reply made only of those
+would finish with no entries, no errors and a handle still reading `selecting`.
+
+**Starting.** `start` transfers each entry **once**. A terminal outcome —
+success, failure, cancellation, or the `start` future being dropped — consumes
+the entry's transport state, so a later `start` moves only what is still
+outstanding. Without that a repeat call replays the transfer: the preflight
+token verifies statelessly inside its 600s window and the server opens a fresh
+temp file per join, so every replay orphans the file before it. A second
+`start` while one is running is refused with `TransferError::AlreadyStarted`
+rather than racing it — both would join `musubi_upload:<ref>`, and attaching
+replaces the socket's registry entry and bumps the generation, so the loser is
+disconnected, its pushes go stale, and its cleanup clears the channel the
+winner is still using.
 
 **Channel mode (BDR-0026).** `phoenix-channel` gained serializer v2 binary
 framing for this: `BinaryPush` (kind `0`, four length-prefixed header fields,
@@ -1545,18 +1587,44 @@ untouched: the server answers with `{op: cancel}`, which *deletes* the entry, so
 there is no cancelled state to observe. `reset` cancels everything, clears the
 entries and errors, and returns the handle to `idle`.
 
+Raising the signal is **every** retirement path's job, not just this one's. A
+transfer clones the bytes, the mode and the signal before its first await and
+holds an `Arc` of the cell, so deleting the transport entry does not stop it:
+the server-driven `{op: cancel}` / `{op: reset}`, a prune, and the root's own
+teardown all abort through the same helper, which raises the signal and leaves
+the sub-channel before removing. Aborting a request already in flight is the
+entire purpose of `CancelSignal` — without it an external-mode transfer runs to
+completion and the file lands in the destination bucket after the user
+cancelled it or navigated away. Two windows are closed alongside it: a
+preflight whose reply lands *after* its cell was retired is refused rather than
+re-populating it (`Unmounted`), and a sub-channel opened after its entry was
+already removed is left immediately, since nothing else knows it exists.
+
 **Failures.** Upload-specific ones are `TransferError` (`Rejected`, `Chunk`,
-`Cancelled`, `NoUploader`, `Uploader`), reached through `MusubiError::Transfer`;
-everything shared with the rest of the client stays on `MusubiError` (`Join`,
-`Timeout`, `NotConnected`, `Disconnected`). `start` returns the first failure
-and ends the handle in `status = error` — which also covers an entry the
-*server* failed with `{op: error}`, where no transfer here returned anything.
+`Cancelled`, `AlreadyStarted`, `NoUploader`, `Uploader`), reached through
+`MusubiError::Transfer`; everything shared with the rest of the client stays on
+`MusubiError` (`Join`, `Timeout`, `NotConnected`, `Disconnected`). `start`
+returns the first failure and ends the handle in `status = error` — which also
+covers an entry the *server* failed with `{op: error}`, where no transfer here
+returned anything.
 
 **Recovery.** On `soft_reset`, a rejoin or a version gap the handles are
 **kept**, matching the TS client. Uploads are not resumable (BDR-0003): an
 in-flight entry the server dropped is only cleared once its store leaves the
 index or the server emits a `reset`, and a transfer that was running fails on
 its own push — disconnected, or the push timeout — rather than being retried.
+
+**Two deliberate divergences from the reference client.** Both are gaps in
+`packages/client/src/uploads.ts` rather than port regressions, and both are
+fixed here rather than reproduced. First, its op-driven cancel
+(`uploads.ts:330-334`) deletes the internal entry without touching the entry's
+`abortController`, while its own client-driven `cancel()` (`:229-231`) does
+abort — so a server-driven cancellation does not stop a transfer in flight.
+Second, its `select` (`:103-107`) sets `status = "selecting"` and can then
+throw without writing a status, while its `start()` (`:211-213`) catches and
+sets `error` — the same asymmetry. The Rust client raises cancellation on every
+retirement path and fails the handle on every preflight exit; the TypeScript
+client should follow.
 
 **Not supported.** The crate reads no files and streams nothing off disk: you
 hand it an `UploadFile`, so entry bytes are held in memory for the duration of

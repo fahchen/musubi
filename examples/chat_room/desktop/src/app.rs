@@ -19,10 +19,11 @@
 //! | Instant relaunch | SWR mount cache (§6.4) over `cache_store::FileCacheStore` |
 //!
 //! The one rule the whole file is organized around: **state renders from
-//! [`Mounted::updates`], never from a command reply.** A reply resolves before
-//! the patch it caused is applied (BDR-0009), so replies only ever write the
-//! one-line `feedback` string; every field the user reads comes off the
-//! snapshot.
+//! [`Mounted::updates`], never from a command reply.** A reply is not gated on
+//! the patch it caused and carries no ordering relationship to it — BDR-0009
+//! orders the *server's* frames, not the client's inbox — so replies only ever
+//! write the one-line `feedback` string; every field the user reads comes off
+//! the snapshot.
 //!
 //! # Parity with `ui/`
 //!
@@ -409,11 +410,14 @@ impl ChatWindow {
 
     /// Dispatches `send_message` with the composer's contents.
     ///
-    /// The reply is `{queued: true}` and arrives **before** the row does
-    /// (BDR-0009: reply, then the `"patch"` push, then the `start_async` task's
-    /// own patch). That is the contract, not a bug to paper over, so the
-    /// feedback line says "queued" and the row shows up one envelope later.
-    /// There is no `command_and_wait_for_patch` helper, by design.
+    /// The reply is `{queued: true}` and says **nothing** about the row. It is
+    /// not gated on the patch it caused: BDR-0009 orders the frames the server
+    /// writes (reply, then the `"patch"` push, then the `start_async` task's
+    /// own patch), but replies and patches reach this client through separate
+    /// tasks, so either can be observed first. That is the contract, not a bug
+    /// to paper over, so the feedback line says "queued" and the row shows up
+    /// when its snapshot does. There is no `command_and_wait_for_patch`
+    /// helper, by design.
     fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(
             window,
