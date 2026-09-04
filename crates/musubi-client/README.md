@@ -63,10 +63,11 @@ branch.
 ## Scope
 
 Uploads are both observed and driven. `upload_ops` are folded into per-store
-handles you read with `Mounted::upload(&store_id, name)` — `snapshot()` and
-`updates()`, same as state — and the same handle carries `select()`, `start()`,
-`cancel()` and `reset()`. The state slot itself stays the inert `UploadSlot`,
-which carries the handle's name. The crate reads no files: you hand it an
+handles you read with `Mounted::upload(&store_id, name)` — the same
+`snapshot()`/`updates()` pair as state, though an upload's stream is a queue of
+per-envelope handles rather than a latest-value cell — and the same handle
+carries `select()`, `start()`, `cancel()` and `reset()`. The state slot itself
+stays the inert `UploadSlot`, which carries the handle's name. The crate reads no files: you hand it an
 `UploadFile` (bytes plus name and content type), and an external destination is
 your own `Uploader` registered on the builder. Reconnect is reconnect-only: a
 version gap or a rejoin keeps the last-good rendering and waits for a fresh

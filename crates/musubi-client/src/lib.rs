@@ -43,10 +43,13 @@
 //! # Concurrency
 //!
 //! One actor owns the socket and every mounted root; the public handles are
-//! cheap `Clone` values over its inbox. State reaches the embedder through a
-//! per-root snapshot cell and per-subscription channels, never through the
-//! inbox, and there is no callback registry — a subscription **is** a `Stream`,
-//! and dropping it unsubscribes.
+//! cheap `Clone` values over its inbox. State and mount status reach the
+//! embedder through per-root **latest-value cells** — `snapshot()`/`status()`
+//! read the cell, `updates()`/`status_updates()` subscribe to it and deliver
+//! whatever it holds, never a backlog — while the discrete-item subscriptions
+//! (`events()`, upload `updates()`) stay unbounded queues. Neither goes back
+//! through the inbox, and there is no callback registry: a subscription **is**
+//! a `Stream`, and dropping it unsubscribes.
 //!
 //! # Generated code
 //!
@@ -89,6 +92,7 @@ mod error;
 pub mod generated;
 mod hydrate;
 mod index;
+mod latest;
 mod mounted;
 mod patch;
 mod streams;

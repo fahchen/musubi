@@ -268,42 +268,69 @@ chunk rather than the whole transfer only because chunks are sequential with one
 push in flight (§10.2) — the actor is never stalled for the length of a file,
 but a large `chunk_size` on a slow link is a real stall for every other root.
 
-**No backpressure, anywhere.** Every channel here is
-`futures_channel::mpsc::unbounded`: the actor's inbox, and every `updates()` /
-`status_updates()` / `events()` / upload `updates()` subscription. Sends are
-therefore non-blocking and infallible-until-closed, which is what lets the actor
-publish without ever awaiting a consumer — but it means there is **no
-backpressure path to the server**. A consumer that stops polling its stream does
-not slow the actor, does not slow the socket, and does not make the server send
-less; its queue simply grows without bound until the process runs out of memory.
-An embedder that cannot keep up must drop the stream (which unsubscribes, and
-the sender is pruned at the next send) and re-read `snapshot()`, or coalesce on
-its own side. The same applies to a stalled actor: the inbox grows while a
-handler is blocked.
+**No backpressure, anywhere.** Sends are non-blocking and
+infallible-until-closed, which is what lets the actor publish without ever
+awaiting a consumer — but it means there is **no backpressure path to the
+server**. A consumer that stops polling its stream does not slow the actor, does
+not slow the socket, and does not make the server send less. What that costs
+depends on the kind of subscription, and the two kinds are deliberately
+different:
+
+- **Latest-value** (`updates()`, `status_updates()`). One value, not a queue:
+  every item is a whole root that subsumes the one before it, so a stalled
+  consumer costs one slot and one waker, whatever the envelope rate. Falling
+  behind is not an error, it is the contract — the next poll yields the current
+  value and the skipped ones are gone. Nothing reads intermediates: v1 publishes
+  one whole-root snapshot per envelope and no client-side fold consumes the
+  ones in between.
+- **Queue** (`events()`, upload `updates()`, and the actor's own inbox).
+  `futures_channel::mpsc::unbounded`, because these items are discrete
+  occurrences and none of them stands in for another. Here the old cost is
+  real: a consumer that stops polling grows its queue without bound until the
+  process runs out of memory, and an embedder that cannot keep up must drop the
+  stream (which unsubscribes, and the sender is pruned at the next send) or
+  coalesce on its own side. The same applies to a stalled actor: the inbox grows
+  while a handler is blocked.
+
+The consequence worth stating for consumers of both: an event is delivered with
+no promise about which state its `updates()` neighbour is showing, because that
+one may already have coalesced past the envelope the event rode in on. Read
+state from the state stream, and treat an event as a notification, not a diff.
 
 State delivery to the embedder is **not** through the actor's inbox. Each
-mounted root owns a snapshot cell:
+mounted root owns a latest-value cell per subject (`src/latest.rs`):
 
 ```rust
 pub(crate) struct RootCell<St: Store> {
-    snapshot: Mutex<Option<Arc<St::State>>>,
+    state: Latest<Arc<St::State>>,
+    status: Latest<MountStatus>,
     ...
 }
 ```
 
-`std::sync::Mutex<Option<Arc<_>>>`, not `arc-swap`: a snapshot read happens once
-per render, not in a hot loop, and the write happens once per accepted envelope,
-so the uncontended-mutex cost is irrelevant and it drops a dependency. The
-`Option` is the pre-first-publish hole `snapshot()` surfaces, and the one
-teardown restores (§7, §9); a reconnect never empties it. Swapping in `ArcSwap`
-later is a private change if profiling ever asks for it.
+Hand-rolled, ~120 lines: a `std::sync::Mutex` over `{value, version, closed,
+wakers}`, a `set` that overwrites and wakes, and a receiver that is a `Stream`
+yielding the current value when its seen version is behind and parking its waker
+otherwise. Not `tokio::sync::watch` — this crate is runtime-free (§2.1) — and
+not `arc-swap`: a read happens once per render and a write once per accepted
+envelope, so the uncontended-mutex cost is irrelevant and it drops a dependency.
 
-plus, per `updates()`/`events()` subscription, a `futures_channel::mpsc`
-sender on the same cell, driven from the actor task. There is **no callback
-registry**: the only subscription surface is `Stream`s (§7), each backed by one
-sender; a closed receiver (dropped stream) is pruned at the next send. Sends
-happen on the actor task; embedders that need thread affinity (gpui) hop inside
-their own consuming task (`cx.spawn` + `while let`). No `tokio::sync::watch`.
+Three properties fall out of that shape:
+
+- **Coalescing is structural.** An intermediate value is gone the moment the
+  next write lands, so no consumer can observe one, and a consumer that fell
+  behind runs its body once rather than once per skipped envelope.
+- **The first poll replays.** A receiver starts behind the cell, so subscribing
+  is enough to be current; `snapshot()`/`status()` remain for synchronous reads
+  (a first paint), not as a race a caller has to close by subscribing first.
+- **Closing is the terminal signal.** Teardown closes the cell: a receiver still
+  takes a value it had not seen, then the stream ends, while `snapshot()` goes
+  back to `None` and `status()` to `Connecting` — the pre-initial baseline (§7,
+  §9). A reconnect closes nothing and empties nothing.
+
+There is **no callback registry**: the only subscription surface is `Stream`s
+(§7). Writes happen on the actor task; embedders that need thread affinity
+(gpui) hop inside their own consuming task (`cx.spawn` + `while let`).
 
 ---
 
@@ -750,7 +777,13 @@ Shape: `{"store_id": [...], "name": "toast", "payload": <wire term>}`.
   dropped.
 - Dispatched exactly once per event, **after** ops/stream_ops/upload_ops are
   applied and the state publication in §4.3. Dispatch is a send into each live
-  stream's sender; closed receivers are pruned on the way.
+  stream's sender; closed receivers are pruned on the way. The payload is
+  wrapped in an `Arc` for the fan-out and each subscription deserializes its
+  `E` from the shared value, so a second subscriber costs a refcount bump
+  rather than a deep clone of the payload tree.
+- Ordering against state is per-stream only: the state stream is latest-value
+  (§2.4), so by the time an event is polled its envelope's state may already
+  have been coalesced past. An event is a notification, not a diff.
 - No ack, no retry, no replay. Events inside an envelope rejected for a version
   gap are discarded with it. A cold client can miss mount-time events —
   documented and accepted upstream.
@@ -960,8 +993,11 @@ impl<St: Store> Mounted<St> {
     /// keeps the last-good tree — see the note below and §9.
     pub fn snapshot(&self) -> Option<Arc<St::State>>;
 
-    /// One item per accepted envelope. The subscription surface is a
-    /// `Stream`, not a callback: dropping the stream unsubscribes.
+    /// The latest state, and every later one the consumer keeps up with —
+    /// latest-value, not a queue (§2.4). The first poll replays `snapshot()`,
+    /// a consumer that fell behind gets the current state and never the ones
+    /// it missed, and the subscription surface is a `Stream`, not a callback:
+    /// dropping the stream unsubscribes.
     #[must_use]
     pub fn updates(&self) -> impl Stream<Item = Arc<St::State>> + Send + 'static;
 
@@ -972,9 +1008,11 @@ impl<St: Store> Mounted<St> {
     /// disconnect) stay on the mount error path — no error arm here.
     pub fn status(&self) -> MountStatus;
 
-    /// One item per status transition; no replay — read `status()` first.
-    /// Same contract as `updates()`: dropping the stream unsubscribes, and it
-    /// ends when the root is unmounted or the connection disconnected.
+    /// The current status, then every edge the consumer keeps up with —
+    /// writes are edges only, delivery is latest-value. Same contract as
+    /// `updates()`: the first poll replays `status()`, dropping the stream
+    /// unsubscribes, and it ends when the root is unmounted or the connection
+    /// disconnected.
     #[must_use]
     pub fn status_updates(&self) -> impl Stream<Item = MountStatus> + Send + 'static;
 
@@ -985,8 +1023,10 @@ impl<St: Store> Mounted<St> {
     pub async fn command_on<C, T>(&self, target: &StoreId, cmd: C) -> Result<C::Reply>
     where T: Store, C: Command<T>;
 
-    /// Push events (BDR-0032) as a typed `Stream`. Dropping the stream
-    /// unregisters. `mounted.events::<ToastPayload, _>(&StoreId::root())`.
+    /// Push events (BDR-0032) as a typed `Stream` — an unbounded queue, not a
+    /// latest-value cell (§2.4): events are discrete, so a slow consumer gets
+    /// all of them and pays for the backlog. Dropping the stream unregisters.
+    /// `mounted.events::<ToastPayload, _>(&StoreId::root())`.
     #[must_use]
     pub fn events<E, T>(&self, store_id: &StoreId) -> impl Stream<Item = E> + Send + 'static
     where T: Store, E: Event<T>;

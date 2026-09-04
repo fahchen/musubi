@@ -668,6 +668,9 @@ fn a_seeded_mount_stays_connecting_until_the_live_initial_patch() {
     // Rendering cached state is not being live: the seed is last-known data,
     // not an accepted initial patch.
     assert_eq!(cart.status(), MountStatus::Connecting);
+    // A fresh subscription opens with the current status rather than the next
+    // transition, so the pill is right without reading `status()` first.
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Connecting]);
 
     server.reply(&sent[0], ReplyStatus::Ok, json!({"root_id": ROOT_ID}));
     harness.pump();
@@ -683,13 +686,17 @@ fn a_transport_drop_reports_reconnecting_and_the_rejoins_fresh_patch_restores_li
     let mut harness = Harness::new();
     let mut first = harness.queue_socket();
     let (_join, cart) = harness.mount(&mut first, "cart");
+    // A consumer that keeps up sees every edge; the drains below are what
+    // "keeping up" means for a latest-value stream.
     let mut statuses = cart.status_updates();
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
 
     let mut second = harness.queue_socket();
     first.disconnect();
     harness.pump();
 
     assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Reconnecting]);
     assert!(
         cart.snapshot().is_some(),
         "the last-good tree keeps rendering through the window (BDR-0015)"
@@ -703,15 +710,13 @@ fn a_transport_drop_reports_reconnecting_and_the_rejoins_fresh_patch_restores_li
     // The rejoin alone is not recovery: live returns only with the fresh
     // initial patch that swaps the state in.
     assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert!(drain(&mut statuses).is_empty(), "no edge was crossed");
 
     second.push_event(&rejoin[0], "patch", initial_envelope());
     harness.pump();
 
     assert_eq!(cart.status(), MountStatus::Live);
-    assert_eq!(
-        drain(&mut statuses),
-        vec![MountStatus::Reconnecting, MountStatus::Live]
-    );
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
 }
 
 #[test]
@@ -747,11 +752,13 @@ fn a_version_gap_recovery_passes_through_reconnecting() {
     let mut server = harness.queue_socket();
     let (join, cart) = harness.mount(&mut server, "cart");
     let mut statuses = cart.status_updates();
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
 
     server.push_event(&join, "patch", envelope(7, 8, json!([])));
     harness.pump();
 
     assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Reconnecting]);
 
     // Recovery left the diverged channel and joined a fresh one; its initial
     // patch completes the loop.
@@ -763,10 +770,7 @@ fn a_version_gap_recovery_passes_through_reconnecting() {
     harness.pump();
 
     assert_eq!(cart.status(), MountStatus::Live);
-    assert_eq!(
-        drain(&mut statuses),
-        vec![MountStatus::Reconnecting, MountStatus::Live]
-    );
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
 }
 
 #[test]
@@ -780,6 +784,9 @@ fn a_root_that_was_never_live_stays_connecting_through_a_socket_drop() {
     server.sent(&mut harness);
     let cart = harness.settle(pending).expect("the seeded mount resolves");
     let mut statuses = cart.status_updates();
+    // The opening replay, not a transition — consumed here so the assertion
+    // below is about edges only.
+    assert_eq!(drain(&mut statuses), vec![MountStatus::Connecting]);
 
     let _next = harness.queue_socket();
     server.disconnect();
@@ -796,11 +803,18 @@ fn a_root_that_was_never_live_stays_connecting_through_a_socket_drop() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn updates_yield_one_item_per_accepted_envelope() {
+fn updates_open_with_the_current_state_and_coalesce_to_the_latest_one() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
     let (join, cart) = harness.mount(&mut server, "cart");
     let mut updates = cart.updates();
+
+    // The subscription opens with what `snapshot()` holds: reading it first is
+    // a first-paint convenience, not a window a consumer has to close.
+    assert!(matches!(
+        drain(&mut updates).as_slice(),
+        [initial] if initial.title == "Cart"
+    ));
 
     server.push_event(
         &join,
@@ -823,9 +837,18 @@ fn updates_yield_one_item_per_accepted_envelope() {
     );
     harness.pump();
 
+    // Two accepted envelopes, one item: each state is a whole root that
+    // subsumes the one before it, so a consumer that was not polling gets
+    // where the root ended up instead of a backlog to replay.
     assert!(matches!(
         drain(&mut updates).as_slice(),
-        [second, third] if second.title == "Second" && third.title == "Third"
+        [third] if third.title == "Third"
+    ));
+    // And a subscription taken now opens on the same value — no consumer can
+    // observe the state that was skipped.
+    assert!(matches!(
+        drain(&mut cart.updates()).as_slice(),
+        [third] if third.title == "Third"
     ));
 }
 

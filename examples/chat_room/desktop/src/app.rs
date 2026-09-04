@@ -295,9 +295,11 @@ impl ChatWindow {
                 }
             };
 
-            // Subscribe *before* reading the snapshot and status: neither
-            // stream replays, so reading the current values afterwards is what
-            // closes the gap between the two.
+            // Both streams are latest-value and open with what the root
+            // already holds, so there is no subscribe-before-read window to
+            // close here. The two reads below are the synchronous seed for the
+            // first paint; the loops would arrive at the same values a tick
+            // later.
             let mut updates = mounted.updates();
             let mut statuses = mounted.status_updates();
             let initial = mounted.snapshot();
@@ -465,8 +467,10 @@ impl ChatWindow {
         };
 
         let upload = mounted.upload(&StoreId::root(), &state.attachment.name);
-        // Subscribe before snapshotting, for the same reason the mount path
-        // does: `updates()` does not replay.
+        // Subscribe before snapshotting: an upload's `updates()` is a queue of
+        // per-envelope handles, not a latest-value cell like the two streams
+        // the mount path takes, so it does not replay and a progress op
+        // landing between these two lines would otherwise be missed.
         let mut updates = upload.updates();
 
         self.attachment = Some(upload.snapshot());

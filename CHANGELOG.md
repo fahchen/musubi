@@ -185,6 +185,23 @@ not in lockstep yet; entries note which surface they affect.
 
 ### Changed
 
+- **`musubi-client` (Rust)** — **`Mounted::updates` and
+  `Mounted::status_updates` deliver the latest value instead of a queue.** Both
+  streams carry whole-root values that subsume the one before them, so they are
+  now backed by a small runtime-free latest-value cell rather than an unbounded
+  channel. Three visible consequences: a consumer that falls behind gets the
+  **current** state (or status) on its next poll and never the intermediates it
+  missed, so a stalled consumer can no longer grow the client's memory and no
+  longer runs its body once per skipped envelope; the **first poll replays**
+  what `snapshot()` / `status()` hold, which retires the
+  subscribe-before-you-read idiom those methods used to require; and teardown
+  still ends the stream after handing over a last unseen value. The signatures
+  are unchanged (`impl Stream<Item = Arc<St::State>>`,
+  `impl Stream<Item = MountStatus>`), so this is a semantic break in a
+  pre-release surface, not a compile break. `events()` and `Upload::updates()`
+  are unaffected — discrete items, still unbounded queues — and one event now
+  fans out as a shared `Arc<Value>` rather than a deep payload clone per
+  subscriber. `docs/rust-client.md` §2.4 has the full contract.
 - **`musubi`** — **Internal: the codegen manifest is now target-neutral.**
   `Musubi.Plugin.TypeScript` became `Musubi.Plugin.Codegen`,
   `Musubi.Codegen.TypeScript.Manifest` became `Musubi.Codegen.Manifest`, and

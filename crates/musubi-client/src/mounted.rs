@@ -7,6 +7,10 @@
 //! allocation typed and reads out of it. That is what makes `snapshot()` a
 //! lock-and-clone instead of an actor round trip, and it keeps every send on
 //! the actor task as §2.4 requires.
+//!
+//! State and status are [`Latest`] cells — one value, not a queue — because
+//! each of their items subsumes the one before it (§2.4). Push events are the
+//! opposite kind of thing, so they stay one unbounded queue per subscription.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,11 +27,16 @@ use serde_json::Value;
 use crate::actor::{ActorMsg, CommandRequest, ConnectionInner};
 use crate::error::{MusubiError, Result};
 use crate::generated::{Command, Event, Store, StoreId};
+use crate::latest::Latest;
 use crate::lock;
 use crate::uploads::{Upload, UploadControl, Uploads};
 
 /// Push-event subscribers, keyed the way BDR-0032 dispatches: `(store_id, name)`.
-type EventRegistry = HashMap<(StoreId, String), Vec<UnboundedSender<Value>>>;
+///
+/// The payload is shared rather than copied: one event reaches every subscriber
+/// of its key, and a whole `serde_json::Value` per subscriber is a deep clone
+/// of a tree each of them only reads.
+type EventRegistry = HashMap<(StoreId, String), Vec<UnboundedSender<Arc<Value>>>>;
 
 /// Where a mounted root is in its connection lifecycle (BDR-0033).
 ///
@@ -56,19 +65,19 @@ pub enum MountStatus {
 
 /// What the actor needs from a mounted root without knowing its [`Store`] type.
 pub(crate) trait RootSink: Send + Sync + 'static {
-    /// Deserializes the hydrated tree and publishes it to the snapshot cell and
-    /// every live `updates()` subscriber.
+    /// Deserializes the hydrated tree and publishes it into the state cell,
+    /// which is what `snapshot()` reads and every live `updates()` subscriber
+    /// converges on.
     fn publish(&self, state: &Value) -> std::result::Result<(), serde_json::Error>;
 
     /// Delivers one push event to every live `events()` subscriber of
     /// `(store_id, name)`. An event with no subscriber is dropped silently.
     fn dispatch_event(&self, store_id: &StoreId, name: &str, payload: &Value);
 
-    /// Publishes a [`MountStatus`] transition to the status cell and every
-    /// live `status_updates()` subscriber (BDR-0033). Repeats are dropped, and
-    /// a root that has never been [`MountStatus::Live`] refuses
-    /// [`MountStatus::Reconnecting`] — socket churn before the first accepted
-    /// initial patch is still `Connecting`.
+    /// Publishes a [`MountStatus`] transition into the status cell (BDR-0033).
+    /// Repeats are dropped, and a root that has never been
+    /// [`MountStatus::Live`] refuses [`MountStatus::Reconnecting`] — socket
+    /// churn before the first accepted initial patch is still `Connecting`.
     fn set_status(&self, status: MountStatus);
 
     /// The root's upload registry, which the actor hands to its
@@ -76,37 +85,36 @@ pub(crate) trait RootSink: Send + Sync + 'static {
     /// the same handles [`Mounted::upload`] reads.
     fn uploads(&self) -> Arc<Uploads>;
 
-    /// Drops the snapshot and every subscription, ending their streams. Called
-    /// once, when the root leaves the registry.
+    /// Ends every subscription and puts the readable surface back to its
+    /// pre-initial baseline. Called once, when the root leaves the registry.
     fn clear(&self);
 }
 
-/// One mounted root's typed cell: the snapshot plus its subscription senders.
+/// One mounted root's typed cell: the state and status cells, plus the
+/// subscription senders of everything that is not a latest value.
 pub(crate) struct RootCell<St: Store> {
-    snapshot: Mutex<Option<Arc<St::State>>>,
-    updates: Mutex<Vec<UnboundedSender<Arc<St::State>>>>,
+    state: Latest<Arc<St::State>>,
     events: Mutex<EventRegistry>,
-    status: Mutex<MountStatus>,
-    status_watchers: Mutex<Vec<UnboundedSender<MountStatus>>>,
-    // Not behind the outer `Mutex`es: the registry has its own interior
-    // locking, because the actor folds ops into it while the embedder reads
-    // handles out of it.
+    status: Latest<MountStatus>,
+    // Not behind a `Mutex` here: the registry has its own interior locking,
+    // because the actor folds ops into it while the embedder reads handles out
+    // of it.
     uploads: Arc<Uploads>,
 }
 
 impl<St: Store> RootCell<St> {
-    /// An empty cell: no snapshot yet, no subscribers, no upload handles.
+    /// An empty cell: no state yet, no subscribers, no upload handles.
     ///
     /// `control` is how the upload handles this cell hands out reach the
     /// server; it is built by the mount call, which is the only place that
     /// knows the root id.
     pub(crate) fn new(control: Arc<UploadControl>) -> Self {
         Self {
-            snapshot: Mutex::new(None),
-            updates: Mutex::new(Vec::new()),
+            state: Latest::new(None),
             events: Mutex::new(EventRegistry::new()),
-            status: Mutex::new(MountStatus::Connecting),
-            status_watchers: Mutex::new(Vec::new()),
+            // Seeded where the state cell is empty: the pre-initial baseline is
+            // a real status, and a subscriber replays it (BDR-0033).
+            status: Latest::new(Some(MountStatus::Connecting)),
             uploads: Arc::new(Uploads::new(control)),
         }
     }
@@ -119,8 +127,7 @@ impl<St: Store> RootSink for RootCell<St> {
         // hydrated tree on the one per-envelope hot path (§4.2).
         let next = Arc::new(St::State::deserialize(state)?);
 
-        *lock(&self.snapshot) = Some(Arc::clone(&next));
-        lock(&self.updates).retain(|sender| sender.unbounded_send(Arc::clone(&next)).is_ok());
+        self.state.set(next);
 
         Ok(())
     }
@@ -133,7 +140,11 @@ impl<St: Store> RootSink for RootCell<St> {
             return;
         };
 
-        senders.retain(|sender| sender.unbounded_send(payload.clone()).is_ok());
+        // One clone of the payload tree for the whole fan-out; each subscriber
+        // costs a refcount bump, and deserializing reads the shared value.
+        let payload = Arc::new(payload.clone());
+
+        senders.retain(|sender| sender.unbounded_send(Arc::clone(&payload)).is_ok());
 
         if senders.is_empty() {
             events.remove(&key);
@@ -141,24 +152,16 @@ impl<St: Store> RootSink for RootCell<St> {
     }
 
     fn set_status(&self, status: MountStatus) {
-        {
-            let mut current = lock(&self.status);
-
+        // Edges only, decided under the cell's lock so the dedupe and the write
+        // are one step rather than a read the next writer can slip between.
+        self.status.set_with(|current| match current {
             // A root that has never been live cannot be reconnecting: socket
             // churn before the first accepted initial patch is part of
             // `Connecting` (BDR-0033).
-            if status == MountStatus::Reconnecting && *current == MountStatus::Connecting {
-                return;
-            }
-
-            if *current == status {
-                return;
-            }
-
-            *current = status;
-        }
-
-        lock(&self.status_watchers).retain(|watcher| watcher.unbounded_send(status).is_ok());
+            Some(MountStatus::Connecting) if status == MountStatus::Reconnecting => None,
+            Some(current) if *current == status => None,
+            _ => Some(status),
+        });
     }
 
     fn uploads(&self) -> Arc<Uploads> {
@@ -166,13 +169,12 @@ impl<St: Store> RootSink for RootCell<St> {
     }
 
     fn clear(&self) {
-        *lock(&self.snapshot) = None;
-        lock(&self.updates).clear();
+        // Closing a cell is the terminal signal: a subscriber still takes the
+        // last value it has not seen and *then* ends, while `snapshot()` and
+        // `status()` fall back to their pre-initial baseline (BDR-0033).
+        self.state.close();
         lock(&self.events).clear();
-        // Back to the pre-initial baseline, coherent with the cleared
-        // snapshot; the ended streams are the terminal signal (BDR-0033).
-        *lock(&self.status) = MountStatus::Connecting;
-        lock(&self.status_watchers).clear();
+        self.status.close();
         self.uploads.clear();
     }
 }
@@ -219,15 +221,26 @@ impl<St: Store> Mounted<St> {
     /// render(&state.title);
     /// ```
     pub fn snapshot(&self) -> Option<Arc<St::State>> {
-        lock(&self.cell.snapshot).clone()
+        self.cell.state.get()
     }
 
-    /// One item per accepted patch envelope, oldest first.
+    /// The latest state, and every later one this consumer keeps up with.
+    ///
+    /// **Latest-value, not a queue.** Each item is a whole root that subsumes
+    /// the one before it, so the stream carries no backlog: a consumer that
+    /// falls behind gets the newest state on its next poll and *never* the
+    /// intermediates it missed. Nothing is lost by that — no client-side fold
+    /// reads them — and a consumer that stalls cannot grow the client's
+    /// memory. An app that needs every envelope needs
+    /// [`events`](Self::events), which is a queue of discrete items.
+    ///
+    /// The first poll **replays** [`snapshot`](Self::snapshot) when there is
+    /// one, so subscribing is enough to be current; reading `snapshot()` too is
+    /// only for a synchronous first paint, not a race to close.
     ///
     /// The stream **is** the subscription: dropping it unsubscribes, and it
-    /// ends when the root is unmounted or the connection is disconnected. It
-    /// does not replay [`snapshot`](Self::snapshot) — read that first if the
-    /// current state matters.
+    /// ends when the root is unmounted or the connection is disconnected —
+    /// after delivering a last value it had not yet seen.
     ///
     /// ```text
     /// let mut updates = cart.updates();
@@ -238,11 +251,7 @@ impl<St: Store> Mounted<St> {
     /// ```
     #[must_use = "the stream is the subscription; dropping it unsubscribes"]
     pub fn updates(&self) -> impl Stream<Item = Arc<St::State>> + Send + 'static {
-        let (sender, receiver) = mpsc::unbounded();
-
-        lock(&self.cell.updates).push(sender);
-
-        receiver
+        self.cell.state.subscribe()
     }
 
     /// Where this root is in its connection lifecycle (BDR-0033).
@@ -267,15 +276,23 @@ impl<St: Store> Mounted<St> {
     /// }
     /// ```
     pub fn status(&self) -> MountStatus {
-        *lock(&self.cell.status)
+        // A closed cell reports no value, which is exactly the pre-initial
+        // baseline a torn-down root reads as.
+        self.cell.status.get().unwrap_or(MountStatus::Connecting)
     }
 
-    /// One item per [`MountStatus`] transition, oldest first (BDR-0033).
+    /// The current [`MountStatus`], and every later one this consumer keeps up
+    /// with (BDR-0033).
+    ///
+    /// **Latest-value, not a queue**, like [`updates`](Self::updates): the
+    /// first poll replays [`status`](Self::status), so a subscriber is current
+    /// without reading it first, and a consumer that was not polling across a
+    /// transition sees where the root ended up rather than a replay of a
+    /// window that has already closed. Writes are edges only, so a status that
+    /// did not change is not an item.
     ///
     /// The stream **is** the subscription: dropping it unsubscribes, and it
-    /// ends when the root is unmounted or the connection is disconnected. It
-    /// does not replay [`status`](Self::status) — read that first if the
-    /// current value matters.
+    /// ends when the root is unmounted or the connection is disconnected.
     ///
     /// ```text
     /// let mut statuses = cart.status_updates();
@@ -286,11 +303,7 @@ impl<St: Store> Mounted<St> {
     /// ```
     #[must_use = "the stream is the subscription; dropping it unsubscribes"]
     pub fn status_updates(&self) -> impl Stream<Item = MountStatus> + Send + 'static {
-        let (sender, receiver) = mpsc::unbounded();
-
-        lock(&self.cell.status_watchers).push(sender);
-
-        receiver
+        self.cell.status.subscribe()
     }
 
     /// Dispatches a command on the root store.
@@ -333,6 +346,10 @@ impl<St: Store> Mounted<St> {
 
     /// Push events (BDR-0032) of one store, as a typed stream.
     ///
+    /// A **queue**, unlike [`updates`](Self::updates): events are discrete
+    /// occurrences, none of which stands in for another, so a slow consumer
+    /// gets all of them (and pays for the backlog) rather than the latest one.
+    ///
     /// The stream is the subscription: dropping it unregisters. Events with no
     /// live stream are dropped, and a payload that fails to deserialize is
     /// logged and skipped — an event is not state, so it never fails a cycle.
@@ -360,7 +377,9 @@ impl<St: Store> Mounted<St> {
         // `ready` rather than an `async` block: the returned stream stays
         // `Unpin`, so a consumer can poll it without pinning it first.
         receiver.filter_map(|payload| {
-            ready(match serde_json::from_value::<E>(payload) {
+            // Deserialized from the shared payload by reference — an owned copy
+            // would undo the point of sharing it across subscribers.
+            ready(match E::deserialize(payload.as_ref()) {
                 Ok(event) => Some(event),
                 Err(error) => {
                     tracing::warn!(

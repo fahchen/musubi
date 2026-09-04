@@ -497,7 +497,8 @@ if let Some(state) = mounted.snapshot() {
     }
 }
 
-// Push-driven: a stream of snapshots, one per accepted envelope.
+// Push-driven: the current snapshot, then every later one this loop keeps up
+// with (latest-value, not a queue — `docs/rust-client.md` §2.4).
 let mut updates = mounted.updates();
 while let Some(state) = updates.next().await {
     redraw(&state);
