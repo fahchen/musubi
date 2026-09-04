@@ -24,8 +24,7 @@ use crate::actor::{ActorMsg, CommandRequest, ConnectionInner};
 use crate::error::{MusubiError, Result};
 use crate::generated::{Command, Event, Store, StoreId};
 use crate::lock;
-use crate::transfer::UploadControl;
-use crate::uploads::{Upload, Uploads};
+use crate::uploads::{Upload, UploadControl, Uploads};
 
 /// Push-event subscribers, keyed the way BDR-0032 dispatches: `(store_id, name)`.
 type EventRegistry = HashMap<(StoreId, String), Vec<UnboundedSender<Value>>>;

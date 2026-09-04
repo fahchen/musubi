@@ -1,7 +1,7 @@
 //! The upload control plane: preflight, channel-mode chunk transfer, and
 //! external uploaders (BDR-0026, BDR-0027, `docs/rust-client.md` §10.2).
 //!
-//! Where [`uploads`](crate::uploads) folds what the **server** says about an
+//! Where [`registry`](super::registry) folds what the **server** says about an
 //! upload, this module is what the **client** does about it: it drives
 //! [`UploadHandle::status`](crate::UploadHandle::status) — the one field no op
 //! ever writes — and moves the bytes.
@@ -20,6 +20,9 @@
 //! The crate stays runtime-free: nothing here spawns, sleeps or reads a file.
 //! Concurrency across entries is a `join_all` on the caller's own task, and the
 //! bytes arrive as [`UploadFile`] — the embedder reads the file.
+//!
+//! This is the top of the upload tree: it reads the registry's cells, and
+//! nothing in the registry reads back into here.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -37,9 +40,9 @@ use crate::actor::{ActorMsg, ConnectionInner};
 use crate::error::{MusubiError, Result, TransferError};
 use crate::generated::StoreId;
 use crate::lock;
-use crate::uploads::{
-    COMPLETE, EntryStatus, Upload, UploadConfig, UploadEntry, UploadError, UploadStatus,
-};
+
+use super::ops::{COMPLETE, EntryStatus, UploadConfig, UploadEntry, UploadError, UploadStatus};
+use super::registry::Upload;
 
 /// The main-channel preflight push (BDR-0024).
 const EVENT_ALLOW_UPLOAD: &str = "allow_upload";
@@ -314,7 +317,7 @@ impl UploaderError {
 /// not observable state, and [`UploadHandle`](crate::UploadHandle) is a value
 /// every subscriber gets a clone of.
 #[derive(Debug)]
-pub(crate) struct EntryTransport {
+pub(in crate::uploads) struct EntryTransport {
     bytes: Arc<[u8]>,
     mode: TransferMode,
     cancel: CancelSignal,
@@ -366,23 +369,34 @@ impl UploadControl {
     }
 
     /// Pushes on the root's main channel and waits for the reply.
+    ///
+    /// The actor routes the push and hands the raw outcome back; what a
+    /// rejection or a failed push *means* is upload vocabulary, so the mapping
+    /// onto [`TransferError`] happens here rather than on the actor.
     async fn push(&self, event: &'static str, payload: Value) -> Result<Value> {
         let (reply_tx, reply_rx) = oneshot::channel();
 
-        self.inner.send(ActorMsg::UploadPush {
+        self.inner.send(ActorMsg::RootPush {
             root_id: Arc::clone(&self.root_id),
             event,
             payload,
             reply: Some(reply_tx),
         })?;
 
-        reply_rx.await.map_err(|_| MusubiError::Disconnected)?
+        // The outer error is the actor's — the root is gone, or its channel is
+        // not joined; the inner one is the push's own.
+        let routed = reply_rx.await.map_err(|_| MusubiError::Disconnected)?;
+
+        match routed? {
+            Ok(reply) => upload_reply(event, reply),
+            Err(error) => Err(push_error(error)),
+        }
     }
 
     /// Pushes without waiting: the progress relay and the failure report are
     /// advisory, and the TypeScript client does not await them either.
     fn push_detached(&self, event: &'static str, payload: Value) {
-        let _ = self.inner.send(ActorMsg::UploadPush {
+        let _ = self.inner.send(ActorMsg::RootPush {
             root_id: Arc::clone(&self.root_id),
             event,
             payload,
@@ -950,7 +964,7 @@ struct PreflightRejection {
 // ---------------------------------------------------------------------------
 
 /// Maps a push that produced no reply onto the shared taxonomy (§11).
-pub(crate) fn push_error(error: PushError) -> MusubiError {
+fn push_error(error: PushError) -> MusubiError {
     match error {
         PushError::Timeout => MusubiError::Timeout,
         PushError::NotJoined | PushError::Stale => MusubiError::NotConnected,
@@ -972,7 +986,7 @@ pub(crate) fn push_error(error: PushError) -> MusubiError {
 }
 
 /// Maps one main-channel reply onto `Ok(response)` / a [`TransferError`].
-pub(crate) fn upload_reply(event: &'static str, reply: Reply) -> Result<Value> {
+fn upload_reply(event: &'static str, reply: Reply) -> Result<Value> {
     if reply.is_ok() {
         return Ok(reply.response);
     }

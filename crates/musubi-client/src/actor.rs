@@ -35,7 +35,6 @@ use crate::envelope::PatchEnvelope;
 use crate::error::{CommandError, MusubiError, Result};
 use crate::generated::StoreId;
 use crate::mounted::{MountStatus, RootSink};
-use crate::transfer;
 
 /// The push event a patch envelope arrives under.
 const EVENT_PATCH: &str = "patch";
@@ -55,6 +54,11 @@ const MAX_QUEUED_DISPATCHES: usize = 32;
 /// The typed cell of a mounted root, as the actor sees it: opaque, and handed
 /// back to the mount caller to downcast.
 pub(crate) type AnyCell = Arc<dyn Any + Send + Sync>;
+
+/// What an [`ActorMsg::RootPush`] answers with: whether the push could be
+/// routed at all, and — when it was — the raw outcome for the sender to map
+/// onto its own error vocabulary.
+pub(crate) type PushOutcome = Result<std::result::Result<Reply, PushError>>;
 
 /// Everything the actor accepts. Every handle method and every forwarding task
 /// is a sender; the actor is the only consumer.
@@ -91,22 +95,22 @@ pub(crate) enum ActorMsg {
         /// The event itself.
         event: ChannelEvent,
     },
-    /// Push one upload control-plane event on a root's main channel
-    /// (`docs/rust-client.md` §10.2).
+    /// Push one subsystem event on a root's main channel — the upload control
+    /// plane's `allow_upload`, `cancel_upload`, `upload_progress` and
+    /// `upload_error` today (`docs/rust-client.md` §10.2).
     ///
     /// Routed through the actor rather than pushed from the handle because the
     /// current channel incarnation is the actor's to know: a recovery replaces
     /// it, and a handle holding the old one would push into a stale channel.
-    UploadPush {
+    RootPush {
         /// The root whose channel carries the push.
         root_id: Arc<str>,
-        /// The event: `allow_upload`, `cancel_upload`, `upload_progress` or
-        /// `upload_error`.
+        /// The event name, already agreed with the server.
         event: &'static str,
         /// The already-built payload.
         payload: Value,
-        /// Where the reply goes; `None` for the fire-and-forget relays.
-        reply: Option<oneshot::Sender<Result<Value>>>,
+        /// Where the outcome goes; `None` for a fire-and-forget push.
+        reply: Option<oneshot::Sender<PushOutcome>>,
     },
     /// A cache read produced a usable entry for a root still awaiting its
     /// initial patch (`docs/rust-client.md` §6.4).
@@ -308,12 +312,12 @@ impl Actor {
                 generation,
                 event,
             } => self.channel_event(&root_id, generation, event).await,
-            ActorMsg::UploadPush {
+            ActorMsg::RootPush {
                 root_id,
                 event,
                 payload,
                 reply,
-            } => self.upload_push(&root_id, event, payload, reply),
+            } => self.root_push(&root_id, event, payload, reply),
             ActorMsg::CacheSeed {
                 root_id,
                 key,
@@ -621,17 +625,23 @@ impl Actor {
         let _ = pending.reply.send(result);
     }
 
-    /// Pushes one upload control-plane event on a root's channel.
+    /// Pushes one subsystem event on a root's channel.
     ///
-    /// Unlike a command there is no version gate: preflight and cancellation
-    /// are about the upload's own state, which the initial patch says nothing
-    /// about. A channel that is not joined still rejects the push.
-    fn upload_push(
+    /// Unlike a command there is no version gate: what travels this way —
+    /// upload preflight and cancellation today — is about state the initial
+    /// patch says nothing about. A channel that is not joined still rejects the
+    /// push.
+    ///
+    /// The reply is handed back **unmapped**: what a rejection or a failed push
+    /// means belongs to the subsystem's own error vocabulary, so the actor
+    /// answers only the question it can — whether the push could be routed at
+    /// all.
+    fn root_push(
         &mut self,
         root_id: &Arc<str>,
         event: &'static str,
         payload: Value,
-        reply: Option<oneshot::Sender<Result<Value>>>,
+        reply: Option<oneshot::Sender<PushOutcome>>,
     ) {
         let channel = self
             .roots
@@ -658,10 +668,7 @@ impl Actor {
                 return;
             };
 
-            let _ = reply.send(match outcome {
-                Ok(received) => transfer::upload_reply(event, received),
-                Err(error) => Err(transfer::push_error(error)),
-            });
+            let _ = reply.send(Ok(outcome));
         }));
     }
 

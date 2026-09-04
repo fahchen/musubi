@@ -1234,9 +1234,16 @@ like streams (§5). The **control plane** — selecting files, preflight, and
 moving bytes — is the client's own API, and it is the only thing that ever
 writes `UploadHandle::status`.
 
+Both live under `crates/musubi-client/src/uploads/`, one file per layer:
+`ops.rs` is the wire vocabulary, `registry.rs` the data plane, `transfer.rs`
+the control plane, and `mod.rs` re-exports the public surface. The
+dependencies point one way — control plane → data plane → vocabulary — so
+`PatchEnvelope` decodes `upload_ops` without reaching the transfer machinery.
+
 ### 10.1 Data plane
 
-`crates/musubi-client/src/uploads.rs`. `PatchEngine` folds `upload_ops` into a
+`crates/musubi-client/src/uploads/registry.rs`, over the wire types in
+`uploads/ops.rs`. `PatchEngine` folds `upload_ops` into a
 per-root registry (`Uploads`) keyed by `(StoreId, upload_name)` — uploads are
 singletons per store, so that pair is the identity (BDR-0028). The pair is
 hashed directly; the TS `json(store_id) + "\0" + name` string key is an
@@ -1305,7 +1312,7 @@ deletes the entry.
 
 ### 10.2 Control plane
 
-`crates/musubi-client/src/transfer.rs`. Four `async` methods on the same
+`crates/musubi-client/src/uploads/transfer.rs`. Four `async` methods on the same
 `Upload` the data plane hands out, so an app never holds two objects for one
 upload:
 
@@ -1324,12 +1331,15 @@ chunk provider is a later addition; nothing in the wire contract depends on the
 whole file being resident.
 
 **Where the pushes go.** Main-channel pushes (`allow_upload`, `cancel_upload`,
-`upload_progress`, `upload_error`) are routed through the connection actor,
-which owns the current channel incarnation — a handle pinning a `Channel` would
-push into one that recovery has replaced. Chunk sub-channels are opened
-straight on the `PhoenixSocket`: they are per-entry, short-lived, and the actor
-has no business tracking them. The two external-mode relays are *detached*
-pushes (no reply awaited), matching the TS client.
+`upload_progress`, `upload_error`) are routed through the connection actor as
+`ActorMsg::RootPush`, which owns the current channel incarnation — a handle
+pinning a `Channel` would push into one that recovery has replaced. That
+message is subsystem-agnostic: it answers with the raw push outcome, and the
+upload control plane maps it onto `TransferError` itself, so nothing about
+uploads is baked into the actor. Chunk sub-channels are opened straight on the
+`PhoenixSocket`: they are per-entry, short-lived, and the actor has no business
+tracking them. The two external-mode relays are *detached* pushes (no reply
+awaited), matching the TS client.
 
 **Preflight.** `select` sets `status = selecting`, clears the handle's errors,
 and pushes `allow_upload` with one offered entry per file, `client_ref` being

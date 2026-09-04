@@ -22,7 +22,7 @@ use crate::cache::{CacheStore, DEFAULT_CACHE_GC_TIME};
 use crate::error::{MusubiError, Result};
 use crate::generated::Store;
 use crate::mounted::{Mounted, RootCell};
-use crate::transfer::{UploadControl, Uploader};
+use crate::uploads::{UploadControl, Uploader};
 
 /// A seam missing from [`Connection::builder`].
 ///

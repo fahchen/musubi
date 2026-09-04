@@ -92,7 +92,6 @@ mod index;
 mod mounted;
 mod patch;
 mod streams;
-mod transfer;
 mod uploads;
 
 pub use crate::cache::{
@@ -104,12 +103,10 @@ pub use crate::engine::PatchEngine;
 pub use crate::envelope::{PatchEnvelope, PatchOp, PushEvent, StreamOp};
 pub use crate::error::{CommandError, MusubiError, PatchError, Result, TransferError};
 pub use crate::mounted::{MountStatus, Mounted};
-pub use crate::transfer::{
-    CancelSignal, UploadFile, UploadProgress, UploadRequest, Uploader, UploaderError,
-};
 pub use crate::uploads::{
-    EntryStatus, Upload, UploadAccept, UploadConfig, UploadEntry, UploadError, UploadErrorCode,
-    UploadHandle, UploadOp, UploadStatus, Uploads,
+    CancelSignal, EntryStatus, Upload, UploadAccept, UploadConfig, UploadEntry, UploadError,
+    UploadErrorCode, UploadFile, UploadHandle, UploadOp, UploadProgress, UploadRequest,
+    UploadStatus, Uploader, UploaderError, Uploads,
 };
 // The runtime seams are defined one layer down and re-exported here, so an
 // embedder implements them against `musubi_client` alone (§3).
