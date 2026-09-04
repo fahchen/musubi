@@ -1151,16 +1151,29 @@ stamping, sorted `list/1`, corrupt-term skipping, missing-dir `[]` / `:ok`,
 orphan-module sweeping, both `test/` skip variants, `renderable_fields/1`, and
 alias expansion.
 
-### 6.5 Compilation smoke test (still deferred)
+### 6.5 Compilation smoke test (`test/musubi/codegen/rust_compile_smoke_test.exs`)
 
-The strongest test would be "does `cargo build` accept the bundle", against a
-fixture crate carrying `serde` / `serde_json`. It is **not** implemented: it
-would need `cargo` on the test machine, so it belongs behind a `@tag :rust`
-excluded by default in `test_helper.exs`, and it is not part of CI. The
-rustfmt check in §6.2 and the crate-side
+The strongest test — "does the compiler accept the bundle" — ships as an
+opt-in suite. It renders the full probe bundle through the same path as the
+golden test (`Manifest.collect/1` over the §6.2 fixtures, one
+`Rust.render/1`), writes it into a throwaway consumer crate under a tmp dir —
+edition 2024, an empty `[workspace]` table so no enclosing workspace claims
+it, a path dependency on `crates/musubi-client`, `serde` + `serde_json` — and
+asserts `cargo check` exits 0. That closes the self-referential gap in the
+golden tests, which compare the renderer's output to itself and would stay
+green on syntactically invalid Rust.
+
+It needs `cargo` on the test machine, so it sits behind `@moduletag :rust`,
+excluded by default (`ExUnit.start(exclude: [:rust])` in `test_helper.exs`):
+plain `mix test` and `mix precommit` never touch it. CI runs it in the Rust
+job (`mix test --only rust`, after `cargo test --workspace`) on both
+toolchain legs, so the generated surface is type-checked under stable and the
+1.85 MSRV alike. `async: false` because it shells out to a `cargo` sharing
+the workspace `target/` dir. The rustfmt check in §6.2 and the crate-side
 `crates/musubi-client/tests/generated.rs` (which exercises the re-exported
-runtime types the bundle depends on) are partial substitutes, not replacements —
-neither type-checks generated code.
+runtime types the bundle depends on) remain complementary — formatting
+stability and runtime-type behavior — but no longer stand in for
+type-checking generated code.
 
 ---
 

@@ -169,3 +169,31 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      # docs/rust-codegen.md §6.5: render the codegen bundle from the probe
+      # fixtures and `cargo check` it against `crates/musubi-client`. The test
+      # needs the BEAM to render and cargo to check — this job has cargo, so
+      # the Elixir setup lives here rather than shipping a Rust toolchain to
+      # the Elixir matrix. Runs on both legs: the generated surface must
+      # type-check under stable and the 1.85 MSRV alike.
+      - name: Setup BEAM (codegen smoke test)
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.3"
+          otp-version: "29.0"
+
+      - name: Restore deps + build cache (codegen smoke test)
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: rust-smoke-${{ runner.os }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            rust-smoke-${{ runner.os }}-
+
+      - name: Fetch deps (codegen smoke test)
+        run: mix deps.get
+
+      - name: Codegen compile smoke test
+        run: mix test --only rust
