@@ -37,8 +37,9 @@
 //! ```
 //!
 //! The shadow document is a `serde_json::Value` kept exactly as it arrived:
-//! patch pointers address the wire tree, so hydration (stream-marker
-//! substitution) produces an owned copy per cycle and never mutates the tree.
+//! patch pointers address the wire tree, so a cycle works on one owned copy of
+//! it — hydration (stream-marker substitution) rewrites that copy in place —
+//! and never mutates the tree itself.
 //!
 //! # Concurrency
 //!

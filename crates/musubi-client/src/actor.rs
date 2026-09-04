@@ -337,10 +337,7 @@ impl Actor {
             },
         );
 
-        if let Some(key) = key {
-            self.cache.on_mount(&root_id, key);
-        }
-
+        self.cache.on_mount(&root_id, key);
         self.attach_and_join(&root_id).await;
     }
 
@@ -1000,9 +997,7 @@ impl Actor {
 
         reject_commands(&mut root, &reason);
 
-        if let Some(key) = root.cache_key.take() {
-            self.cache.on_teardown(key, self.closed);
-        }
+        self.cache.on_teardown(root.cache_key.take(), self.closed);
 
         for reply in root.pending_mounts.drain(..) {
             let _ = reply.send(Err(reason()));

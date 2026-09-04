@@ -67,12 +67,12 @@ handles you read with `Mounted::upload(&store_id, name)` — the same
 `snapshot()`/`updates()` pair as state, though an upload's stream is a queue of
 per-envelope handles rather than a latest-value cell — and the same handle
 carries `select()`, `start()`, `cancel()` and `reset()`. The state slot itself
-stays the inert `UploadSlot`, which carries the handle's name. The crate reads no files: you hand it an
-`UploadFile` (bytes plus name and content type), and an external destination is
-your own `Uploader` registered on the builder. Reconnect is reconnect-only: a
-version gap or a rejoin keeps the last-good rendering and waits for a fresh
-initial envelope, and an upload in flight fails rather than resuming. The
-reconnect window itself is renderable state:
+stays the inert `UploadSlot`, which carries the handle's name. The crate reads
+no files: you hand it an `UploadFile` (bytes plus name and content type), and
+an external destination is your own `Uploader` registered on the builder.
+Reconnect is reconnect-only: a version gap or a rejoin keeps the last-good
+rendering and waits for a fresh initial envelope, and an upload in flight fails
+rather than resuming. The reconnect window itself is renderable state:
 `Mounted::status()` / `status_updates()` report
 `MountStatus { Connecting, Live, Reconnecting }` (BDR-0033) while `snapshot()`
 keeps serving the last-good tree — the status annotates stale rendering, it

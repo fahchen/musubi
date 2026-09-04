@@ -173,10 +173,7 @@ impl PatchEngine {
         self.document = document;
         self.index = build_store_index(&self.document);
 
-        let live_store_ids: HashSet<StoreId> = self.index.keys().cloned().collect();
-
-        self.streams.prune(&live_store_ids);
-        self.uploads.prune(&live_store_ids);
+        self.prune_to_index();
 
         let mut state = self.document.clone();
 
@@ -208,8 +205,9 @@ impl PatchEngine {
         self.index = StoreIndex::new();
     }
 
-    /// Applies one envelope in the order §4.3 fixes: validate, patch, stream
-    /// ops, upload ops, rebuild the index, prune, hydrate.
+    /// Applies one envelope in the order §4.3 fixes: validate, patch, rebuild
+    /// the index, fold `stream_ops`, hydrate — then adopt all of it, fold
+    /// `upload_ops`, and prune.
     ///
     /// Upload ops are folded into the registry rather than into the tree: an
     /// upload slot stays the inert `{"__musubi_upload__": name}` marker on the
@@ -267,10 +265,9 @@ impl PatchEngine {
     /// version, the tree, the streams and every upload subscriber exactly as
     /// they were.
     ///
-    /// The working copy is the copy the hydration walk used to make on its own
-    /// — the ops land on it, the index is read off it, and the walk then
-    /// rewrites it in place into the hydrated state — so the cycle still costs
-    /// one copy of the tree.
+    /// The working copy is the cycle's only copy of the tree: the ops land on
+    /// it, the index is read off it, and the hydration walk then rewrites it in
+    /// place into the state the caller deserializes.
     ///
     /// Pruning is a commit-phase step, so the walk runs against streams that
     /// still include ones the commit is about to drop. It cannot see the
@@ -332,15 +329,20 @@ impl PatchEngine {
         self.index = index;
         self.streams.commit(streams);
         self.uploads.apply_ops(&envelope.upload_ops);
-
-        let live_store_ids: HashSet<StoreId> = self.index.keys().cloned().collect();
-
-        self.streams.prune(&live_store_ids);
-        self.uploads.prune(&live_store_ids);
+        self.prune_to_index();
 
         self.version = envelope.version;
 
         state
+    }
+
+    /// Drops the streams and upload handles of every store the freshly rebuilt
+    /// index no longer names (§4.3 step 8, BDR-0011).
+    fn prune_to_index(&mut self) {
+        let live_store_ids: HashSet<StoreId> = self.index.keys().cloned().collect();
+
+        self.streams.prune(&live_store_ids);
+        self.uploads.prune(&live_store_ids);
     }
 
     /// Enforces version continuity (§4.5).

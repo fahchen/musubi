@@ -116,8 +116,8 @@ impl CacheCoordinator {
     /// delays the seed, never the revalidation (§6.4). Staleness is decided out
     /// there too, so that dropping an unusable entry costs the actor nothing
     /// and the entry that reaches it is already one it may seed.
-    pub(crate) fn on_mount(&mut self, root_id: &Arc<str>, key: Arc<str>) {
-        let Some(config) = self.config.clone() else {
+    pub(crate) fn on_mount(&mut self, root_id: &Arc<str>, key: Option<Arc<str>>) {
+        let (Some(config), Some(key)) = (self.config.clone(), key) else {
             return;
         };
 
@@ -151,10 +151,7 @@ impl CacheCoordinator {
     /// The *wire* tree is what is stored: seeding is then the same marker
     /// substitution the engine already does, with no second decoding path.
     pub(crate) fn on_publish(&mut self, key: Option<&Arc<str>>, document: &Value) {
-        let Some(config) = self.config.clone() else {
-            return;
-        };
-        let Some(key) = key else {
+        let (Some(config), Some(key)) = (self.config.clone(), key) else {
             return;
         };
         let entry = CacheEntry {
@@ -190,12 +187,12 @@ impl CacheCoordinator {
     /// The remaining window is measured from the entry's own `updated_at`, so
     /// an entry that was already half-expired when the root unmounted is not
     /// given a fresh full lifetime.
-    pub(crate) fn on_teardown(&mut self, key: Arc<str>, connection_closed: bool) {
-        let pending = self.writes.remove(&key).and_then(|writer| writer.pending);
-
-        let Some(config) = self.config.clone() else {
+    pub(crate) fn on_teardown(&mut self, key: Option<Arc<str>>, connection_closed: bool) {
+        let (Some(config), Some(key)) = (self.config.clone(), key) else {
             return;
         };
+
+        let pending = self.writes.remove(&key).and_then(|writer| writer.pending);
 
         // A disconnect keeps whatever was flushed: the entry ages out on its
         // own, and a reconnecting app can seed from it again.
