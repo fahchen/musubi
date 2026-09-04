@@ -3,7 +3,7 @@ import { describe, expect, test, vi } from "vitest"
 import { connect } from "../src/connect"
 import type { MusubiConnection } from "../src/connect"
 import type { MusubiSocketStatus } from "../src/runtime"
-import type { ConnectionPatchEnvelope } from "../src/types"
+import type { ConnectionPatchEnvelope, StoreProxy } from "../src/types"
 
 type PushStatus = "ok" | "error" | "timeout"
 type PushCallback = (payload: unknown) => void
@@ -181,7 +181,7 @@ async function mountRoot(
   socket: MockLifecycleSocket,
   connection: MusubiConnection<TestStores>,
   id: string
-): Promise<{ store: { title: string; snapshot(): { title: string } | undefined }; channel: MockChannel }> {
+): Promise<{ store: StoreProxy<"Test.Store", TestStores>; channel: MockChannel }> {
   const mountedPromise = connection.mountStore({ module: "Test.Store", id })
   await Promise.resolve()
   const channel = socket.channels.at(-1)

@@ -66,6 +66,26 @@ struct PersistedEntry {
     buster: String,
 }
 
+impl From<PersistedEntry> for CacheEntry {
+    fn from(entry: PersistedEntry) -> Self {
+        Self {
+            data: entry.data,
+            updated_at: entry.updated_at,
+            buster: entry.buster,
+        }
+    }
+}
+
+impl From<&CacheEntry> for PersistedEntry {
+    fn from(entry: &CacheEntry) -> Self {
+        Self {
+            data: entry.data.clone(),
+            updated_at: entry.updated_at,
+            buster: entry.buster.clone(),
+        }
+    }
+}
+
 /// A [`CacheStore`] over one JSON file.
 ///
 /// The file is read once, at [`open`](Self::open); after that the map lives in
@@ -87,16 +107,7 @@ impl FileCacheStore {
             Ok(bytes) => match serde_json::from_slice::<HashMap<String, PersistedEntry>>(&bytes) {
                 Ok(persisted) => persisted
                     .into_iter()
-                    .map(|(key, entry)| {
-                        (
-                            key,
-                            CacheEntry {
-                                data: entry.data,
-                                updated_at: entry.updated_at,
-                                buster: entry.buster,
-                            },
-                        )
-                    })
+                    .map(|(key, entry)| (key, CacheEntry::from(entry)))
                     .collect(),
                 Err(error) => {
                     tracing::warn!(?path, %error, "cache file is corrupt; starting empty");
@@ -130,16 +141,7 @@ impl FileCacheStore {
     fn save(&self, entries: &HashMap<String, CacheEntry>) {
         let persisted: HashMap<&String, PersistedEntry> = entries
             .iter()
-            .map(|(key, entry)| {
-                (
-                    key,
-                    PersistedEntry {
-                        data: entry.data.clone(),
-                        updated_at: entry.updated_at,
-                        buster: entry.buster.clone(),
-                    },
-                )
-            })
+            .map(|(key, entry)| (key, PersistedEntry::from(entry)))
             .collect();
 
         // Pretty on purpose: the file is part of the demo, and small enough
