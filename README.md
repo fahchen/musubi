@@ -112,6 +112,16 @@ musubi-client = { path = "../deps/musubi/crates/musubi-client" }
 musubi-client-tokio = { path = "../deps/musubi/crates/musubi-client-tokio" }
 ```
 
+The Rust client is a peer of the TypeScript one, not a subset:
+`Connection::mount::<St>` takes the store's generated `Params` struct (one
+field per `attr/3`, so a required mount param cannot be forgotten at the call
+site), `Mounted` exposes `snapshot()`/`updates()`, typed `command(...)`
+dispatch and typed `events(...)` streams, uploads run through
+`Mounted::upload` in both channel and external (direct-to-cloud) mode, an
+opt-in stale-while-revalidate cache hangs off the builder
+(`ConnectionBuilder::cache`), and per-root liveness is observable via
+`Mounted::status()`/`status_updates()`.
+
 `musubi-client` pulls in no async runtime, so a non-tokio embedder such as a
 gpui desktop app skips `musubi-client-tokio` and supplies its own `Spawner`,
 `Timer`, and `Connector`. See [Rust Client](docs/rust-client.md),
@@ -244,8 +254,14 @@ Musubi has no built-in PubSub abstraction — the application owns the broadcast
 - [Getting Started](guides/getting-started.md)
 - [Phoenix Setup](guides/phoenix-setup.md)
 - [Client and React](guides/client-and-react.md)
+- [Streams](guides/streams.md)
 - [Uploads](guides/uploads.md)
+- [Push Events](guides/push-events.md)
+- [Testing](guides/testing.md)
 - [Client Contract](docs/client-contract.md)
+- [Streams Reference](docs/streams.md)
+- [Uploads Reference](docs/uploads.md)
+- [Push Events Reference](docs/push-events.md)
 - [Persistence Pattern](docs/persistence-pattern.md)
 - [Rust Codegen](docs/rust-codegen.md)
 - [Rust Client](docs/rust-client.md)

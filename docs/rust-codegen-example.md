@@ -24,7 +24,7 @@ Feature coverage map:
 | Commands: payload + reply | `:apply_coupon`, `:pay` | `Command` impls | §3.6 |
 | Commands: empty payload / `{:noreply}` | `:refresh` | `Refresh {}` / `NoReply` | §3.6 |
 | Push events (BDR-0032), with/without payload | `:toast`, `:ping`, `:receipt_ready` | `Event` impls | §3.7 |
-| Uploads (BDR-0024…0027) | `upload :attachments` | inert `UploadSlot` (v1) | §3.8 |
+| Uploads (BDR-0024…0027) | `upload :attachments` | inert `UploadSlot` + runtime handle | §3.8 |
 | Reconnect (BDR-0015), reply-before-patch (BDR-0009) | — (runtime) | — | §3.5, §3.9 |
 
 `start_async/3`, lifecycle hooks, `send_update`, and PubSub `handle_info/2` are
@@ -231,8 +231,9 @@ pub mod demo {
             }
 
             /// The mount params object, one field per `attr/3` declaration: required
-            /// attrs are plain fields, optional ones `Option`. A store declaring no
-            /// `attr` gets an empty struct, which serializes to `{}`.
+            /// attrs are plain fields, optional ones `Option` that serialize to an
+            /// absent key rather than an explicit `null`. A store declaring no `attr`
+            /// gets an empty struct, which serializes to `{}`.
             #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
             pub struct Params {
                 pub cart_id: String,
@@ -341,8 +342,9 @@ pub mod demo {
             }
 
             /// The mount params object, one field per `attr/3` declaration: required
-            /// attrs are plain fields, optional ones `Option`. A store declaring no
-            /// `attr` gets an empty struct, which serializes to `{}`.
+            /// attrs are plain fields, optional ones `Option` that serialize to an
+            /// absent key rather than an explicit `null`. A store declaring no `attr`
+            /// gets an empty struct, which serializes to `{}`.
             #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
             pub struct Params {}
 
@@ -581,14 +583,25 @@ let mut receipts =
 Events are transient (BDR-0032): no ack, no replay; a cold client can miss
 mount-time events, and reconnect re-fires them (the server re-runs `mount`).
 
-### 3.8 Uploads (v1: inert)
+### 3.8 Uploads
 
 ```rust
-// v1 client: `attachments` deserializes from the wire marker as an inert
-// UploadSlot { name }. upload_ops are parsed and discarded; the transfer
-// engine (preflight, chunking, external mode) is deferred —
-// docs/rust-client.md §10.
-let _ = &state.attachments.name; // "attachments"
+// The state slot stays inert: `attachments` deserializes from the wire marker
+// as UploadSlot { name }, and that name is the key to the live handle. The
+// handle carries both planes — the server-driven data plane (snapshot(),
+// updates(), one item per envelope that touched it) and the client-driven
+// control plane (select / start / cancel / reset) — docs/rust-client.md §10.
+let slot_name = &state.attachments.name; // "attachments"
+let attachments = mounted.upload(&StoreId::root(), slot_name);
+
+let entries = attachments
+    .select(vec![UploadFile::new("spec.pdf", "application/pdf", bytes)])
+    .await?;                       // preflight: the server signs one token per entry
+attachments.start().await?;        // channel mode: binary chunks, sequential per entry
+
+// External (direct-to-S3) mode needs no call-site change: the server's
+// upload_external/3 names an uploader, registered on the builder via
+// ConnectionBuilder::uploader(name, impl Uploader) — the app does the PUT.
 ```
 
 ### 3.9 Teardown and reconnect

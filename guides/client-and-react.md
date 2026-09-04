@@ -384,8 +384,8 @@ class MusubiCommandError extends Error {
 `MusubiCommandError.is(value)` is a cross-module-safe type guard (uses
 `name` rather than `instanceof`, so it works across bundle boundaries).
 Use `error.code` for routing to user-visible copy; fall back to
-`error.message` for unstructured cases. `dispatchConnectionCommand` from
-`@musubi/client` throws the same class for direct-proxy callers.
+`error.message` for unstructured cases. Calling `dispatchCommand` on a
+store proxy directly throws the same class.
 
 ```tsx
 const { dispatch, error } = useMusubiCommand(cart, "checkout")

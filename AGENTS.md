@@ -4,7 +4,7 @@ Server-authoritative, page-scoped runtime library for Elixir/Phoenix. One BEAM p
 
 ## Stack
 
-- Elixir 1.18+ (CI matrix tests 1.18 + 1.19; local dev uses 1.19 via `mise`)
+- Elixir 1.18+ (CI matrix tests 1.18–1.20; local dev uses 1.20 via `mise`)
 - `{:typed_structor, "~> 0.6.1"}` — struct definitions and plugin-based metadata
 - `{:jsonpatch, "~> 2.2"}` (corka149/jsonpatch) — RFC 6902 diff/apply
 - `Phoenix.Channel` (transport, M4); `Phoenix.PubSub` is used by application code, not wrapped (BDR-0005)

@@ -2,8 +2,10 @@
 
 The runtime-free core of the Musubi Rust client: the patch engine (RFC 6902
 subset over a shadow `serde_json::Value`), client-owned stream materialization,
-hydration of the wire markers, mount/command/event lifecycle, and the support
-types the generated bundle (`mix compile.musubi_rust`) refers to.
+hydration of the wire markers, mount/command/event lifecycle, uploads (both
+planes), the stale-while-revalidate mount cache, the per-root mount status,
+and the support types the generated bundle (`mix compile.musubi_rust`) refers
+to.
 
 The crate depends on no executor: the socket, the task spawner and the clock
 are the `Connector` / `Spawner` / `Timer` traits of `phoenix-channel`. Tokio
@@ -58,7 +60,7 @@ There are deliberately no `Default` / `unwrap_or_default` conveniences:
 `Loading { result: None }` and `Ok` are different states and the app must
 branch.
 
-## Scope of v1
+## Scope
 
 Uploads are both observed and driven. `upload_ops` are folded into per-store
 handles you read with `Mounted::upload(&store_id, name)` — `snapshot()` and
@@ -68,7 +70,13 @@ which carries the handle's name. The crate reads no files: you hand it an
 `UploadFile` (bytes plus name and content type), and an external destination is
 your own `Uploader` registered on the builder. Reconnect is reconnect-only: a
 version gap or a rejoin keeps the last-good rendering and waits for a fresh
-initial envelope, and an upload in flight fails rather than resuming. See
+initial envelope, and an upload in flight fails rather than resuming. The
+reconnect window itself is renderable state:
+`Mounted::status()` / `status_updates()` report
+`MountStatus { Connecting, Live, Reconnecting }` (BDR-0033) while `snapshot()`
+keeps serving the last-good tree — the status annotates stale rendering, it
+never blanks it.
+
 Mounts can be stale-while-revalidate. `ConnectionBuilder::cache` takes a
 `CacheStore` — `MemoryCacheStore` ships here, a durable one is yours — and every
 mount then publishes the last-known wire tree for its `(module, id, params)`

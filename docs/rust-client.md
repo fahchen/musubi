@@ -942,6 +942,10 @@ impl<St: Store> Mounted<St> {
     pub fn events<E, T>(&self, store_id: &StoreId) -> impl Stream<Item = E> + Send + 'static
     where T: Store, E: Event<T>;
 
+    /// The live upload handle for `(store_id, name)` — the name is read off
+    /// the state struct's inert `UploadSlot` field. See §10.
+    pub fn upload(&self, store_id: &StoreId, name: &str) -> Upload;
+
     // No unmount method: unmounting is automatic. Dropping the last clone of
     // this handle leaves the channel (RAII) — see the "Unmount" note below.
 }
@@ -1552,6 +1556,7 @@ CI — `docs/rust-gpui-example.md` §8):
 | format | `cargo fmt --all --check` |
 | lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | runtime-free core | `cargo check -p musubi-client` + `cargo tree -p musubi-client -i tokio` matching nothing (the gpui embedder\'s configuration) |
+| codegen smoke test | `mix test --only rust` after the cargo tests, on both toolchain legs — the `docs/rust-codegen.md` §6.5 `cargo check` over the rendered probe bundle, which needs both the BEAM and a Rust toolchain and therefore lives here rather than in the Elixir job |
 | fixture drift | `mix musubi.capture_wire`, then `git add --intent-to-add` + `git diff --exit-code` over `crates/musubi-client/tests/fixtures` — a step of the **Elixir** `test` job, not this one, since it needs the BEAM. The `--intent-to-add` is what makes a brand-new scenario's untracked file count as drift. `mix test` asserts the same gate |
 
 ---

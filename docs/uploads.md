@@ -46,7 +46,7 @@ end
 
 - Upload names must be unique within a store.
 - An upload name must not collide with any state field name in the same
-  store (the client surface is flat at `page.<name>`).
+  store (the client surface is flat at `store.<name>`).
 - Uploads may only be declared at the top level of a store. They are
   rejected inside `state do`, `field do ... end`, list type specs, or
   stream blocks.
@@ -388,7 +388,7 @@ interface StoreProxy<M, R> {
   readonly __musubi_store_id__: readonly string[]
   dispatchCommand<K>(name: K, payload: ...): Promise<...>
   subscribe(listener: () => void): () => void
-  snapshot(): StoreSnapshot<M, R>
+  snapshot(): StoreSnapshot<M, R> | undefined
   // plus every declared state field as a typed property,
   // plus every declared upload as `UploadHandle`.
 }
@@ -420,7 +420,7 @@ await store.avatar.start()
 
 const unsubscribe = store.subscribe(() => {
   const s = store.snapshot()
-  console.log(s.avatar.status, s.avatar.progress)
+  if (s) console.log(s.avatar.status, s.avatar.progress)
 })
 
 await store.avatar.cancel(entryRef)
@@ -513,7 +513,7 @@ responsibility — Musubi ships no headless components.
    notifies the store pid, which enqueues `{op:progress}`.
 8. Drain emits envelopes; client mutates handle state in place.
 9. Final chunk → `{op:complete}`.
-10. `page.command("submit", {})` triggers `consume_uploaded_entries/3`.
+10. `store.dispatchCommand("submit", {})` triggers `consume_uploaded_entries/3`.
 11. Application moves the temp file, replies with result, and the server
     emits `{op:reset}` for the upload plus a normal JSON Patch for the
     state field that received the URL.

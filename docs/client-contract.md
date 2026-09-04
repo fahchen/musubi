@@ -276,8 +276,10 @@ type UploadError = {
     | "too_many_files"
     | "not_accepted"
     | "chunk_timeout"
+    | "chunk_too_large"
     | "external_failed"
     | "preflight_rejected"
+    | "internal"
     | (string & {})
   message: string
 }
@@ -751,7 +753,9 @@ interface StoreRuntime<M extends StoreModule<R>, R> {
     name: K,
     handler: (payload: EventPayload<M, K, R>) => void
   ): () => void
-  snapshot(): StoreSnapshot<M, R>
+  // `undefined` before the initial patch and when the node is absent from the
+  // index mid-reconnect — guard before dereferencing.
+  snapshot(): StoreSnapshot<M, R> | undefined
 }
 
 type StoreProxy<M extends StoreModule<R>, R> =
