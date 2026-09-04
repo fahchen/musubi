@@ -20,7 +20,11 @@ defmodule Musubi.MixProject do
         plt_local_path: "priv/plts/musubi.plt",
         plt_core_path: "priv/plts/core.plt",
         plt_add_apps: [:ex_unit, :mix],
-        ignore_warnings: ".dialyzer_ignore.exs"
+        ignore_warnings: ".dialyzer_ignore.exs",
+        # Fail on an ignore entry that no longer matches anything, so the
+        # narrow entries in `.dialyzer_ignore.exs` cannot rot into whole-file
+        # suppression as the code they cover moves.
+        list_unused_filters: true
       ],
       aliases: aliases()
     ]

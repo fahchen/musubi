@@ -186,8 +186,10 @@ defmodule Musubi.WireCapture.Recorder do
 
     # `:transport` carries `{Phoenix.ChannelTest, sup}` — what the test helper
     # puts there and what `Phoenix.ChannelTest.join/4` reads back out, even
-    # though `Phoenix.Socket.t()` declares `transport: atom`. That upstream
-    # mismatch is why `.dialyzer_ignore.exs` has an entry for this file.
+    # though `Phoenix.Socket.t()` declares `transport: atom`. That field, plus
+    # the `channel_pid`/`topic` nils any socket carries before it has joined,
+    # puts this struct outside `Phoenix.Socket.t()` no matter how it is built;
+    # `.dialyzer_ignore.exs` pins the resulting warning types one by one.
     phoenix_socket = %Phoenix.Socket{
       assigns: %{},
       endpoint: Endpoint,
