@@ -109,6 +109,12 @@ pub(crate) enum ActorMsg {
         /// The already-built payload.
         payload: Value,
         /// Where the outcome goes; `None` for a fire-and-forget push.
+        ///
+        /// The upload control plane's progress relay uses **both**: it awaits
+        /// each progress push, which is what bounds it to one in flight and
+        /// orders the next behind it, and detaches only the terminal report it
+        /// sends last — a transfer must not hang on the acknowledgement of a
+        /// report nothing is waiting for.
         reply: Option<oneshot::Sender<PushOutcome>>,
     },
     /// A cache read produced a usable entry for a root still awaiting its

@@ -170,6 +170,16 @@ pub enum TransferError {
         /// The entry whose transfer was cancelled.
         entry_ref: String,
     },
+    /// [`Upload::start`](crate::Upload::start) was called while a transfer of
+    /// the same handle was still running.
+    ///
+    /// The running one keeps the entries: a second transfer would join the same
+    /// `musubi_upload:<ref>` topic, which supersedes the first one's channel.
+    #[error("upload {name} is already transferring")]
+    AlreadyStarted {
+        /// The upload whose transfer is already in flight.
+        name: String,
+    },
     /// The server picked an external uploader this client did not register
     /// (BDR-0027).
     #[error("no uploader registered as {uploader:?}, which entry {entry_ref} needs")]

@@ -1044,6 +1044,28 @@ fn unmounting_a_root_ends_its_upload_streams() {
 }
 
 #[test]
+fn an_upload_subscription_taken_after_teardown_ends_instead_of_waiting_forever() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let held = cart.upload(&StoreId::root(), "avatar");
+
+    // The handle outlives the root, exactly as `events()` can: nothing rejoins
+    // afterwards, so neither a handle taken before the teardown nor one taken
+    // through the retired root after it can ever be published to.
+    harness.disconnect();
+
+    assert!(
+        ended(&mut held.updates()),
+        "a handle kept across the teardown"
+    );
+    assert!(
+        ended(&mut cart.upload(&StoreId::root(), "avatar").updates()),
+        "and one taken from the root afterwards, which the registry no longer has a cell for"
+    );
+}
+
+#[test]
 fn a_mount_whose_future_was_dropped_gives_its_hold_back() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();

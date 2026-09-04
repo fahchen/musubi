@@ -26,7 +26,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future;
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 use futures_channel::oneshot;
 use futures_core::future::BoxFuture;
@@ -42,7 +45,7 @@ use crate::generated::StoreId;
 use crate::lock;
 
 use super::ops::{COMPLETE, EntryStatus, UploadConfig, UploadEntry, UploadError, UploadStatus};
-use super::registry::Upload;
+use super::registry::{Upload, UploadCell};
 
 /// The main-channel preflight push (BDR-0024).
 const EVENT_ALLOW_UPLOAD: &str = "allow_upload";
@@ -180,35 +183,219 @@ pub struct UploadRequest {
 /// emit `{op: complete}`.
 #[derive(Clone)]
 pub struct UploadProgress {
-    control: Arc<UploadControl>,
-    store_id: StoreId,
-    name: String,
-    entry_ref: String,
+    relay: Arc<ProgressRelay>,
 }
 
 impl UploadProgress {
     /// Reports percent complete, clamped to `0..=100`.
     ///
+    /// Reports are **coalesced**, never queued: at most one relay push per
+    /// entry is in flight, and the next one carries the newest value reported
+    /// while it was. An uploader reporting every few kilobytes therefore cannot
+    /// outrun the socket — it only overwrites a number.
+    ///
     /// ```text
     /// request.progress.report(sent * 100 / total);
     /// ```
     pub fn report(&self, percent: u32) {
-        self.control.push_detached(
-            EVENT_UPLOAD_PROGRESS,
-            json!({
-                "store_id": self.store_id,
-                "name": self.name,
-                "ref": self.entry_ref,
-                "progress": percent.min(COMPLETE),
-            }),
-        );
+        self.relay.report(percent.min(COMPLETE));
     }
 }
 
 impl fmt::Debug for UploadProgress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UploadProgress")
+            .field("entry_ref", &self.relay.entry_ref)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One external entry's report channel to the server, and the only producer in
+/// this client that an app controls the rate of.
+///
+/// Each report used to be an independent detached push: one unbounded
+/// `ActorMsg::RootPush`, one spawned task, one unbounded socket push, one
+/// inflight-map entry and one timeout task, with nothing throttling any of it.
+/// That is the one thing here that can sustainably outrun frame encoding, and
+/// doing so starves the socket read loop — a spurious reconnect mid-upload,
+/// taking every concurrent command with it.
+///
+/// So reports coalesce to their latest value, and the transfer's outcome is a
+/// **barrier**: it is pushed last and nothing follows it. Without that the two
+/// were independent, and a queued progress could land after `upload_error` —
+/// which moves an entry the server already failed back to uploading
+/// (`lib/musubi/page/server.ex`).
+struct ProgressRelay {
+    control: Arc<UploadControl>,
+    store_id: StoreId,
+    name: String,
+    entry_ref: String,
+    /// The entry's own signal. Cancellation *deletes* the entry server-side, so
+    /// a report that lands afterwards would recreate state for something the
+    /// user abandoned: once this is raised the relay sends nothing more, not
+    /// even the final `100`.
+    cancel: CancelSignal,
+    state: Mutex<RelayState>,
+}
+
+/// What the relay has been told but not yet sent.
+#[derive(Debug, Default)]
+struct RelayState {
+    /// The newest unsent percentage. Overwritten, never queued.
+    pending: Option<u32>,
+    /// The transfer's outcome, once it has one.
+    outcome: Option<TransferOutcome>,
+    /// Woken by `report` and `close`; taken by whoever wakes.
+    waker: Option<Waker>,
+}
+
+/// How an external transfer ended, as the relay reports it.
+#[derive(Debug)]
+enum TransferOutcome {
+    /// The uploader resolved. `progress: 100` is the completion signal — there
+    /// is no other one in external mode.
+    Succeeded,
+    /// The uploader failed; the server is told, as `external_failed`.
+    Failed {
+        /// The uploader's own message, propagated verbatim.
+        message: String,
+    },
+}
+
+/// What the relay does next.
+#[derive(Debug)]
+enum RelayStep {
+    /// Push this percentage, then keep relaying.
+    Progress(u32),
+    /// Push this terminal event, then stop.
+    Terminal(&'static str, Value),
+    /// Stop without pushing anything.
+    Stop,
+}
+
+impl ProgressRelay {
+    /// Records the newest percentage, unless the transfer already ended.
+    fn report(&self, percent: u32) {
+        let waker = {
+            let mut state = lock(&self.state);
+
+            // A report after the barrier is late by definition: the uploader
+            // resolved, and its outcome is the last word on the entry.
+            if state.outcome.is_some() {
+                return;
+            }
+
+            state.pending = Some(percent);
+
+            state.waker.take()
+        };
+
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Closes the relay with the transfer's outcome.
+    fn close(&self, outcome: TransferOutcome) {
+        let waker = {
+            let mut state = lock(&self.state);
+
+            state.outcome = Some(outcome);
+
+            state.waker.take()
+        };
+
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Relays until the transfer is closed and its terminal report has gone
+    /// out.
+    ///
+    /// One progress push at a time, **awaited**: the reply is what "in flight"
+    /// means, and awaiting it is what orders everything behind it. Failures are
+    /// ignored — the relay is advisory, and a report the server never saw must
+    /// not fail the transfer.
+    async fn run(&self) {
+        loop {
+            match future::poll_fn(|cx| self.poll_next(cx)).await {
+                RelayStep::Progress(percent) => {
+                    let _ = self
+                        .control
+                        .push(EVENT_UPLOAD_PROGRESS, self.progress_payload(percent))
+                        .await;
+                }
+                RelayStep::Terminal(event, payload) => {
+                    self.control.push_detached(event, payload);
+
+                    return;
+                }
+                RelayStep::Stop => return,
+            }
+        }
+    }
+
+    /// Picks the next thing to send, parking until there is one.
+    fn poll_next(&self, cx: &mut Context<'_>) -> Poll<RelayStep> {
+        let mut state = lock(&self.state);
+
+        if self.cancel.is_cancelled() {
+            return Poll::Ready(RelayStep::Stop);
+        }
+
+        // A failure supersedes whatever is still queued: the server moves an
+        // entry it already failed back to uploading for a progress that lands
+        // after the error (`lib/musubi/page/server.ex`), so an unsent report
+        // dies with the transfer. Success does not — a percentage the server
+        // has not seen yet is still true, and the final `100` follows it.
+        if matches!(state.outcome, Some(TransferOutcome::Failed { .. })) {
+            state.pending = None;
+        }
+
+        if let Some(percent) = state.pending.take() {
+            return Poll::Ready(RelayStep::Progress(percent));
+        }
+
+        if let Some(outcome) = state.outcome.take() {
+            return Poll::Ready(match outcome {
+                TransferOutcome::Succeeded => {
+                    RelayStep::Terminal(EVENT_UPLOAD_PROGRESS, self.progress_payload(COMPLETE))
+                }
+                TransferOutcome::Failed { message } => RelayStep::Terminal(
+                    EVENT_UPLOAD_ERROR,
+                    json!({
+                        "store_id": self.store_id,
+                        "name": self.name,
+                        "ref": self.entry_ref,
+                        "code": CODE_EXTERNAL_FAILED,
+                        "message": message,
+                    }),
+                ),
+            });
+        }
+
+        state.waker = Some(cx.waker().clone());
+
+        Poll::Pending
+    }
+
+    /// One `upload_progress` payload.
+    fn progress_payload(&self, percent: u32) -> Value {
+        json!({
+            "store_id": self.store_id,
+            "name": self.name,
+            "ref": self.entry_ref,
+            "progress": percent,
+        })
+    }
+}
+
+impl fmt::Debug for ProgressRelay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProgressRelay")
             .field("entry_ref", &self.entry_ref)
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
@@ -326,6 +513,26 @@ pub(in crate::uploads) struct EntryTransport {
     channel: Option<Channel>,
 }
 
+impl EntryTransport {
+    /// Aborts this entry: raises its cancellation and leaves the sub-channel,
+    /// which is what makes the server drop the partial file.
+    ///
+    /// **The one place either happens.** Deleting the map entry does not stop
+    /// anything on its own: a running transfer cloned the bytes, the mode and
+    /// the signal before its first await and holds an `Arc` of the cell, so it
+    /// survives the deletion — and in external mode the app's own PUT would then
+    /// run to completion, landing the file in the destination bucket after the
+    /// user cancelled it or navigated away. Aborting is exactly what
+    /// `CancelSignal` is for, so every retirement goes through here.
+    pub(in crate::uploads) fn abort(&mut self) {
+        self.cancel.cancel();
+
+        if let Some(channel) = self.channel.take() {
+            let _ = channel.leave();
+        }
+    }
+}
+
 /// How one entry's bytes travel, as preflight decided (BDR-0027).
 #[derive(Debug, Clone)]
 enum TransferMode {
@@ -393,8 +600,13 @@ impl UploadControl {
         }
     }
 
-    /// Pushes without waiting: the progress relay and the failure report are
-    /// advisory, and the TypeScript client does not await them either.
+    /// Pushes without waiting for the reply.
+    ///
+    /// Only the relay's **terminal** report goes this way: it is the last thing
+    /// an entry sends, so there is nothing left for its acknowledgement to
+    /// order, and a transfer must not hang on a reply nothing reads. Everything
+    /// before it is awaited, which is what bounds the relay to one push in
+    /// flight.
     fn push_detached(&self, event: &'static str, payload: Value) {
         let _ = self.inner.send(ActorMsg::RootPush {
             root_id: Arc::clone(&self.root_id),
@@ -431,6 +643,12 @@ impl Upload {
     /// The matching `{op: add}` ops arrive **after** this reply (BDR-0009), and
     /// merge into the entries seeded here.
     ///
+    /// A preflight that fails leaves the handle in [`UploadStatus::Error`] —
+    /// including when this future is dropped before the reply lands. The error
+    /// is returned to the caller *and* published, because the caller is rarely
+    /// the only one watching: a spinner bound to `status` would otherwise sit in
+    /// [`UploadStatus::Selecting`] forever.
+    ///
     /// ```text
     /// let entries = avatar.select(vec![UploadFile::new("me.png", "image/png", bytes)]).await?;
     /// ```
@@ -440,6 +658,11 @@ impl Upload {
         }
 
         let control = self.control()?.clone();
+        // Armed across everything below, and the reason none of the `?`s need
+        // to know about status: whatever ends this selection short of the
+        // final write — a rejected push, a timeout, a malformed reply, or the
+        // future being dropped — publishes `Error` when the guard goes.
+        let selection = self.cell.begin_selection();
 
         self.cell.update(|handle| {
             handle.status = UploadStatus::Selecting;
@@ -473,38 +696,47 @@ impl Upload {
         let reply: PreflightReply = serde_json::from_value(reply)
             .map_err(|_| MusubiError::Protocol("allow_upload reply did not match the contract"))?;
 
-        // The reply keys entries by the client_ref this call chose, which is
-        // the file's index; sorting by it keeps entry order = selection order
-        // whatever order the server's map iterates in.
-        let mut accepted: Vec<(usize, AcceptedEntry)> = reply
-            .entries
-            .into_iter()
-            .filter_map(|(client_ref, entry)| Some((client_ref.parse().ok()?, entry)))
-            .collect();
+        let mut accepted: Vec<(usize, AcceptedEntry)> = Vec::with_capacity(reply.entries.len());
 
+        for (client_ref, entry) in reply.entries {
+            // The reply keys entries by the `client_ref` this call chose, which
+            // is the file's index. Anything else is the server describing a
+            // file this selection never offered: there is no file to transfer
+            // and no entry for an error to attach to, so it fails the
+            // selection rather than being skipped — a reply made only of those
+            // would otherwise finish with no entries, no errors, and a handle
+            // still reading `selecting`.
+            let index = client_ref
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index < files.len())
+                .ok_or(MusubiError::Protocol(
+                    "allow_upload reply named a client_ref this selection never offered",
+                ))?;
+
+            accepted.push((index, entry));
+        }
+
+        // Sorted by the offered index, so entry order is selection order
+        // whatever order the server's map iterates in.
         accepted.sort_by_key(|(index, _)| *index);
 
+        let mut transport = Vec::with_capacity(accepted.len());
         let mut seeded = Vec::with_capacity(accepted.len());
 
         for (index, accepted) in accepted {
-            // A `client_ref` this call never offered is the server talking
-            // about a file we do not have; there is nothing to transfer.
-            let Some(file) = files.get(index) else {
-                continue;
-            };
+            let file = &files[index];
             let (entry_ref, mode) = accepted.split();
 
-            self.cell.transport(|transport| {
-                transport.insert(
-                    entry_ref.clone(),
-                    EntryTransport {
-                        bytes: Arc::clone(&file.bytes),
-                        mode,
-                        cancel: CancelSignal::default(),
-                        channel: None,
-                    },
-                )
-            });
+            transport.push((
+                entry_ref.clone(),
+                EntryTransport {
+                    bytes: Arc::clone(&file.bytes),
+                    mode,
+                    cancel: CancelSignal::default(),
+                    channel: None,
+                },
+            ));
 
             seeded.push(UploadEntry {
                 r#ref: entry_ref,
@@ -517,7 +749,16 @@ impl Upload {
             });
         }
 
+        // Refused outright if the handle was retired while the preflight was in
+        // flight: a teardown aborts the transport state it can see, and state
+        // inserted behind it would never be aborted by anything.
+        if !self.cell.insert_transport(transport) {
+            return Err(MusubiError::Unmounted);
+        }
+
         let errors: Vec<UploadError> = reply.errors.into_iter().map(|error| error.error).collect();
+
+        selection.settled();
 
         Ok(self.cell.update(|handle| {
             handle.config = reply.config;
@@ -548,12 +789,30 @@ impl Upload {
     ///
     /// The first failure is returned; the rest still ran to completion.
     ///
+    /// An entry is transferred **once**: finishing it consumes its transport
+    /// state, so calling this again after a transfer — or after a cancellation
+    /// — moves only what is still outstanding. A second call while one is
+    /// running is refused with [`TransferError::AlreadyStarted`] rather than
+    /// racing it.
+    ///
     /// ```text
     /// avatar.select(files).await?;
     /// avatar.start().await?;
     /// ```
     pub async fn start(&self) -> Result<()> {
         let control = self.control()?.clone();
+
+        // One transfer per handle. Two concurrent ones would attach the same
+        // `musubi_upload:<ref>` topic twice: the socket replaces the registry
+        // entry and bumps the generation, so the loser is disconnected, its
+        // pushes go stale, and its cleanup clears the channel the winner is
+        // still using — after which no `cancel` can leave it.
+        let Some(_claim) = self.cell.claim_transfer() else {
+            return Err(TransferError::AlreadyStarted {
+                name: self.cell.name.clone(),
+            }
+            .into());
+        };
 
         self.cell
             .update(|handle| handle.status = UploadStatus::Uploading);
@@ -635,13 +894,12 @@ impl Upload {
         };
 
         for entry_ref in refs {
+            // Aborted, not removed: the entry is deleted by the `{op: cancel}`
+            // the server answers with, which is what also retires its transport
+            // state.
             self.cell.transport(|transport| {
                 if let Some(entry) = transport.get_mut(&entry_ref) {
-                    entry.cancel.cancel();
-
-                    if let Some(channel) = entry.channel.take() {
-                        let _ = channel.leave();
-                    }
+                    entry.abort();
                 }
             });
 
@@ -671,7 +929,7 @@ impl Upload {
     pub async fn reset(&self) -> Result<()> {
         self.cancel(None).await?;
 
-        self.cell.transport(HashMap::clear);
+        self.cell.drop_transport(None);
         self.cell.update(|handle| {
             handle.entries.clear();
             handle.errors.clear();
@@ -706,6 +964,18 @@ impl Upload {
             })
         }) else {
             return Ok(());
+        };
+
+        // The entry belongs to this transfer from here on, and leaves with it
+        // whatever the outcome — including the `start()` future being dropped,
+        // which no code on the post-await path could promise. Consuming on
+        // *every* terminal outcome is also what stops a later `start()` sending
+        // the same entry again: the preflight token verifies statelessly for
+        // 600s and the server opens a fresh temp file each time, so a replay
+        // orphans the one before it.
+        let _consumed = Transferred {
+            cell: Arc::clone(&self.cell),
+            entry_ref: entry.r#ref.clone(),
         };
 
         match mode {
@@ -745,12 +1015,31 @@ impl Upload {
             .await
             .map_err(|_| MusubiError::Disconnected)?;
 
-        // Recorded so `cancel` can leave it mid-transfer.
-        self.cell.transport(|transport| {
-            if let Some(state) = transport.get_mut(entry_ref) {
-                state.channel = Some(channel.clone());
+        // Recorded so `cancel` can leave it mid-transfer — and, when the entry
+        // went away while the socket was opening it, left right here. Nothing
+        // else knows about this channel yet: the retirement that removed the
+        // entry ran before there was anything to take, so a channel that fails
+        // to claim its entry has this frame as its only owner, and one left
+        // registered would be rejoined by the socket's own recovery.
+        let claimed = self
+            .cell
+            .transport(|transport| match transport.get_mut(entry_ref) {
+                Some(state) => {
+                    state.channel = Some(channel.clone());
+
+                    true
+                }
+                None => false,
+            });
+
+        if !claimed {
+            let _ = channel.leave();
+
+            return Err(TransferError::Cancelled {
+                entry_ref: entry_ref.to_owned(),
             }
-        });
+            .into());
+        }
 
         let outcome = async {
             channel.join().map_err(|_| MusubiError::Disconnected)?;
@@ -857,49 +1146,80 @@ impl Upload {
             .into());
         };
 
-        let progress = UploadProgress {
+        let relay = Arc::new(ProgressRelay {
             control: Arc::clone(control),
             store_id: self.cell.store_id.clone(),
             name: self.cell.name.clone(),
             entry_ref: entry_ref.clone(),
-        };
+            cancel: cancel.clone(),
+            state: Mutex::new(RelayState::default()),
+        });
 
         let request = UploadRequest {
             entry,
             bytes,
             meta,
-            progress: progress.clone(),
+            progress: UploadProgress {
+                relay: Arc::clone(&relay),
+            },
             cancel,
         };
 
-        match implementation.upload(request).await {
-            Ok(()) => {
-                // What makes the server mark the entry `:success` and emit
-                // `{op: complete}` — there is no other completion signal in
-                // external mode.
-                progress.report(COMPLETE);
+        // The relay runs on *this* task, beside the uploader: the crate spawns
+        // nothing, and a detached push is what made the old relay unbounded and
+        // unordered in the first place. `run` only resolves early when the
+        // entry was cancelled, which is why the flag is needed at all.
+        let mut uploading = pin!(implementation.upload(request));
+        let mut relaying = pin!(relay.run());
+        let mut relayed = false;
 
-                Ok(())
+        let outcome = future::poll_fn(|cx| {
+            if !relayed && relaying.as_mut().poll(cx).is_ready() {
+                relayed = true;
             }
-            Err(error) => {
-                control.push_detached(
-                    EVENT_UPLOAD_ERROR,
-                    json!({
-                        "store_id": self.cell.store_id,
-                        "name": self.cell.name,
-                        "ref": entry_ref,
-                        "code": CODE_EXTERNAL_FAILED,
-                        "message": error.message,
-                    }),
-                );
 
-                Err(TransferError::Uploader {
-                    entry_ref,
-                    message: error.message,
-                }
-                .into())
-            }
+            uploading.as_mut().poll(cx)
+        })
+        .await;
+
+        relay.close(match &outcome {
+            Ok(()) => TransferOutcome::Succeeded,
+            Err(error) => TransferOutcome::Failed {
+                message: error.message.clone(),
+            },
+        });
+
+        // Drains the barrier: the final `progress: 100` — the only thing that
+        // makes the server mark the entry `:success` and emit `{op: complete}`
+        // — or the `upload_error` that fails it, and nothing after either.
+        if !relayed {
+            relaying.await;
         }
+
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) => Err(TransferError::Uploader {
+                entry_ref,
+                message: error.message,
+            }
+            .into()),
+        }
+    }
+}
+
+/// Consumes one entry's transport state when its transfer ends.
+///
+/// A guard rather than a step after the await: dropping the `start()` future —
+/// a `select!` losing its race, a task abandoned on navigation — must still
+/// retire the entry and leave whatever sub-channel it had joined.
+struct Transferred {
+    cell: Arc<UploadCell>,
+    entry_ref: String,
+}
+
+impl Drop for Transferred {
+    fn drop(&mut self) {
+        self.cell.drop_transport(Some(&self.entry_ref));
     }
 }
 

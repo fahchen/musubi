@@ -6,10 +6,15 @@
 //! Nothing here sleeps: the executor is a `LocalPool` the test pumps by hand
 //! and every timer fires only when a test says so.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use futures_channel::oneshot;
 use futures_core::future::BoxFuture;
+use futures_util::future::{Either, select};
 use musubi_client::generated::{Store, StoreId};
 use musubi_client::{
     Connection, EntryStatus, Mounted, MusubiError, PatchEngine, TransferError, Upload, UploadEntry,
@@ -128,6 +133,102 @@ fn select_keeps_the_entry_an_add_op_already_created() {
         [UploadEntry { r#ref, progress: 40, status: EntryStatus::Uploading, .. }]
             if r#ref == "u_1"
     ));
+}
+
+#[test]
+fn a_rejected_preflight_leaves_the_handle_in_error_rather_than_selecting() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    let selecting = harness.select(&avatar, vec![png("me.png", b"abcde")]);
+    let sent = server.sent(&mut harness);
+
+    server.reply(
+        &sent[0],
+        ReplyStatus::Error,
+        json!({"reason": "uploads are closed"}),
+    );
+
+    assert!(matches!(
+        harness.settle(selecting),
+        Err(MusubiError::Transfer(TransferError::Rejected { event, reason }))
+            if event == "allow_upload" && reason == "uploads are closed"
+    ));
+    // The caller gets the error, but it is rarely the only one watching: a
+    // spinner bound to `status` would otherwise never resolve.
+    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+}
+
+#[test]
+fn a_preflight_that_times_out_leaves_the_handle_in_error_rather_than_selecting() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    let selecting = harness.select(&avatar, vec![png("me.png", b"abcde")]);
+    assert_eq!(server.sent(&mut harness).len(), 1);
+
+    harness.fire(PUSH_TIMEOUT);
+
+    assert!(matches!(
+        harness.settle(selecting),
+        Err(MusubiError::Timeout)
+    ));
+    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+}
+
+#[test]
+fn abandoning_a_preflight_leaves_the_handle_in_error_rather_than_selecting() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    let (abandon, selecting) = harness.select_abandonable(&avatar, vec![png("me.png", b"abcde")]);
+    assert_eq!(server.sent(&mut harness).len(), 1);
+    assert_eq!(avatar.snapshot().status, UploadStatus::Selecting);
+
+    // Nothing on the error path runs when the future itself goes away, so the
+    // transition out of `selecting` cannot live there.
+    abandon.now(&mut harness);
+
+    assert!(
+        harness.settle(selecting).is_none(),
+        "the preflight was dropped"
+    );
+    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+}
+
+#[test]
+fn a_reply_naming_a_client_ref_this_selection_never_offered_is_a_protocol_error() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    let selecting = harness.select(&avatar, vec![png("me.png", b"abcde")]);
+    let sent = server.sent(&mut harness);
+
+    // One file was offered, under `client_ref: "0"`. An entry for anything else
+    // describes a file this client does not have: skipping it silently would
+    // finish with no entries, no errors, and a handle still reading `selecting`.
+    server.reply(
+        &sent[0],
+        ReplyStatus::Ok,
+        preflight(
+            json!({"7": {"type": "channel", "entry_ref": "u_1", "token": "tok"}}),
+            json!([]),
+        ),
+    );
+
+    assert!(matches!(
+        harness.settle(selecting),
+        Err(MusubiError::Protocol(_))
+    ));
+    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
 }
 
 #[test]
@@ -418,6 +519,128 @@ fn cancelling_mid_transfer_leaves_the_sub_channel_and_tells_the_page_server() {
 }
 
 #[test]
+fn a_server_cancel_op_leaves_the_sub_channel_of_the_transfer_it_kills() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    harness.preflight_one(&mut server, &avatar, b"abcde");
+    let starting = harness.start(&avatar);
+    harness.join_upload_channel(&mut server);
+    assert_eq!(
+        server.sent_binary(&mut harness).len(),
+        1,
+        "one chunk in flight"
+    );
+
+    // Somebody else cancelled the entry — another tab, or a server-side rule.
+    // The op *deletes* it (BDR-0025), and deleting the transport state is not
+    // enough on its own: the transfer cloned everything it needs before its
+    // first await, so only the signal and the leave stop it.
+    server.push_event(
+        &join,
+        "patch",
+        upload_envelope(
+            1,
+            2,
+            json!([
+                add_op("u_1", 0),
+                {"op": "cancel", "upload": "avatar", "store_id": [], "ref": "u_1"}
+            ]),
+        ),
+    );
+    harness.pump();
+
+    assert!(
+        matches!(
+            server.sent(&mut harness).as_slice(),
+            [Message { topic, event, .. }] if topic == UPLOAD_TOPIC && event == "phx_leave"
+        ),
+        "the sub-channel is left, which is what makes the server drop the partial file"
+    );
+
+    harness.fire(PUSH_TIMEOUT);
+    assert!(harness.settle(starting).is_err());
+}
+
+#[test]
+fn a_server_cancel_op_raises_the_signal_an_external_uploader_is_waiting_on() {
+    let mut harness = Harness::with_uploader(CancellableUploader);
+    let mut server = harness.queue_socket();
+    let (join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    harness.preflight(
+        &mut server,
+        &avatar,
+        b"abcde",
+        json!({"0": {"type": "external", "entry_ref": "u_1", "uploader": "S3", "meta": {}}}),
+    );
+
+    let starting = harness.start(&avatar);
+    assert!(
+        server.sent(&mut harness).is_empty(),
+        "the uploader is parked on its cancellation signal"
+    );
+
+    server.push_event(
+        &join,
+        "patch",
+        upload_envelope(
+            1,
+            2,
+            json!([
+                add_op("u_1", 0),
+                {"op": "cancel", "upload": "avatar", "store_id": [], "ref": "u_1"}
+            ]),
+        ),
+    );
+    harness.pump();
+
+    // Without the signal the app's own PUT runs to completion and the file
+    // lands in the destination bucket after the user abandoned it.
+    assert!(harness.settle(starting).is_ok());
+    assert!(
+        server.sent(&mut harness).is_empty(),
+        "nothing is reported for an entry the server already deleted — a `100` \
+         would move it back to success"
+    );
+}
+
+#[test]
+fn unmounting_the_root_mid_transfer_leaves_the_sub_channel() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    harness.preflight_one(&mut server, &avatar, b"abcde");
+    let starting = harness.start(&avatar);
+    harness.join_upload_channel(&mut server);
+    assert_eq!(
+        server.sent_binary(&mut harness).len(),
+        1,
+        "one chunk in flight"
+    );
+
+    // Navigating away. The registry is cleared, and a transfer it left running
+    // would keep pushing into a sub-channel nobody is going to leave.
+    drop(cart);
+    harness.pump();
+
+    let sent = server.sent(&mut harness);
+    assert!(
+        sent.iter()
+            .any(|frame| frame.topic == UPLOAD_TOPIC && frame.event == "phx_leave"),
+        "expected the sub-channel to be left too, got {sent:?}"
+    );
+
+    harness.fire(PUSH_TIMEOUT);
+    assert!(harness.settle(starting).is_err());
+}
+
+#[test]
 fn reset_cancels_every_entry_and_returns_the_handle_to_idle() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
@@ -440,6 +663,127 @@ fn reset_cancels_every_entry_and_returns_the_handle_to_idle() {
     let handle = avatar.snapshot();
     assert_eq!(handle.status, UploadStatus::Idle);
     assert!(handle.entries.is_empty() && handle.errors.is_empty());
+}
+
+#[test]
+fn starting_again_after_a_finished_transfer_does_not_send_the_entry_twice() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    harness.preflight_one(&mut server, &avatar, b"abcde");
+
+    let starting = harness.start(&avatar);
+    harness.join_upload_channel(&mut server);
+
+    for progress in [40, 80, 100] {
+        let pushes = server.sent_binary(&mut harness);
+
+        server.reply_binary(&pushes[0], ReplyStatus::Ok, json!({"progress": progress}));
+    }
+
+    assert!(harness.settle(starting).is_ok());
+    assert_eq!(
+        server.sent(&mut harness).len(),
+        1,
+        "the finished sub-channel is left"
+    );
+
+    // The preflight token verifies statelessly for 600s and the server opens a
+    // fresh temp file per join, so a replay would orphan the one it already
+    // wrote — and overwrite the entry's path with an empty file.
+    let again = harness.start(&avatar);
+
+    assert!(harness.settle(again).is_ok());
+    assert!(
+        server.sent(&mut harness).is_empty(),
+        "a finished entry is consumed: there is nothing left to transfer"
+    );
+    assert!(server.sent_binary(&mut harness).is_empty());
+}
+
+#[test]
+fn a_second_start_while_one_is_running_is_refused_rather_than_racing_it() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    harness.preflight_one(&mut server, &avatar, b"abcde");
+
+    let starting = harness.start(&avatar);
+    harness.join_upload_channel(&mut server);
+    assert_eq!(
+        server.sent_binary(&mut harness).len(),
+        1,
+        "one chunk in flight"
+    );
+
+    // A second transfer would join `musubi_upload:u_1` again; attaching
+    // replaces the socket's registry entry and bumps the generation, so the
+    // first transfer's pushes go stale and its cleanup clears the channel the
+    // second one is using.
+    let second = harness.start(&avatar);
+
+    assert!(
+        server.sent(&mut harness).is_empty(),
+        "the second start opens no channel of its own"
+    );
+    assert!(matches!(
+        harness.settle(second),
+        Err(MusubiError::Transfer(TransferError::AlreadyStarted { name })) if name == "avatar"
+    ));
+
+    // And the first one is still the transfer that owns the entry.
+    let pushes = server.sent_binary(&mut harness);
+    assert!(pushes.is_empty(), "no second stream of chunks: {pushes:?}");
+
+    harness.fire(PUSH_TIMEOUT);
+    assert!(harness.settle(starting).is_err());
+}
+
+#[test]
+fn abandoning_a_transfer_leaves_its_sub_channel_and_retires_its_entry() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    harness.preflight_one(&mut server, &avatar, b"abcde");
+
+    let (abandon, starting) = harness.start_abandonable(&avatar);
+    harness.join_upload_channel(&mut server);
+    assert_eq!(
+        server.sent_binary(&mut harness).len(),
+        1,
+        "one chunk in flight"
+    );
+
+    // The `select!` that lost its race, the task dropped on navigation: no code
+    // on the post-await path runs, so the cleanup has to be `Drop`'s.
+    abandon.now(&mut harness);
+
+    assert!(
+        harness.settle(starting).is_none(),
+        "the transfer was dropped"
+    );
+    assert!(
+        matches!(
+            server.sent(&mut harness).as_slice(),
+            [Message { topic, event, .. }] if topic == UPLOAD_TOPIC && event == "phx_leave"
+        ),
+        "the sub-channel it joined is left, or the socket's recovery rejoins it"
+    );
+
+    // The claim went with it, and so did the entry.
+    let again = harness.start(&avatar);
+
+    assert!(harness.settle(again).is_ok());
+    assert!(
+        server.sent(&mut harness).is_empty(),
+        "the abandoned entry is retired, not left for the next start to re-send"
+    );
 }
 
 #[test]
@@ -492,6 +836,22 @@ fn external_mode_hands_the_bytes_to_the_registered_uploader_and_relays_progress(
     );
 
     let starting = harness.start(&avatar);
+
+    // One relay push at a time: the uploader's own report goes out first and
+    // the transfer does not resolve until the server has acknowledged it.
+    let relayed = server.sent(&mut harness);
+    assert!(
+        matches!(
+            relayed.as_slice(),
+            [Message { event, payload, .. }]
+                if event == "upload_progress"
+                    && payload["progress"] == json!(50)
+                    && payload["ref"] == json!("u_1")
+        ),
+        "expected one in-flight progress relay, got {relayed:?}"
+    );
+
+    server.reply(&relayed[0], ReplyStatus::Ok, json!({}));
     assert!(harness.settle(starting).is_ok());
 
     let calls = calls.lock().unwrap();
@@ -509,18 +869,70 @@ fn external_mode_hands_the_bytes_to_the_registered_uploader_and_relays_progress(
     assert!(
         matches!(
             server.sent(&mut harness).as_slice(),
-            [
-                Message { event: first, payload: half, .. },
-                Message { event: second, payload: done, .. },
-            ] if first == "upload_progress"
-                && second == "upload_progress"
-                && half["progress"] == json!(50)
-                && done["progress"] == json!(100)
-                && done["ref"] == json!("u_1")
+            [Message { event, payload, .. }]
+                if event == "upload_progress"
+                    && payload["progress"] == json!(100)
+                    && payload["ref"] == json!("u_1")
         ),
-        "the uploader's own report is relayed, then 100 once it resolves"
+        "then 100 once the uploader resolves — the only completion signal there is"
     );
     assert_eq!(avatar.snapshot().status, UploadStatus::Success);
+}
+
+#[test]
+fn progress_reported_faster_than_the_socket_drains_coalesces_to_the_latest_value() {
+    let mut harness = Harness::with_uploader(FloodingUploader);
+    let mut server = harness.queue_socket();
+    let (_join, cart) = harness.mount(&mut server, "cart");
+    let avatar = cart.upload(&StoreId::root(), "avatar");
+
+    harness.preflight(
+        &mut server,
+        &avatar,
+        b"abcde",
+        json!({"0": {"type": "external", "entry_ref": "u_1", "uploader": "S3", "meta": {}}}),
+    );
+
+    let starting = harness.start(&avatar);
+
+    // A hundred reports, none of them acknowledged: exactly one push is on the
+    // wire. Unbounded relaying would have queued a hundred `RootPush`es, a
+    // hundred spawned tasks and a hundred inflight-map entries, and starved the
+    // socket read loop doing it.
+    let first = server.sent(&mut harness);
+    assert!(
+        matches!(
+            first.as_slice(),
+            [Message { event, payload, .. }]
+                if event == "upload_progress" && payload["progress"] == json!(1)
+        ),
+        "expected a single in-flight relay, got {first:?}"
+    );
+
+    server.reply(&first[0], ReplyStatus::Ok, json!({}));
+
+    // The one after it carries the newest value, not the next one in line.
+    let second = server.sent(&mut harness);
+    assert!(
+        matches!(
+            second.as_slice(),
+            [Message { event, payload, .. }]
+                if event == "upload_progress" && payload["progress"] == json!(99)
+        ),
+        "expected the latest value, got {second:?}"
+    );
+
+    server.reply(&second[0], ReplyStatus::Ok, json!({}));
+    assert!(harness.settle(starting).is_ok());
+
+    assert!(
+        matches!(
+            server.sent(&mut harness).as_slice(),
+            [Message { event, payload, .. }]
+                if event == "upload_progress" && payload["progress"] == json!(100)
+        ),
+        "and the completion report is last"
+    );
 }
 
 #[test]
@@ -550,16 +962,14 @@ fn an_uploader_that_rejects_is_reported_as_external_failed() {
     assert!(
         matches!(
             server.sent(&mut harness).as_slice(),
-            [
-                Message { event: relayed, .. },
-                Message { event: failed, payload, .. },
-            ] if relayed == "upload_progress"
-                && failed == "upload_error"
-                && payload["code"] == json!("external_failed")
-                && payload["message"] == json!("403 Forbidden")
-                && payload["ref"] == json!("u_1")
+            [Message { event, payload, .. }]
+                if event == "upload_error"
+                    && payload["code"] == json!("external_failed")
+                    && payload["message"] == json!("403 Forbidden")
+                    && payload["ref"] == json!("u_1")
         ),
-        "progress reported before the failure is still relayed, then the failure itself"
+        "the failure is the last word: a progress the relay had not sent yet dies with it, \
+         because the server moves an entry it already failed back to uploading for one"
     );
     assert_eq!(avatar.snapshot().status, UploadStatus::Error);
 }
@@ -621,6 +1031,59 @@ impl Uploader for ScriptedUploader {
 
             outcome.map_err(UploaderError::new)
         })
+    }
+}
+
+/// Waits for its cancellation signal and then gives up, which is what an
+/// uploader that `select!`s on `cancelled()` around its own request does.
+struct CancellableUploader;
+
+impl Uploader for CancellableUploader {
+    fn upload(&self, request: UploadRequest) -> BoxFuture<'static, Result<(), UploaderError>> {
+        Box::pin(async move {
+            request.cancel.cancelled().await;
+
+            Ok(())
+        })
+    }
+}
+
+/// Reports a hundred times in one burst, with a single await point after the
+/// first — which is what a real uploader chunking a large body looks like.
+struct FloodingUploader;
+
+impl Uploader for FloodingUploader {
+    fn upload(&self, request: UploadRequest) -> BoxFuture<'static, Result<(), UploaderError>> {
+        Box::pin(async move {
+            request.progress.report(1);
+
+            // The one turn the relay beside this uploader gets.
+            YieldOnce(false).await;
+
+            for percent in 2..=99 {
+                request.progress.report(percent);
+            }
+
+            Ok(())
+        })
+    }
+}
+
+/// Yields to the executor exactly once.
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            return Poll::Ready(());
+        }
+
+        self.0 = true;
+        cx.waker().wake_by_ref();
+
+        Poll::Pending
     }
 }
 
@@ -786,6 +1249,50 @@ impl Harness {
         self.spawn_capture(async move { avatar.start().await })
     }
 
+    /// `select`, beside a switch that drops it mid-flight.
+    fn select_abandonable(
+        &mut self,
+        avatar: &Upload,
+        files: Vec<UploadFile>,
+    ) -> (Abandon, Slot<Option<Selected>>) {
+        let avatar = avatar.clone();
+
+        self.abandonable(async move { avatar.select(files).await })
+    }
+
+    /// `start`, beside a switch that drops it mid-transfer.
+    fn start_abandonable(
+        &mut self,
+        avatar: &Upload,
+    ) -> (Abandon, Slot<Option<musubi_client::Result<()>>>) {
+        let avatar = avatar.clone();
+
+        self.abandonable(async move { avatar.start().await })
+    }
+
+    /// Spawns `call` racing a switch the test holds, so a test can observe what
+    /// a *dropped* future leaves behind — the one thing no assertion on a
+    /// resolved one can reach.
+    fn abandonable<T: Send + 'static>(
+        &mut self,
+        call: impl Future<Output = T> + Send + 'static,
+    ) -> (Abandon, Slot<Option<T>>) {
+        let (switch, flipped) = oneshot::channel::<()>();
+        let slot = self.spawn_capture(async move {
+            match select(Box::pin(call), flipped).await {
+                Either::Left((outcome, _)) => Some(outcome),
+                // Dropping the losing half is the cancellation.
+                Either::Right((_, abandoned)) => {
+                    drop(abandoned);
+
+                    None
+                }
+            }
+        });
+
+        (Abandon(switch), slot)
+    }
+
     fn cancel(
         &mut self,
         avatar: &Upload,
@@ -805,6 +1312,17 @@ impl Harness {
 }
 
 type Selected = musubi_client::Result<Vec<UploadEntry>>;
+
+/// The switch [`Harness::abandonable`] hands back: flipping it drops the call.
+struct Abandon(oneshot::Sender<()>);
+
+impl Abandon {
+    fn now(self, harness: &mut Harness) {
+        let _ = self.0.send(());
+
+        harness.pump();
+    }
+}
 
 fn build(builder: musubi_client::ConnectionBuilder, seams: Seams) -> Connection {
     builder

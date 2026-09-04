@@ -307,6 +307,26 @@ pub(in crate::uploads) struct UploadCell {
     handle: Mutex<UploadHandle>,
     updates: Mutex<Vec<UnboundedSender<UploadHandle>>>,
     transport: Mutex<HashMap<String, EntryTransport>>,
+    /// Terminal for the whole cell, set by [`close`](Self::close).
+    ///
+    /// Taken **before** `updates` and `transport`, and held across both: a
+    /// teardown and the preflight landing on top of it have to be ordered
+    /// against each other, not merely atomic one at a time. That order is the
+    /// whole reason this is a `Mutex<bool>` rather than an atomic.
+    closed: Mutex<bool>,
+    /// Which selection attempt is current; bumped by every
+    /// [`Upload::select`](super::Upload::select).
+    ///
+    /// A [`Selection`] guard that is still the current attempt when it is
+    /// dropped is an *unfinished* one, and publishes
+    /// [`UploadStatus::Error`] — including when the future it belonged to was
+    /// dropped mid-flight.
+    selection: Mutex<u64>,
+    /// Whether a [`Upload::start`](super::Upload::start) is transferring right
+    /// now. One claim per cell: two concurrent starts would attach the same
+    /// `musubi_upload:<ref>` topic twice and the loser's cleanup would clobber
+    /// the winner's channel.
+    transferring: Mutex<bool>,
 }
 
 impl UploadCell {
@@ -316,6 +336,9 @@ impl UploadCell {
             handle: Mutex::new(UploadHandle::new(store_id.clone(), name.clone())),
             updates: Mutex::new(Vec::new()),
             transport: Mutex::new(HashMap::new()),
+            closed: Mutex::new(false),
+            selection: Mutex::new(0),
+            transferring: Mutex::new(false),
             store_id,
             name,
         }
@@ -343,12 +366,8 @@ impl UploadCell {
         // transport state of an entry `Upload::select` has already inserted
         // but not yet seeded onto the handle, and `Upload::start` skips an
         // entry with no transport state.
-        if !applied.removed.is_empty() {
-            let mut transport = lock(&self.transport);
-
-            for r#ref in &applied.removed {
-                transport.remove(r#ref);
-            }
+        for r#ref in &applied.removed {
+            self.drop_transport(Some(r#ref));
         }
 
         self.publish(snapshot);
@@ -376,6 +395,11 @@ impl UploadCell {
     }
 
     /// Runs `mutate` over the transport index.
+    ///
+    /// Reads and in-place edits only — **removal goes through
+    /// [`drop_transport`](Self::drop_transport)** and insertion through
+    /// [`insert_transport`](Self::insert_transport), because both carry
+    /// obligations this raw accessor cannot enforce.
     pub(in crate::uploads) fn transport<T>(
         &self,
         mutate: impl FnOnce(&mut HashMap<String, EntryTransport>) -> T,
@@ -383,21 +407,186 @@ impl UploadCell {
         mutate(&mut lock(&self.transport))
     }
 
+    /// Records the transport state one preflight accepted — all of it, or none
+    /// of it — reporting whether the insert happened.
+    ///
+    /// `false` means the cell was closed underneath the preflight, which is a
+    /// live race: the reply is awaited on the caller's task while a teardown
+    /// runs on the actor's. Re-populating a closed cell would leave transport
+    /// state — bytes, a token, a joined sub-channel to come — that no teardown
+    /// will ever abort again, so the entries are dropped here instead and the
+    /// caller fails the selection.
+    pub(in crate::uploads) fn insert_transport(
+        &self,
+        entries: Vec<(String, EntryTransport)>,
+    ) -> bool {
+        let closed = lock(&self.closed);
+
+        if *closed {
+            return false;
+        }
+
+        let mut transport = lock(&self.transport);
+
+        for (entry_ref, state) in entries {
+            transport.insert(entry_ref, state);
+        }
+
+        true
+    }
+
+    /// Removes transport state — one entry, or every entry when `entry_ref` is
+    /// `None`.
+    ///
+    /// **The only way transport state leaves a cell.** Every removal raises the
+    /// entry's [`CancelSignal`](crate::CancelSignal) and leaves its sub-channel
+    /// first: a transfer cloned its state before it started and holds an `Arc`
+    /// of this cell, so dropping the map entry alone would not stop it — in
+    /// external mode the app's own PUT would run to completion and the file
+    /// would land in the destination bucket *after* the user cancelled it or
+    /// navigated away.
+    pub(in crate::uploads) fn drop_transport(&self, entry_ref: Option<&str>) {
+        let mut transport = lock(&self.transport);
+
+        match entry_ref {
+            Some(entry_ref) => {
+                if let Some(mut state) = transport.remove(entry_ref) {
+                    state.abort();
+                }
+            }
+            None => {
+                for (_, mut state) in transport.drain() {
+                    state.abort();
+                }
+            }
+        }
+    }
+
+    /// Claims this cell's single in-flight transfer, or `None` if one is
+    /// already running.
+    ///
+    /// Releasing is the guard's [`Drop`], so a `start()` future that is dropped
+    /// mid-transfer releases the claim too.
+    pub(in crate::uploads) fn claim_transfer(self: &Arc<Self>) -> Option<TransferClaim> {
+        let mut transferring = lock(&self.transferring);
+
+        if *transferring {
+            return None;
+        }
+
+        *transferring = true;
+
+        Some(TransferClaim {
+            cell: Arc::clone(self),
+        })
+    }
+
+    /// Opens a selection attempt, superseding any older one.
+    pub(in crate::uploads) fn begin_selection(self: &Arc<Self>) -> Selection {
+        let attempt = {
+            let mut selection = lock(&self.selection);
+
+            *selection += 1;
+
+            *selection
+        };
+
+        Selection {
+            cell: Arc::clone(self),
+            attempt,
+            armed: true,
+        }
+    }
+
     /// Delivers one snapshot to every live subscriber.
     fn publish(&self, snapshot: UploadHandle) {
         lock(&self.updates).retain(|sender| sender.unbounded_send(snapshot.clone()).is_ok());
     }
 
-    /// Ends every [`Upload::updates`] stream on this cell.
+    /// Subscribes to this cell, or hands back an already-ended stream once it
+    /// has been closed.
+    ///
+    /// The read and the registration are one step under `closed`, so a teardown
+    /// cannot land between them and leave a sender nothing will ever write to.
+    fn subscribe(&self) -> impl Stream<Item = UploadHandle> + Send + 'static {
+        let (sender, receiver) = mpsc::unbounded();
+        let closed = lock(&self.closed);
+
+        if !*closed {
+            lock(&self.updates).push(sender);
+        }
+
+        drop(closed);
+
+        receiver
+    }
+
+    /// Retires the cell: no more subscriptions, no more transport state.
     ///
     /// Dropping the senders with the cell is not enough: the registry is not
     /// the cell's only owner, and every live [`Upload`] holds an `Arc` of it.
     /// A handle the embedder is still holding would otherwise keep the senders
     /// — and its subscriber's receiver — alive forever, so removal from the
     /// registry has to end them explicitly, exactly as `RootSink::clear` does
-    /// for a root's own subscriptions.
-    fn end_updates(&self) {
+    /// for a root's own subscriptions. Closure is **recorded** rather than the
+    /// senders merely dropped, so a subscription taken afterwards is an ended
+    /// stream instead of one waiting on a publish that can never come.
+    fn close(&self) {
+        let mut closed = lock(&self.closed);
+
+        *closed = true;
+
         lock(&self.updates).clear();
+        drop(closed);
+
+        // After the flag, so nothing this aborts can be re-inserted behind it.
+        self.drop_transport(None);
+    }
+}
+
+/// The claim one running [`Upload::start`](super::Upload::start) holds on its
+/// cell.
+#[derive(Debug)]
+pub(in crate::uploads) struct TransferClaim {
+    cell: Arc<UploadCell>,
+}
+
+impl Drop for TransferClaim {
+    fn drop(&mut self) {
+        *lock(&self.cell.transferring) = false;
+    }
+}
+
+/// One [`Upload::select`](super::Upload::select) attempt, from the transition
+/// into [`UploadStatus::Selecting`] to whatever ends it.
+///
+/// Dropped while still armed, it publishes [`UploadStatus::Error`]: a preflight
+/// that failed — or whose future was dropped — must not leave observers of
+/// `status` watching a selection that will never resolve. A guard superseded by
+/// a newer attempt publishes nothing, so a stale one cannot stomp the status of
+/// the selection that replaced it.
+#[derive(Debug)]
+pub(in crate::uploads) struct Selection {
+    cell: Arc<UploadCell>,
+    attempt: u64,
+    armed: bool,
+}
+
+impl Selection {
+    /// Disarms the guard: the caller has written the final status itself.
+    pub(in crate::uploads) fn settled(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Selection {
+    fn drop(&mut self) {
+        if !self.armed || *lock(&self.cell.selection) != self.attempt {
+            return;
+        }
+
+        self.cell
+            .update(|handle| handle.status = UploadStatus::Error);
     }
 }
 
@@ -408,7 +597,7 @@ impl UploadCell {
 /// one set of handles.
 #[derive(Debug, Default)]
 pub struct Uploads {
-    handles: Mutex<HashMap<UploadKey, Arc<UploadCell>>>,
+    handles: Mutex<Handles>,
     /// How the control plane reaches the server. `None` for a registry with no
     /// connection behind it — a bare [`PatchEngine`](crate::PatchEngine) — in
     /// which case `select`/`start`/`cancel`/`reset` report
@@ -416,12 +605,38 @@ pub struct Uploads {
     control: Option<Arc<UploadControl>>,
 }
 
+/// The cells, plus what the registry remembers about the ones it no longer has.
+///
+/// A per-cell tombstone cannot answer for a cell the registry has *removed*:
+/// `prune` drops keys and `clear` empties the map, and the very next
+/// [`Uploads::handle`] would then mint a fresh, open cell for a store that is
+/// gone — a stream nothing can ever publish to and nothing ever ends. Closure
+/// is therefore recorded here, one flag for teardown and one set for the stores
+/// pruning dropped, and read under the same lock the insert takes.
+#[derive(Debug, Default)]
+struct Handles {
+    cells: HashMap<UploadKey, Arc<UploadCell>>,
+    /// Set by [`Uploads::clear`]; terminal for the whole registry.
+    closed: bool,
+    /// The stores [`Uploads::prune`] dropped cells for, still absent from the
+    /// index. Only stores that *had* a cell are recorded, so this is bounded by
+    /// the uploads a root actually used rather than by every store it ever had.
+    pruned: HashSet<StoreId>,
+}
+
+impl Handles {
+    /// Whether a handle minted for this store now would be a dead one.
+    fn is_closed(&self, store_id: &StoreId) -> bool {
+        self.closed || self.pruned.contains(store_id)
+    }
+}
+
 impl Uploads {
     /// The registry a mounted root gets: handles wired to the connection, so
     /// the ones it hands out can also drive transfers.
     pub(crate) fn new(control: Arc<UploadControl>) -> Self {
         Self {
-            handles: Mutex::new(HashMap::new()),
+            handles: Mutex::new(Handles::default()),
             control: Some(control),
         }
     }
@@ -431,17 +646,32 @@ impl Uploads {
     /// Taking a handle before the server has said anything about it is normal:
     /// a subscriber can be attached the moment the marker appears on the state,
     /// and the defaults stand in until the `config` op lands.
+    ///
+    /// A handle for a key the registry has closed is born closed and is **not**
+    /// filed: it reads as the defaults and its `updates()` ends immediately, and
+    /// leaving it out of the index is what lets a pruned store that comes back
+    /// (BDR-0011) get a live cell rather than the dead one minted while it was
+    /// away.
     pub fn handle(&self, store_id: &StoreId, name: &str) -> Upload {
-        let key = UploadKey {
-            store_id: store_id.clone(),
-            name: name.to_owned(),
+        let mut handles = lock(&self.handles);
+        let fresh = || Arc::new(UploadCell::new(store_id.clone(), name.to_owned()));
+
+        let cell = if handles.is_closed(store_id) {
+            let cell = fresh();
+
+            cell.close();
+
+            cell
+        } else {
+            let key = UploadKey {
+                store_id: store_id.clone(),
+                name: name.to_owned(),
+            };
+
+            Arc::clone(handles.cells.entry(key).or_insert_with(fresh))
         };
 
-        let cell = Arc::clone(
-            lock(&self.handles)
-                .entry(key)
-                .or_insert_with(|| Arc::new(UploadCell::new(store_id.clone(), name.to_owned()))),
-        );
+        drop(handles);
 
         Upload {
             cell,
@@ -481,34 +711,52 @@ impl Uploads {
     }
 
     /// Drops every handle whose owning store is gone from the freshly rebuilt
-    /// index, ending its `updates()` streams.
+    /// index, ending its `updates()` streams and aborting its transfers.
     ///
     /// Uploads are not resumable (BDR-0003), and a store that reappears mounts
     /// fresh (BDR-0011), so a vanished store must not leave its handles behind.
     pub(crate) fn prune(&self, live_store_ids: &HashSet<StoreId>) {
-        lock(&self.handles).retain(|key, cell| {
-            if live_store_ids.contains(&key.store_id) {
-                return true;
+        let mut handles = lock(&self.handles);
+
+        // A store that came back is live again, so its tombstone lifts and the
+        // next handle taken on it is a live one.
+        handles
+            .pruned
+            .retain(|store_id| !live_store_ids.contains(store_id));
+
+        let gone: Vec<UploadKey> = handles
+            .cells
+            .keys()
+            .filter(|key| !live_store_ids.contains(&key.store_id))
+            .cloned()
+            .collect();
+
+        for key in gone {
+            // Explicit, because an `Upload` the embedder still holds keeps the
+            // cell alive past its removal from the index — and a transfer that
+            // is already running holds one too.
+            if let Some(cell) = handles.cells.remove(&key) {
+                cell.close();
             }
 
-            // Explicit, because an `Upload` the embedder still holds keeps the
-            // cell alive past its removal from the index.
-            cell.end_updates();
-
-            false
-        });
+            handles.pruned.insert(key.store_id);
+        }
     }
 
-    /// Drops every handle, ending its `updates()` streams. Called when the root
-    /// leaves the registry.
+    /// Drops every handle, ending its `updates()` streams and aborting its
+    /// transfers. Called when the root leaves the registry.
     pub(crate) fn clear(&self) {
         let mut handles = lock(&self.handles);
 
-        for cell in handles.values() {
-            cell.end_updates();
+        handles.closed = true;
+
+        for cell in handles.cells.values() {
+            cell.close();
         }
 
-        handles.clear();
+        handles.cells.clear();
+        // Subsumed by `closed`, which answers for every key at once.
+        handles.pruned.clear();
     }
 }
 
@@ -544,16 +792,15 @@ impl Upload {
     /// One item per envelope that touched this upload, oldest first.
     ///
     /// The stream **is** the subscription: dropping it unsubscribes, and it
-    /// ends when the owning store leaves the tree or the root is unmounted. It
-    /// does not replay [`snapshot`](Self::snapshot) — read that first if the
-    /// current state matters.
+    /// ends when the owning store leaves the tree or the root is unmounted. A
+    /// subscription taken *after* that is an already-ended stream, never one
+    /// waiting on a publish that can no longer come — including one taken
+    /// through a handle the embedder kept across the teardown. It does not
+    /// replay [`snapshot`](Self::snapshot) — read that first if the current
+    /// state matters.
     #[must_use = "the stream is the subscription; dropping it unsubscribes"]
     pub fn updates(&self) -> impl Stream<Item = UploadHandle> + Send + 'static {
-        let (sender, receiver) = mpsc::unbounded();
-
-        lock(&self.cell.updates).push(sender);
-
-        receiver
+        self.cell.subscribe()
     }
 }
 
@@ -952,6 +1199,70 @@ mod tests {
 
         assert!(matches!(updates.next().now_or_never(), Some(None)));
         assert_eq!(held.snapshot().store_id, StoreId::root());
+    }
+
+    // A handle the registry no longer has is the case a per-cell tombstone
+    // cannot answer: `prune` removes the key and `clear` empties the map, so
+    // the next `handle()` mints a *fresh* cell — open, and subscribed to
+    // something no fold can ever reach.
+
+    #[test]
+    fn a_handle_taken_after_the_registry_was_cleared_hands_out_an_ended_stream() {
+        let uploads = Uploads::default();
+
+        uploads.clear();
+
+        let mut updates = uploads.handle(&StoreId::root(), "avatar").updates();
+
+        assert!(matches!(updates.next().now_or_never(), Some(None)));
+    }
+
+    #[test]
+    fn a_handle_taken_after_its_store_was_pruned_hands_out_an_ended_stream() {
+        let uploads = Uploads::default();
+        let panel = store_id(&["panel"]);
+
+        uploads.handle(&panel, "avatar");
+        uploads.prune(&HashSet::from([StoreId::root()]));
+
+        let mut updates = uploads.handle(&panel, "avatar").updates();
+
+        assert!(matches!(updates.next().now_or_never(), Some(None)));
+        // Another store's handle is untouched by its neighbour's tombstone.
+        assert!(
+            uploads
+                .handle(&StoreId::root(), "avatar")
+                .updates()
+                .next()
+                .now_or_never()
+                .is_none()
+        );
+    }
+
+    /// Guards the tombstone from over-reaching rather than a bug: a store that
+    /// leaves the tree and comes back mounts fresh (BDR-0011), and its new
+    /// handle has to be a live one. Passes before the closure fix too — there
+    /// was no tombstone to over-reach with.
+    #[test]
+    fn a_store_that_comes_back_gets_a_live_handle_again() {
+        let uploads = Uploads::default();
+        let panel = store_id(&["panel"]);
+
+        uploads.handle(&panel, "avatar");
+        uploads.prune(&HashSet::from([StoreId::root()]));
+        uploads.prune(&HashSet::from([StoreId::root(), panel.clone()]));
+
+        let mut updates = uploads.handle(&panel, "avatar").updates();
+
+        uploads.apply_ops(&decode(vec![json!({
+            "op": "add", "upload": "avatar", "store_id": ["panel"], "ref": "u_2",
+            "entry": entry("u_2", "pending", 0)
+        })]));
+
+        assert!(matches!(
+            block_on(updates.next()),
+            Some(handle) if handle.entry("u_2").is_some()
+        ));
     }
 
     // ---- wire ------------------------------------------------------------

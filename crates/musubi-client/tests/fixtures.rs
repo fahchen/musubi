@@ -310,6 +310,8 @@ fn run<St: Store<State = Value, Params = Value>>(fixture: &Fixture) {
     let mut join: Option<Message> = None;
     let mut topic: Option<String> = None;
     let mut upload: Option<Upload> = None;
+    // Whether `start` has already been driven; see the `upload_progress` arm.
+    let mut transferring = false;
     let mut events: Vec<(StoreId, String, BoxStream<'static, Value>)> = Vec::new();
 
     // Frames the client wrote but no fixture frame has claimed yet: one action
@@ -384,8 +386,14 @@ fn run<St: Store<State = Value, Params = Value>>(fixture: &Fixture) {
                         )
                     }
                     // Progress is written by the transfer itself, so the action
-                    // behind the first recorded one is `start`.
+                    // behind the first recorded one is `start`. Every later one
+                    // belongs to that same call: the relay coalesces reports
+                    // and awaits each push's reply, so they are written one
+                    // pump apart rather than all at once.
+                    "upload_progress" if transferring => Pending::Silent,
                     "upload_progress" => {
+                        transferring = true;
+
                         let handle = upload
                             .clone()
                             .unwrap_or_else(|| panic!("{scenario}: no upload was selected"));
