@@ -385,6 +385,29 @@ the workspace (§1.3); the crates.io name is a question for publishing time.
   re-joined with its original params, and the join-ok handling runs again
   (Phoenix `Push.resend` semantics). This is load-bearing for §9; a Rust
   channel that only fires its ok-hook once is wrong.
+- **One join attempt per channel at a time.** Phoenix answers a `phx_join` for
+  a topic the socket already holds by killing that channel and running the join
+  again (`Phoenix.Socket.shutdown_duplicate_channel/1`), so a second attempt
+  throws away the work the first is waiting on. A join is only sent for a
+  channel that is closed — `phoenix.js`'s `joinedOnce` and `rejoin()`
+  leaving-guard in one condition.
+- **Attempts are fenced, not cancelled.** The `Timer` seam returns a future,
+  not a cancellable handle, so every join carries an attempt counter: a reply
+  or a timeout naming an attempt the channel has moved off (joined, closed,
+  leaving, or already onto a later one) is dropped. Scheduled rejoins carry the
+  same stamp and a socket drop disarms them, so a rejoin that outlived its
+  socket cannot land on top of the one the reconnect already sent — and a
+  rejoin that comes due with no transport under it defers to the reconnect
+  ladder rather than dialling on its own (`phoenix.js` gates its rejoin timer
+  on `socket.isConnected()`).
+- **A join the client abandons is left before it is retried.** On a join
+  timeout — or a reply that will not parse — the client sends `phx_leave`
+  stamped with the abandoned attempt's join_ref before rearming, exactly as
+  `phoenix.js` does. Without it a mount that merely runs longer than the join
+  timeout never converges: the server finishes the join and holds the channel,
+  the retry arrives as a duplicate and restarts the same expensive join, for
+  ever. Every other way an attempt ends (`phx_error`, a deliberate leave, a
+  dead transport) is one the server already knows about and owes no leave.
 - Per-push timeout (default 10s, configurable) yields a `Timeout` outcome
   rather than hanging the caller's future.
 - **Generation counter.** Each `attach_and_join` for a root bumps a `u64`

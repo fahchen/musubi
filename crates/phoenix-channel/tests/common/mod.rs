@@ -118,7 +118,30 @@ impl<T> Harness<T> {
         self.fire_where(|pending| pending < Duration::from_secs(1));
     }
 
-    pub fn fire_where(&mut self, matches: impl Fn(Duration) -> bool) {
+    /// Resolves the `nth` matching sleep only — 0 being the oldest armed —
+    /// and leaves the rest pending.
+    ///
+    /// [`fire_backoff`](Self::fire_backoff) fires the whole sub-second band at
+    /// once, which is all a test needs while one ladder is running. A channel's
+    /// rejoin and the socket's reconnect both start at the same 10ms rung, so
+    /// when both are armed only the order they were armed in tells them apart —
+    /// and *which of the two fires first* is the whole question a rejoin timer
+    /// that outlived its socket asks.
+    pub fn fire_nth(&mut self, nth: usize, matches: impl Fn(Duration) -> bool) {
+        let mut seen = 0;
+
+        self.fire_where(|pending| {
+            if !matches(pending) {
+                return false;
+            }
+
+            let hit = seen == nth;
+            seen += 1;
+            hit
+        });
+    }
+
+    pub fn fire_where(&mut self, mut matches: impl FnMut(Duration) -> bool) {
         let mut kept = Vec::new();
 
         for (dur, waker) in self.sleeps.lock().unwrap().drain(..) {

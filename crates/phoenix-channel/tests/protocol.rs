@@ -99,6 +99,39 @@ fn join_timeout_is_reported_as_a_join_failure() {
 }
 
 #[test]
+fn a_join_timeout_leaves_the_attempt_it_gave_up_on_before_retrying() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, _events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    server.sent(&mut harness);
+    harness.fire(JOIN_TIMEOUT);
+
+    // A join the server answers *after* the client gave up leaves a live
+    // channel behind, and Phoenix answers the retry by killing that channel and
+    // running the whole join again. `phoenix.js` sends a `phx_leave` for the
+    // attempt it abandoned first (`channel.js` join-timeout hook), stamped with
+    // that attempt's join_ref so the server can match it.
+    assert!(
+        matches!(
+            server.sent(&mut harness).as_slice(),
+            [Message { event, join_ref: Some(join_ref), msg_ref: Some(msg_ref), .. }]
+                if event == "phx_leave" && join_ref == "1" && msg_ref != "1"
+        ),
+        "the abandoned attempt is left before anything else goes out"
+    );
+
+    harness.fire_backoff();
+
+    assert!(matches!(
+        server.sent(&mut harness).as_slice(),
+        [Message { event, .. }] if event == "phx_join"
+    ));
+}
+
+#[test]
 fn a_join_reply_that_is_not_a_reply_payload_fails_the_join_instead_of_stranding_it() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
@@ -123,6 +156,138 @@ fn a_join_reply_that_is_not_a_reply_payload_fails_the_join_instead_of_stranding_
         drain(&mut events).as_slice(),
         [ChannelEvent::JoinTimeout]
     ));
+}
+
+#[test]
+fn a_malformed_join_reply_leaves_the_attempt_it_gave_up_on_before_retrying() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, _events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let sent = server.sent(&mut harness);
+
+    // A reply we cannot read is exactly as likely to have been an "ok" as a
+    // timeout is: the server may well hold a joined channel we can no longer
+    // account for, so the retry has to be preceded by the same teardown.
+    server.push(Message {
+        join_ref: sent[0].join_ref.clone(),
+        msg_ref: sent[0].msg_ref.clone(),
+        topic: sent[0].topic.clone(),
+        event: "phx_reply".to_owned(),
+        payload: json!({"ok": true}),
+    });
+    harness.pump();
+
+    assert!(matches!(
+        server.sent(&mut harness).as_slice(),
+        [Message { event, join_ref: Some(join_ref), .. }]
+            if event == "phx_leave" && join_ref == "1"
+    ));
+}
+
+#[test]
+fn a_second_join_while_one_is_in_flight_is_a_no_op() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let sent = server.sent(&mut harness);
+    assert_eq!(sent.len(), 1);
+
+    // Phoenix answers a second `phx_join` on a topic it already holds by
+    // killing that channel and joining again, so a client that stacks attempts
+    // is asking the server to throw away the work it is waiting for.
+    channel.join().unwrap();
+    harness.pump();
+    assert!(
+        server.sent(&mut harness).is_empty(),
+        "the attempt already in flight is left alone"
+    );
+
+    server.reply(&sent[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+
+    assert!(matches!(
+        drain(&mut events).as_slice(),
+        [ChannelEvent::Joined { .. }]
+    ));
+}
+
+#[test]
+fn a_join_reply_for_a_superseded_attempt_does_not_join_the_channel() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let first = server.sent(&mut harness);
+
+    // The server tears the joining channel down, so the attempt is abandoned
+    // and the rejoin ladder starts a fresh one.
+    server.push(lifecycle("phx_error", "1"));
+    harness.pump();
+    drain(&mut events);
+    harness.fire_backoff();
+    let second = server.sent(&mut harness);
+    assert!(matches!(
+        second.as_slice(),
+        [Message { event, msg_ref: Some(msg_ref), .. }] if event == "phx_join" && msg_ref == "2"
+    ));
+
+    // The abandoned attempt answers late. It says nothing about the attempt
+    // that replaced it, and the channel is not joined until *that* one replies.
+    server.reply(&first[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    assert!(
+        drain(&mut events).is_empty(),
+        "a superseded attempt cannot join the channel"
+    );
+    assert!(matches!(
+        harness.push(&channel, "command", json!({})),
+        Err(PushError::NotJoined)
+    ));
+
+    server.reply(&second[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+
+    assert!(matches!(
+        drain(&mut events).as_slice(),
+        [ChannelEvent::Joined { .. }]
+    ));
+}
+
+#[test]
+fn a_join_reply_that_arrives_after_a_leave_does_not_join_the_channel() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let join = server.sent(&mut harness);
+
+    channel.leave().unwrap();
+    harness.pump();
+    let leave = server.sent(&mut harness);
+    assert!(matches!(
+        leave.as_slice(),
+        [Message { event, .. }] if event == "phx_leave"
+    ));
+
+    // The join is answered after we asked to leave: the channel is on its way
+    // out and must not be reported joined.
+    server.reply(&join[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+
+    assert!(
+        drain(&mut events).is_empty(),
+        "a channel that is leaving cannot be joined by the reply it outran"
+    );
 }
 
 #[test]
@@ -446,6 +611,90 @@ fn a_server_close_reports_close_and_schedules_a_rejoin() {
 }
 
 #[test]
+fn a_rejoin_armed_before_the_socket_died_does_not_join_on_top_of_the_reconnect() {
+    let mut harness = Harness::new();
+    let mut first = harness.queue_socket();
+    let (channel, mut events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let sent = first.sent(&mut harness);
+    first.reply(&sent[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    drain(&mut events);
+
+    // A rejoin is armed on a live socket...
+    first.push(lifecycle("phx_close", "1"));
+    harness.pump();
+
+    // ...and the transport dies before it fires. Both ladders now hold a timer
+    // in the same 10ms band, so only the order they were armed in tells them
+    // apart: the socket's reconnect is the second.
+    let mut second = harness.queue_socket();
+    first.disconnect();
+    harness.pump();
+    harness.fire_nth(1, |delay| delay < Duration::from_secs(1));
+
+    let rejoin = second.sent(&mut harness);
+    assert!(matches!(
+        rejoin.as_slice(),
+        [Message { event, .. }] if event == "phx_join"
+    ));
+    second.reply(&rejoin[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+    drain(&mut events);
+
+    // The rejoin that outlived its socket finally fires. The channel it was
+    // scheduled for has already been joined by the reconnect, and a second
+    // `phx_join` would make Phoenix kill that channel and start over.
+    harness.fire_backoff();
+
+    assert!(
+        second.sent(&mut harness).is_empty(),
+        "a rejoin whose attempt was superseded must not join again"
+    );
+    assert!(drain(&mut events).is_empty());
+}
+
+#[test]
+fn a_rejoin_that_fires_while_the_socket_is_down_leaves_the_ladder_alone() {
+    let mut harness = Harness::new();
+    let mut first = harness.queue_socket();
+    let (channel, _events) = harness.attach(TOPIC, json!({}));
+
+    channel.join().unwrap();
+    harness.pump();
+    let sent = first.sent(&mut harness);
+    first.reply(&sent[0], ReplyStatus::Ok, json!({}));
+    harness.pump();
+
+    first.push(lifecycle("phx_close", "1"));
+    harness.pump();
+    first.disconnect();
+    harness.pump();
+
+    // The rejoin fires first, with no transport under it. `phoenix.js` gates
+    // its rejoin timer on `socket.isConnected()`: while the socket is down the
+    // reconnect ladder owns recovery, and a rejoin that dials on its own jumps
+    // the queue the ladder exists to hold.
+    harness.fire_nth(0, |delay| delay < Duration::from_secs(1));
+
+    assert_eq!(
+        harness.connected_urls().len(),
+        1,
+        "the rejoin must not open a connection off the reconnect ladder"
+    );
+
+    let mut second = harness.queue_socket();
+    harness.fire_backoff();
+
+    assert!(matches!(
+        second.sent(&mut harness).as_slice(),
+        [Message { event, .. }] if event == "phx_join"
+    ));
+}
+
+#[test]
 fn server_messages_reach_the_channel_stream() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
@@ -596,6 +845,18 @@ fn disconnect_reports_closed_rather_than_reconnecting() {
 }
 
 // ---------------------------------------------------------------- harness --
+
+/// A server-initiated lifecycle frame (`phx_close`, `phx_error`) stamped with
+/// the join_ref of the attempt it tears down.
+fn lifecycle(event: &str, join_ref: &str) -> Message {
+    Message {
+        join_ref: Some(join_ref.to_owned()),
+        msg_ref: None,
+        topic: TOPIC.to_owned(),
+        event: event.to_owned(),
+        payload: json!({}),
+    }
+}
 
 /// The shared rig (`tests/common/mod.rs`) wired to one [`PhoenixSocket`].
 type Harness = common::Harness<PhoenixSocket>;

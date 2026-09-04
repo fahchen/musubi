@@ -46,7 +46,12 @@ pub enum ChannelEvent {
         /// The server's error reply body.
         response: Value,
     },
-    /// The join did not reply within the configured join timeout.
+    /// The join did not reply within the configured join timeout, or replied
+    /// something that was not a reply payload.
+    ///
+    /// The abandoned attempt is taken back off the server with a `phx_leave`
+    /// before the rejoin, so a mount that is merely slower than the timeout
+    /// still converges instead of being restarted by every retry.
     JoinTimeout,
     /// A server-initiated message on this topic.
     Message {
@@ -134,6 +139,11 @@ impl Channel {
     /// [`ChannelEvent::Joined`], [`ChannelEvent::JoinError`] or
     /// [`ChannelEvent::JoinTimeout`], because a rejoin after a reconnect
     /// produces the very same events with no caller to return them to.
+    ///
+    /// Idempotent: a channel that is already joined, joining or leaving keeps
+    /// the claim it has on the topic. Phoenix answers a second `phx_join` for a
+    /// topic it already holds by killing that channel and joining again, so
+    /// stacking attempts would throw away the join being waited on.
     ///
     /// ```text
     /// channel.join()?;

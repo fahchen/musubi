@@ -4,6 +4,14 @@
 //! None of it is public API. The handle half of the module posts work as
 //! `ActorMsg` and reads liveness off the `StatusCell` this writes; those two
 //! types are the whole seam between the halves.
+//!
+//! No timer here can be cancelled — the `Timer` seam hands back a future, not a
+//! handle — so every timer is *fenced* instead: what it carries names the thing
+//! it was armed for, and the actor checks that name when the message lands. A
+//! push names its ref, a join reply and a join timeout name their attempt, a
+//! rejoin names the attempt it was armed to replace. Anything the channel has
+//! since moved off is dropped rather than acted on, which is what keeps a
+//! stale timer from stacking a second `phx_join` on a live one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,6 +58,9 @@ pub(crate) enum ActorMsg {
     Rejoin {
         topic: Arc<str>,
         generation: u64,
+        /// The attempt this rejoin was armed to replace. A timer that fires
+        /// after its attempt was superseded is dropped, not acted on.
+        attempt: u64,
     },
     Connected(Result<Box<dyn Socket>, TransportError>),
     Reconnect,
@@ -106,13 +117,25 @@ struct ChannelState {
     events: UnboundedSender<ChannelEvent>,
     status: ChannelStatus,
     join_ref: Option<String>,
+    /// How many `phx_join`s this channel has sent. The current value names the
+    /// attempt that [`ChannelStatus::Joining`] refers to, so a reply or a
+    /// timeout stamped with an older one is known to belong to an attempt that
+    /// has already been abandoned — and a rejoin armed against an older one is
+    /// known to be redundant.
+    ///
+    /// A generation (which only `attach` bumps) cannot do this job: both
+    /// attempts of one channel share it.
+    attempt: u64,
     /// Whether the channel should be (re)joined whenever a socket is available.
     wants_join: bool,
     /// Set by a deliberate leave so the resulting `phx_close` neither surfaces
     /// nor re-enters reconnect handling.
     suppress_close: bool,
     backoff: Backoff,
-    rejoin_scheduled: bool,
+    /// The attempt a pending rejoin timer was armed against, if any. A rejoin
+    /// is disarmed by setting this to `None`, which is enough to make the timer
+    /// that still fires a no-op.
+    rejoin_scheduled: Option<u64>,
 }
 
 /// A push awaiting its `phx_reply`.
@@ -123,6 +146,7 @@ enum Inflight {
     Join {
         topic: Arc<str>,
         generation: u64,
+        attempt: u64,
     },
     Leave {
         topic: Arc<str>,
@@ -244,19 +268,18 @@ impl Actor {
                 payload,
                 reply,
             } => self.push(topic, generation, event, payload, reply).await,
-            ActorMsg::Rejoin { topic, generation } => {
-                if let Some(state) = self.live_mut(&topic, generation) {
-                    state.rejoin_scheduled = false;
-                }
-                self.join(topic, generation).await;
-            }
+            ActorMsg::Rejoin {
+                topic,
+                generation,
+                attempt,
+            } => self.rejoin(topic, generation, attempt).await,
             ActorMsg::Connected(result) => self.connected(result).await,
             ActorMsg::Reconnect => {
                 self.reconnect_scheduled = false;
                 self.connect();
             }
             ActorMsg::HeartbeatTick => self.heartbeat_tick().await,
-            ActorMsg::Timeout { msg_ref } => self.timeout(msg_ref),
+            ActorMsg::Timeout { msg_ref } => self.timeout(msg_ref).await,
             ActorMsg::Disconnect { ack } => {
                 self.closed = true;
                 self.drop_socket(ChannelErrorReason::SocketClosed);
@@ -289,10 +312,11 @@ impl Actor {
                 events: events_tx,
                 status: ChannelStatus::Closed,
                 join_ref: None,
+                attempt: 0,
                 wants_join: false,
                 suppress_close: false,
                 backoff: Backoff::default(),
-                rejoin_scheduled: false,
+                rejoin_scheduled: None,
             },
         );
 
@@ -315,6 +339,34 @@ impl Actor {
         self.send_join(topic, generation).await;
     }
 
+    /// A scheduled rejoin came due.
+    ///
+    /// `phoenix.js` gates its rejoin timer on `socket.isConnected()` and resets
+    /// it whenever the socket errors: while the transport is down the reconnect
+    /// ladder owns recovery and rejoins everything on open, so a rejoin that
+    /// dialled on its own would only jump the queue the ladder exists to hold.
+    async fn rejoin(&mut self, topic: Arc<str>, generation: u64, attempt: u64) {
+        let armed = match self.live_mut(&topic, generation) {
+            Some(state) if state.rejoin_scheduled == Some(attempt) => {
+                state.rejoin_scheduled = None;
+                true
+            }
+            _ => false,
+        };
+
+        if armed && self.socket.is_some() {
+            self.join(topic, generation).await;
+        }
+    }
+
+    /// Sends one `phx_join`, if the channel has no other claim on the topic.
+    ///
+    /// Phoenix answers a second `phx_join` for a topic the socket already holds
+    /// by killing that channel and running the join again
+    /// (`Phoenix.Socket.shutdown_duplicate_channel/1`), so stacking attempts
+    /// asks the server to throw away the very work we are waiting on. Only a
+    /// [`ChannelStatus::Closed`] channel may join — which is `phoenix.js`'s
+    /// `joinedOnce` guard and its `rejoin()` leaving-guard in one condition.
     async fn send_join(&mut self, topic: Arc<str>, generation: u64) {
         let msg_ref = self.next_ref();
         let ref_str = msg_ref.to_string();
@@ -322,8 +374,14 @@ impl Actor {
         let Some(state) = self.live_mut(&topic, generation) else {
             return;
         };
+        if state.status != ChannelStatus::Closed {
+            return;
+        }
+
         state.status = ChannelStatus::Joining;
         state.join_ref = Some(ref_str.clone());
+        state.attempt += 1;
+        let attempt = state.attempt;
         let payload = state.params.clone();
 
         self.inflight.insert(
@@ -331,6 +389,7 @@ impl Actor {
             Inflight::Join {
                 topic: Arc::clone(&topic),
                 generation,
+                attempt,
             },
         );
         self.spawn_timeout(msg_ref, self.join_timeout);
@@ -352,6 +411,8 @@ impl Actor {
         };
         state.wants_join = false;
         state.suppress_close = true;
+        // Leaving supersedes any join still in flight: a reply that arrives
+        // after this must not report a channel on its way out as joined.
         state.status = ChannelStatus::Leaving;
         let join_ref = state.join_ref.clone();
 
@@ -508,35 +569,81 @@ impl Actor {
         .await;
     }
 
-    fn timeout(&mut self, msg_ref: u64) {
+    async fn timeout(&mut self, msg_ref: u64) {
         if let Some(inflight) = self.inflight.remove(&msg_ref) {
-            self.abandon(inflight, PushError::Timeout);
+            self.abandon(inflight, PushError::Timeout).await;
         }
     }
 
     /// Fails one inflight entry that can never resolve, dispatching by kind:
-    /// the push learns why, a join reports [`ChannelEvent::JoinTimeout`] and is
-    /// rescheduled, and a leave completes.
+    /// the push learns why, a join reports [`ChannelEvent::JoinTimeout`], is
+    /// taken back off the server and rescheduled, and a leave completes.
     ///
-    /// Both callers have already removed the entry, so a join left un-notified
-    /// here would sit in [`ChannelStatus::Joining`] forever — its own timeout
-    /// no longer finds anything to fire on.
-    fn abandon(&mut self, inflight: Inflight, push_error: PushError) {
+    /// Both callers have already removed the entry, so a join that is still the
+    /// channel's current attempt has to be resolved here: nothing else will
+    /// fire on it, and it would otherwise sit in [`ChannelStatus::Joining`]
+    /// forever. An attempt the channel has already moved off is another matter
+    /// — the fence drops it, because whatever superseded it did the resolving.
+    ///
+    /// A timeout and an unreadable reply are the only two ways an attempt ends
+    /// without the server knowing:
+    /// it either never answered, or answered something we could not read. Every
+    /// other way a join is superseded — a `phx_error`, a deliberate leave, a
+    /// dead transport — is one the server already knows about, so this is the
+    /// one path that has to say `phx_leave` on its own.
+    async fn abandon(&mut self, inflight: Inflight, push_error: PushError) {
         match inflight {
             Inflight::Push { reply } => {
                 let _ = reply.send(Err(push_error));
             }
-            Inflight::Join { topic, generation } => {
-                if let Some(state) = self.live_mut(&topic, generation) {
-                    state.status = ChannelStatus::Closed;
-                    emit(state, ChannelEvent::JoinTimeout);
+            Inflight::Join {
+                topic,
+                generation,
+                attempt,
+            } => {
+                let Some(state) = self.joining(&topic, generation, attempt) else {
+                    return;
+                };
+                state.status = ChannelStatus::Closed;
+                let join_ref = state.join_ref.take();
+                emit(state, ChannelEvent::JoinTimeout);
+
+                if let Some(join_ref) = join_ref {
+                    self.leave_abandoned_join(&topic, join_ref).await;
                 }
+
                 self.schedule_rejoin(&topic, generation);
             }
             Inflight::Leave { topic, generation } => {
                 self.remove_if_live(&topic, generation);
             }
         }
+    }
+
+    /// Tells the server to drop the channel an abandoned `phx_join` may still
+    /// be building, the way `phoenix.js` does before it re-arms (`channel.js`,
+    /// the join-timeout hook).
+    ///
+    /// Without it a join that merely runs longer than the join timeout never
+    /// converges: the server finishes the mount and holds the channel, the
+    /// retry arrives as a duplicate join, and Phoenix answers that by killing
+    /// the channel it just finished and starting the same expensive join over.
+    /// The leave is stamped with the abandoned attempt's join_ref, which is
+    /// what `Phoenix.Socket` matches it against.
+    ///
+    /// Fire and forget: nothing is registered for the reply, because the
+    /// channel stays in the registry to be rejoined rather than dropped.
+    async fn leave_abandoned_join(&mut self, topic: &Arc<str>, join_ref: String) {
+        let msg_ref = self.next_ref();
+
+        self.send_frame(Message {
+            join_ref: Some(join_ref),
+            msg_ref: Some(msg_ref.to_string()),
+            topic: topic.to_string(),
+            event: EVENT_LEAVE.to_owned(),
+            payload: json!({}),
+        })
+        .await;
     }
 
     async fn handle_frame(&mut self, frame: Frame) {
@@ -557,7 +664,7 @@ impl Actor {
         };
 
         if message.event == EVENT_REPLY {
-            self.handle_reply(message);
+            self.handle_reply(message).await;
             return;
         }
 
@@ -575,27 +682,17 @@ impl Actor {
         let generation = state.generation;
 
         match message.event.as_str() {
-            EVENT_CLOSE => {
-                if state.suppress_close {
-                    self.channels.remove(&topic);
-                    return;
-                }
-                state.status = ChannelStatus::Closed;
-                state.join_ref = None;
-                emit(state, ChannelEvent::Close);
-                self.schedule_rejoin(&topic, generation);
+            EVENT_CLOSE if state.suppress_close => {
+                self.channels.remove(&topic);
             }
-            EVENT_ERROR => {
-                state.status = ChannelStatus::Closed;
-                state.join_ref = None;
-                emit(
-                    state,
-                    ChannelEvent::Error {
-                        reason: ChannelErrorReason::Server,
-                    },
-                );
-                self.schedule_rejoin(&topic, generation);
-            }
+            EVENT_CLOSE => self.went_down(&topic, generation, ChannelEvent::Close),
+            EVENT_ERROR => self.went_down(
+                &topic,
+                generation,
+                ChannelEvent::Error {
+                    reason: ChannelErrorReason::Server,
+                },
+            ),
             _ => emit(
                 state,
                 ChannelEvent::Message {
@@ -606,7 +703,24 @@ impl Actor {
         }
     }
 
-    fn handle_reply(&mut self, message: Message) {
+    /// The server tore the channel down: it is closed, `event` is reported and
+    /// a rejoin is scheduled.
+    ///
+    /// Leaving [`ChannelStatus::Joining`] is what abandons a join still in
+    /// flight — the reply it may still get, and the timeout it will get, both
+    /// name the attempt and find it superseded. No `phx_leave` is owed: the
+    /// server is the one that closed the channel.
+    fn went_down(&mut self, topic: &Arc<str>, generation: u64, event: ChannelEvent) {
+        let Some(state) = self.live_mut(topic, generation) else {
+            return;
+        };
+        state.status = ChannelStatus::Closed;
+        state.join_ref = None;
+        emit(state, event);
+        self.schedule_rejoin(topic, generation);
+    }
+
+    async fn handle_reply(&mut self, message: Message) {
         let Some(msg_ref) = message.msg_ref.as_ref().and_then(|r| r.parse::<u64>().ok()) else {
             tracing::warn!(msg_ref = ?message.msg_ref, "reply without a usable ref");
             return;
@@ -626,7 +740,7 @@ impl Actor {
             Ok(reply) => reply,
             Err(error) => {
                 tracing::warn!(%error, "dropping malformed reply payload");
-                self.abandon(inflight, PushError::MalformedReply);
+                self.abandon(inflight, PushError::MalformedReply).await;
                 return;
             }
         };
@@ -635,15 +749,19 @@ impl Actor {
             Inflight::Push { reply: sender } => {
                 let _ = sender.send(Ok(reply));
             }
-            Inflight::Join { topic, generation } => self.join_replied(topic, generation, reply),
+            Inflight::Join {
+                topic,
+                generation,
+                attempt,
+            } => self.join_replied(topic, generation, attempt, reply),
             Inflight::Leave { topic, generation } => {
                 self.remove_if_live(&topic, generation);
             }
         }
     }
 
-    fn join_replied(&mut self, topic: Arc<str>, generation: u64, reply: Reply) {
-        let Some(state) = self.live_mut(&topic, generation) else {
+    fn join_replied(&mut self, topic: Arc<str>, generation: u64, attempt: u64, reply: Reply) {
+        let Some(state) = self.joining(&topic, generation, attempt) else {
             return;
         };
 
@@ -723,6 +841,12 @@ impl Actor {
             let was_live = state.status != ChannelStatus::Closed;
             state.status = ChannelStatus::Closed;
             state.join_ref = None;
+            // Whatever the old socket had running is gone with it: a join in
+            // flight is superseded by the reset above, and a rejoin armed
+            // against it is disarmed here. Reconnecting rejoins everything, so
+            // a rejoin timer that outlived its socket would only stack a second
+            // `phx_join` on the one the reconnect already sent.
+            state.rejoin_scheduled = None;
 
             if was_live {
                 emit(state, ChannelEvent::Error { reason });
@@ -771,17 +895,19 @@ impl Actor {
         let Some(state) = self.channels.get_mut(topic) else {
             return;
         };
-        if state.generation != generation || !state.wants_join || state.rejoin_scheduled {
+        if state.generation != generation || !state.wants_join || state.rejoin_scheduled.is_some() {
             return;
         }
 
-        state.rejoin_scheduled = true;
+        let attempt = state.attempt;
+        state.rejoin_scheduled = Some(attempt);
         let delay = state.backoff.next_delay();
         self.spawn_after(
             delay,
             ActorMsg::Rejoin {
                 topic: Arc::clone(topic),
                 generation,
+                attempt,
             },
         );
     }
@@ -836,6 +962,22 @@ impl Actor {
         self.channels
             .get_mut(topic)
             .filter(|state| state.generation == generation)
+    }
+
+    /// The registry entry for `topic`, only if it is still waiting on `attempt`.
+    ///
+    /// This is the fence every join reply and every join timeout passes: a
+    /// channel that has moved on — joined, closed, leaving, or already onto a
+    /// later attempt — must not be reopened, failed or rescheduled by one it
+    /// stopped waiting for.
+    fn joining(
+        &mut self,
+        topic: &Arc<str>,
+        generation: u64,
+        attempt: u64,
+    ) -> Option<&mut ChannelState> {
+        self.live_mut(topic, generation)
+            .filter(|state| state.status == ChannelStatus::Joining && state.attempt == attempt)
     }
 
     fn remove_if_live(&mut self, topic: &Arc<str>, generation: u64) {
