@@ -21,6 +21,12 @@ defmodule Musubi.Codegen.Rust do
       struct, its `Store` impl, the `State` shape struct, the `Params` mount
       struct, one struct per command payload / reply, one payload struct per
       push event, and every type hoisted out of those
+    * beside every shape that reaches the state tree, its navigation trait —
+      `pub trait <Name>Ext` plus the `impl` on `State<Shape>` (and, for a
+      store's shape, a second `impl` on `StoreState<Shape>`)
+      (`docs/rust-reactive-state.md` §4.2)
+    * a trailing `pub mod nav` re-exporting every one of those traits flat, so
+      a consumer writes `use <bundle>::nav::*;` once per file
 
   Rust is nominal, so anonymous maps and non-trivial unions cannot be written
   inline: `Musubi.Codegen.Rust.TypeRenderer` hoists them into named `struct` /
@@ -43,13 +49,32 @@ defmodule Musubi.Codegen.Rust do
   # so a consumer re-exporting the crate under another name can point at it.
   @default_runtime_path "musubi_client"
 
-  # The re-export list is normative (docs/rust-codegen.md §4.5) and mirrored
-  # verbatim in docs/rust-client.md §8.2.
-  @runtime_types "AsyncError, AsyncResult, Command, Event, NoReply, Store, StoreField, StoreId, UploadSlot"
+  # The re-export list is normative (docs/rust-codegen.md §4.5, extended by
+  # docs/rust-reactive-state.md §4.1 with the seven state-tree names) and
+  # mirrored verbatim in docs/rust-client.md §8.2. Emitted as one `use` tree
+  # filled to rustfmt's `max_width` at the one indent level it always lands on.
+  @runtime_types ~w(
+    AsyncError AsyncResult AsyncState Command Event NoReply State StateTree
+    Store StoreField StoreId StoreState StreamState Subscription UploadSlot
+    UploadSlotState
+  )
+
+  # Bundle-level module re-exporting every generated navigation trait, so a
+  # consumer writes `use generated::nav::*;` once per file rather than
+  # importing one trait per shape (docs/rust-reactive-state.md §4.2).
+  @nav_module "nav"
+
+  @nav_comment """
+  // Navigation traits, flat. One `use <bundle>::nav::*;` per consumer file
+  // brings every generated accessor into scope.
+  """
 
   # One level of Rust indentation, owned by the type renderer so the two
   # emitters cannot drift.
   @indent TypeRenderer.indent()
+
+  # rustfmt's `max_width`, owned by the type renderer for the same reason.
+  @max_width TypeRenderer.max_width()
 
   @prelude_comment """
   // Prelude: re-exports only. The shared runtime types are owned by the
@@ -64,14 +89,16 @@ defmodule Musubi.Codegen.Rust do
   @type entry() :: Manifest.entry()
 
   # Rendering options for one generated item: the `pub mod` depth of the module
-  # holding it, the prelude module name, and whether `doc:` field options render
-  # as `///` comments (command and event fields only, mirroring the TS target's
-  # asymmetry).
+  # holding it, the prelude module name, whether `doc:` field options render as
+  # `///` comments (command and event fields only, mirroring the TS target's
+  # asymmetry), and whether the item reaches the state tree and so takes a
+  # navigation surface.
   @typep item_opts() :: %{
            depth: non_neg_integer(),
            root_module: String.t(),
            stores: MapSet.t([String.t()]),
-           docs?: boolean()
+           docs?: boolean(),
+           nav?: boolean()
          }
 
   @doc """
@@ -79,8 +106,9 @@ defmodule Musubi.Codegen.Rust do
   Returns the rendered source string. Raises `ArgumentError` when two modules
   underscore to the same Rust module path, when two siblings of the emitted
   module tree do, when a module segment underscores to a Rust keyword that
-  cannot be a raw identifier, or when an upload name collides with a state
-  field.
+  cannot be a raw identifier, when a top-level module (or the configured
+  prelude) takes the `nav` module's name, or when an upload name collides with
+  a state field.
 
   Options:
 
@@ -108,7 +136,11 @@ defmodule Musubi.Codegen.Rust do
       |> Enum.map(fn {module, data} -> {module, normalize(data)} end)
       |> validate_no_module_path_collisions!()
 
-    tree = entries |> tree() |> validate_no_sibling_module_collisions!("")
+    tree =
+      entries
+      |> tree()
+      |> validate_no_sibling_module_collisions!("")
+      |> validate_no_nav_module_collision!(root)
 
     bundle = %{
       root: root,
@@ -117,9 +149,9 @@ defmodule Musubi.Codegen.Rust do
       prelude_item: prelude_item(runtime)
     }
 
-    blocks = [header() | prelude_and_tree(tree, bundle)]
+    {blocks, nav} = prelude_and_tree(tree, bundle)
 
-    Enum.join(blocks, "\n")
+    Enum.join([header() | blocks] ++ nav_block(nav), "\n")
   end
 
   @doc """
@@ -188,6 +220,35 @@ defmodule Musubi.Codegen.Rust do
     tree
   end
 
+  # The `nav` module is a third top-level item the bundle owns outright, next
+  # to the prelude and the module tree. Unlike the prelude it cannot be merged
+  # into a generated module of the same name — its contents are re-exports of
+  # items discovered *during* the tree walk — so a collision is a hard error,
+  # like the reserved module names in `Names.mod_ident/1`.
+  defp validate_no_nav_module_collision!(_tree, @nav_module) do
+    raise ArgumentError,
+          "Musubi Rust codegen: :rust_codegen_root_module is #{inspect(@nav_module)}, the " <>
+            "name the bundle's navigation re-export module already takes; configure another"
+  end
+
+  defp validate_no_nav_module_collision!(tree, _root) do
+    colliding =
+      Enum.find(tree, fn {segment, {children, leaf}} ->
+        emits_module?(children, leaf) and Names.mod_ident(segment) == @nav_module
+      end)
+
+    case colliding do
+      nil ->
+        tree
+
+      {segment, _node} ->
+        raise ArgumentError,
+              "Musubi Rust codegen: top-level module #{inspect(to_string(segment))} becomes " <>
+                "#{inspect(@nav_module)}, the bundle's navigation re-export module; rename " <>
+                "the Elixir module"
+    end
+  end
+
   defp raise_on_collision!({_ident, [_only]}, _prefix), do: :ok
 
   defp raise_on_collision!({ident, segments}, prefix) do
@@ -226,10 +287,28 @@ defmodule Musubi.Codegen.Rust do
   defp prelude_item(runtime) do
     """
     pub use ::#{runtime}::generated::{
-    #{@indent}#{@runtime_types},
-    };
+    #{fill(@runtime_types, @indent, String.length(@indent))}};
     """
   end
+
+  # rustfmt's `Mixed` import layout: greedily fill each line up to `max_width`,
+  # trailing comma included. `offset` is what the bundle assembler prepends —
+  # the prelude item is always shifted exactly one level, and its continuation
+  # lines carry one more.
+  defp fill(names, indent, offset) do
+    names
+    |> Enum.reduce([], &fill_line(&1, &2, indent, offset))
+    |> Enum.reverse()
+    |> Enum.map_join("", &(&1 <> "\n"))
+  end
+
+  defp fill_line(name, [line | rest] = lines, indent, offset) do
+    if offset + String.length(line) + 2 + String.length(name) <= @max_width,
+      do: [line <> " " <> name <> "," | rest],
+      else: [indent <> name <> "," | lines]
+  end
+
+  defp fill_line(name, [], indent, _offset), do: [indent <> name <> ","]
 
   defp prelude_block(bundle) do
     @prelude_comment <> "pub mod #{bundle.root} {\n" <> indent(bundle.prelude_item) <> "}\n"
@@ -262,10 +341,13 @@ defmodule Musubi.Codegen.Rust do
   defp emits_module?(children, leaf),
     do: map_size(children) > 0 or match?({_module, %{kind: :store}}, leaf)
 
-  defp prelude_and_tree(tree, %{prelude_segment: nil} = bundle),
-    do: [prelude_block(bundle) | emit_blocks(tree, 0, bundle, MapSet.new())]
+  defp prelude_and_tree(tree, %{prelude_segment: nil} = bundle) do
+    {blocks, nav} = emit_blocks(tree, 0, bundle, MapSet.new(), [])
 
-  defp prelude_and_tree(tree, bundle), do: emit_blocks(tree, 0, bundle, MapSet.new())
+    {[prelude_block(bundle) | blocks], nav}
+  end
+
+  defp prelude_and_tree(tree, bundle), do: emit_blocks(tree, 0, bundle, MapSet.new(), [])
 
   defp insert_entry(tree, [last], entry) do
     Map.update(tree, last, {%{}, entry}, fn {children, _leaf} -> {children, entry} end)
@@ -277,38 +359,63 @@ defmodule Musubi.Codegen.Rust do
     end)
   end
 
-  # Emits the body of one Rust module as a list of blocks. `claimed` seeds the
-  # per-module name table with the names already taken inside it, so a hoisted
-  # type can never shadow a generated item.
-  defp emit_blocks(tree, depth, bundle, claimed) do
+  # Emits the body of one Rust module as a list of blocks, plus every
+  # navigation trait declared inside it (for the bundle's `nav` module).
+  # `claimed` seeds the per-module name table with the names already taken
+  # inside it, so a hoisted type can never shadow a generated item; `path` is
+  # the Rust module path reached so far, which the `nav` re-exports name.
+  defp emit_blocks(tree, depth, bundle, claimed, path) do
     nodes = Enum.sort_by(tree, fn {segment, _node} -> segment end)
     claimed = Enum.reduce(nodes, claimed, &claim_struct_name/2)
 
-    {blocks, _claimed} =
-      Enum.map_reduce(nodes, claimed, fn node, acc -> emit_node(node, depth, bundle, acc) end)
+    {emitted, _claimed} =
+      Enum.map_reduce(nodes, claimed, fn node, acc ->
+        {blocks, acc, nav} = emit_node(node, depth, bundle, acc, path)
 
-    List.flatten(blocks)
+        {{blocks, nav}, acc}
+      end)
+
+    {emitted |> Enum.flat_map(&elem(&1, 0)) |> List.flatten(),
+     Enum.flat_map(emitted, &elem(&1, 1))}
   end
 
+  # A shape's `<Name>Ext` takes its place in the module's name table alongside
+  # the shape itself, before any hoisted type is allocated, so a hoisted type
+  # can never shadow a navigation trait (docs/rust-reactive-state.md §4.2).
   defp claim_struct_name({segment, {_children, {_module, %{kind: :state}}}}, claimed),
-    do: MapSet.put(claimed, segment)
+    do: claimed |> MapSet.put(segment) |> MapSet.put(ext_name(segment))
 
   defp claim_struct_name(_node, claimed), do: claimed
 
+  defp ext_name(name), do: to_string(name) <> "Ext"
+
   # A node with no leaf is a pure namespace: only the `pub mod` is emitted.
-  defp emit_node({segment, {children, nil}}, depth, bundle, claimed),
-    do: {child_module(segment, children, depth, bundle), claimed}
+  defp emit_node({segment, {children, nil}}, depth, bundle, claimed, path) do
+    {blocks, nav} = child_module(segment, children, depth, bundle, path)
 
-  defp emit_node({segment, {children, {_module, %{kind: :state} = data}}}, depth, bundle, claimed) do
+    {blocks, claimed, nav}
+  end
+
+  defp emit_node(
+         {segment, {children, {_module, %{kind: :state} = data}}},
+         depth,
+         bundle,
+         claimed,
+         path
+       ) do
     opts = item_opts(depth, bundle)
-    {specs, hoists, claimed} = render_fields(data.fields, segment, claimed, opts)
+    shape = Names.struct_ident(segment)
+    {specs, hoists, claimed} = render_fields(data.fields, segment, claimed, %{opts | nav?: true})
+    {hoisted, hoisted_nav} = hoisted_blocks(hoists, path)
 
-    blocks = [
-      TypeRenderer.struct_block(Names.struct_ident(segment), specs, depth)
-      | hoisted_blocks(hoists)
-    ]
+    blocks =
+      [TypeRenderer.struct_block(shape, specs, depth)] ++
+        ext_blocks(shape, [{state_target(shape, opts), :field}], specs, opts) ++ hoisted
 
-    {blocks ++ child_module(segment, children, depth, bundle), claimed}
+    {child_blocks, child_nav} = child_module(segment, children, depth, bundle, path)
+
+    {blocks ++ child_blocks, claimed,
+     [nav_entry(ext_name(shape), path) | hoisted_nav] ++ child_nav}
   end
 
   # A store's own items and any module nested under it share one Rust module,
@@ -317,22 +424,27 @@ defmodule Musubi.Codegen.Rust do
          {segment, {children, {module, %{kind: :store} = data}}},
          depth,
          bundle,
-         claimed
+         claimed,
+         path
        ) do
-    {items, inner_claimed} = store_items(module, data, depth + 1, bundle)
-    nested = emit_blocks(children, depth + 1, bundle, inner_claimed)
+    inner_path = [Names.mod_ident(segment) | path]
+    {items, inner_claimed, nav} = store_items(module, data, depth + 1, bundle, inner_path)
+    {nested, nested_nav} = emit_blocks(children, depth + 1, bundle, inner_claimed, inner_path)
 
     body = prelude_prefix(segment, depth, bundle) <> Enum.join(items ++ nested, "\n")
 
-    {[mod_block(segment, body)], claimed}
+    {[mod_block(segment, body)], claimed, nav ++ nested_nav}
   end
 
-  defp child_module(_segment, children, _depth, _bundle) when map_size(children) == 0, do: []
+  defp child_module(_segment, children, _depth, _bundle, _path) when map_size(children) == 0,
+    do: {[], []}
 
-  defp child_module(segment, children, depth, bundle) do
-    body = children |> emit_blocks(depth + 1, bundle, MapSet.new()) |> Enum.join("\n")
+  defp child_module(segment, children, depth, bundle, path) do
+    inner_path = [Names.mod_ident(segment) | path]
+    {blocks, nav} = emit_blocks(children, depth + 1, bundle, MapSet.new(), inner_path)
+    body = Enum.join(blocks, "\n")
 
-    [mod_block(segment, prelude_prefix(segment, depth, bundle) <> body)]
+    {[mod_block(segment, prelude_prefix(segment, depth, bundle) <> body)], nav}
   end
 
   defp prelude_prefix(segment, 0, %{prelude_segment: segment} = bundle),
@@ -348,7 +460,7 @@ defmodule Musubi.Codegen.Rust do
   # Store items
   # ---------------------------------------------------------------------------
 
-  defp store_items(module, data, depth, bundle) do
+  defp store_items(module, data, depth, bundle, path) do
     ensure_no_state_upload_collision!(module, data.fields, data.uploads)
 
     marker = module |> Module.split() |> List.last() |> Names.struct_ident()
@@ -357,12 +469,14 @@ defmodule Musubi.Codegen.Rust do
 
     claimed =
       MapSet.new(
-        [marker, "State", "Params"] ++
+        [marker, ext_name(marker), "State", "Params"] ++
           Enum.flat_map(data.commands, &command_names/1) ++
           Enum.map(data.events, &event_name/1)
       )
 
-    {specs, hoists, claimed} = render_fields(data.fields, marker, claimed, opts)
+    {specs, hoists, claimed} =
+      render_fields(data.fields, marker, claimed, %{opts | nav?: true})
+
     upload_specs = Enum.map(data.uploads, &upload_spec(&1, prelude))
 
     {param_specs, param_hoists, claimed} =
@@ -374,13 +488,63 @@ defmodule Musubi.Codegen.Rust do
     {events, claimed} =
       Enum.flat_map_reduce(data.events, claimed, &event_blocks(&1, marker, prelude, opts, &2))
 
+    {hoisted, hoisted_nav} = hoisted_blocks(hoists ++ param_hoists, path)
+
     blocks =
       [marker_block(marker), store_impl_block(module, marker, prelude)] ++
-        [state_block(marker, specs ++ upload_specs, depth), params_block(param_specs, depth)] ++
-        hoisted_blocks(hoists ++ param_hoists) ++ commands ++ events
+        [state_block(marker, specs ++ upload_specs, depth)] ++
+        ext_blocks(marker, store_targets(opts), specs ++ upload_specs, opts) ++
+        [params_block(param_specs, depth)] ++ hoisted ++ commands ++ events
 
-    {blocks, claimed}
+    {blocks, claimed, [nav_entry(ext_name(marker), path) | hoisted_nav]}
   end
+
+  # A store's shape carries two impls (docs/rust-reactive-state.md §4.2): one on
+  # `State<State>` for a shape reached as an ordinary node, one forwarding
+  # through `StoreState::fields` so a child store's own handle navigates
+  # directly — `snap.checkout_panel().total()` next to
+  # `snap.checkout_panel().store_id()`.
+  defp store_targets(opts) do
+    prelude = prelude_path(opts.depth, opts.root_module)
+
+    [{"#{prelude}::State<State>", :field}, {"#{prelude}::StoreState<State>", :forward}]
+  end
+
+  defp state_target(shape, opts),
+    do: "#{prelude_path(opts.depth, opts.root_module)}::State<#{shape}>"
+
+  defp ext_blocks(shape, targets, specs, opts),
+    do: TypeRenderer.ext_blocks(ext_name(shape), targets, specs, opts.depth)
+
+  # `path` is the enclosing Rust module path, innermost segment first; the
+  # `nav` re-export needs it outermost first.
+  defp nav_entry(trait, path), do: %{trait: trait, segments: Enum.reverse([trait | path])}
+
+  # The bundle's last top-level item: every navigation trait re-exported flat,
+  # so one `use <bundle>::nav::*;` per consumer file is enough. Sorted the way
+  # rustfmt sorts a `use` group — segment by segment, uppercase before
+  # lowercase — because the bundle has to survive `cargo fmt --check` (§4.1),
+  # and that ordering is by trait name wherever two traits share a module.
+  # Two shapes in different modules can carry the same trait name, so the names
+  # are allocated through the same append-`2` strategy hoisted types use.
+  defp nav_block([]), do: []
+
+  defp nav_block(entries) do
+    {uses, _claimed} =
+      entries
+      |> Enum.sort_by(& &1.segments)
+      |> Enum.map_reduce(MapSet.new(), fn entry, claimed ->
+        {name, claimed} = Names.allocate(entry.trait, claimed)
+        path = Enum.join(entry.segments, "::")
+
+        {@indent <> "pub use super::#{path}#{rename_use(entry.trait, name)};\n", claimed}
+      end)
+
+    [@nav_comment <> "pub mod #{@nav_module} {\n" <> Enum.join(uses) <> "}\n"]
+  end
+
+  defp rename_use(trait, trait), do: ""
+  defp rename_use(_trait, name), do: " as #{name}"
 
   defp ensure_no_state_upload_collision!(module, fields, uploads) do
     field_names = MapSet.new(fields, & &1.name)
@@ -466,10 +630,21 @@ defmodule Musubi.Codegen.Rust do
   defp optionalize("Option<" <> _rest = type), do: type
   defp optionalize(type), do: "Option<" <> type <> ">"
 
+  # The fifth handle shape (docs/rust-reactive-state.md §4.3): an upload slot
+  # is an inert leaf on the tree whose accessor hands back the two-halves key
+  # `Mounted::upload_at/1` takes.
   defp upload_spec(%{name: name}, prelude) do
     {ident, rename} = Names.field_ident(name)
 
-    %{ident: ident, rename: rename, type: prelude <> "::UploadSlot", docs: []}
+    %{
+      ident: ident,
+      rename: rename,
+      type: prelude <> "::UploadSlot",
+      docs: [],
+      key: to_string(name),
+      nav: prelude <> "::UploadSlotState",
+      into: true
+    }
   end
 
   defp command_blocks(command, marker, prelude, opts, claimed) do
@@ -532,8 +707,15 @@ defmodule Musubi.Codegen.Rust do
   # Fields and declarations
   # ---------------------------------------------------------------------------
 
-  defp item_opts(depth, bundle),
-    do: %{depth: depth, root_module: bundle.root, stores: bundle.stores, docs?: false}
+  defp item_opts(depth, bundle) do
+    %{
+      depth: depth,
+      root_module: bundle.root,
+      stores: bundle.stores,
+      docs?: false,
+      nav?: false
+    }
+  end
 
   @spec render_fields([map()], String.t(), MapSet.t(String.t()), item_opts()) ::
           {[TypeRenderer.field_spec()], [TypeRenderer.declaration()], MapSet.t(String.t())}
@@ -543,7 +725,8 @@ defmodule Musubi.Codegen.Rust do
         root_module: opts.root_module,
         depth: opts.depth,
         claimed: claimed,
-        stores: opts.stores
+        stores: opts.stores,
+        nav: opts.nav?
       )
 
     {specs, ctx} =
@@ -552,8 +735,19 @@ defmodule Musubi.Codegen.Rust do
         prefix = Names.hoisted_name(item_name, [field.name])
         {type, acc} = TypeRenderer.render(field.type, %{acc | prefix: prefix, notes: []})
         docs = field_docs(field, opts.docs?) ++ TypeRenderer.notes(acc)
+        {nav, into?} = TypeRenderer.nav_type(field.type, type, acc)
 
-        {%{ident: ident, rename: rename, type: type, docs: docs}, acc}
+        spec = %{
+          ident: ident,
+          rename: rename,
+          type: type,
+          docs: docs,
+          key: to_string(field.name),
+          nav: nav,
+          into: into?
+        }
+
+        {spec, acc}
       end)
 
     {specs, TypeRenderer.declarations(ctx), ctx.claimed}
@@ -572,10 +766,26 @@ defmodule Musubi.Codegen.Rust do
 
   defp field_docs(_field, _docs?), do: []
 
+  # A hoisted struct's navigation trait follows the struct it belongs to, so
+  # the module stays readable top-down; enums hoist no trait (they are leaves).
+  defp hoisted_blocks(declarations, path) do
+    sorted = Enum.sort_by(declarations, & &1.name)
+
+    nav = for %{ext: %{trait: trait}} <- sorted, do: nav_entry(trait, path)
+
+    {Enum.flat_map(sorted, &[&1.code | ext_code(&1)]), nav}
+  end
+
+  defp ext_code(%{ext: nil}), do: []
+  defp ext_code(%{ext: %{blocks: blocks}}), do: blocks
+
+  # Command payloads, command replies and event payloads never reach the state
+  # tree, so nothing hoisted out of them carries a navigation trait; the empty
+  # match is the assertion (docs/rust-reactive-state.md §4.3).
   defp hoisted_blocks(declarations) do
-    declarations
-    |> Enum.sort_by(& &1.name)
-    |> Enum.map(& &1.code)
+    {blocks, []} = hoisted_blocks(declarations, [])
+
+    blocks
   end
 
   defp prelude_path(depth, root), do: String.duplicate("super::", depth) <> root

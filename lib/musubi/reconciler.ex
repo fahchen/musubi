@@ -131,26 +131,6 @@ defmodule Musubi.Reconciler do
   end
 
   @doc """
-  Runs the legacy store mount callback.
-
-  This function remains as a compatibility wrapper for callers using the old
-  `mount/1` naming. New code should call `init_store/1`.
-
-  ## Examples
-
-      iex> defmodule ReconcilerLegacyMountDocStore do
-      ...>   def mount(socket), do: {:ok, Musubi.Socket.assign(socket, :mounted?, true)}
-      ...> end
-      iex> socket = %Musubi.Socket{module: ReconcilerLegacyMountDocStore}
-      iex> Musubi.Reconciler.mount_store(socket).assigns.mounted?
-      true
-  """
-  @spec mount_store(Socket.t()) :: Socket.t()
-  def mount_store(%Socket{} = socket) do
-    init_store(socket)
-  end
-
-  @doc """
   Runs `update/2` when present; otherwise merges the new assigns into the socket.
 
   ## Examples

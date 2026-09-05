@@ -253,6 +253,13 @@ non-hoisting cases so the primitive table test reads like the TS one.
 prefix (see [4.3](#43-cross-module-path-resolution)); written `musubi::` here
 for readability.
 
+The **Rust** column is the snapshot type — the struct field, and what
+`State::value()` hands back. Each row has a second rendering, the handle its
+generated `Ext` accessor returns; that column is normative in
+`docs/rust-reactive-state.md` §4.3 and summarized under the table here. The two
+are derived from one render (`TypeRenderer.nav_type/3` takes the rendered
+snapshot type), so they cannot drift.
+
 | Musubi field-type AST | TypeScript (today) | Rust |
 | :-------------------- | :----------------- | :--- |
 | `String.t()` / `binary()` / `string()` | `string` | `String` |
@@ -276,6 +283,30 @@ for readability.
 | `Musubi.AsyncResult.of(T)` | `Musubi.AsyncField<T>` | `musubi::AsyncResult<T>` |
 | any other `X.of(T)` | `unknown` | `serde_json::Value` |
 | anything unrecognized | `unknown` | `serde_json::Value` |
+
+The navigation column (`docs/rust-reactive-state.md` §4.3 is normative for it;
+`nav` is the shape of the accessor, not a second snapshot type):
+
+| Musubi field-type AST | `Ext` accessor returns |
+| :-------------------- | :--------------------- |
+| `stream(T)` | `musubi::StreamState<T'>` — keyed (`by_key`, `keys`, `at`, `iter`) |
+| `Module.state()` | `musubi::StoreState<S>`, navigated through the child store's own `Ext` |
+| `Musubi.AsyncResult.of(T)` | `musubi::AsyncState<T'>` |
+| `stream_async` (`AsyncResult.of(stream(T))`) | `musubi::AsyncState<Vec<T'>>`, the shape `ok_stream()` is defined on |
+| declared upload | `musubi::UploadSlotState` — inert leaf, bridged by `Mounted::upload_at` |
+| everything else | `musubi::State<snapshot>`, where `snapshot` is the Rust column verbatim |
+
+Three consequences worth spelling out, all from §4.3:
+
+- **Unions are leaves.** A hoisted enum gets no `Ext` trait; the accessor
+  returns `State<E>` and the consumer matches on `value()`. Anything hoisted
+  *inside* a union arm is inside that leaf, so it gets none either.
+- **`list(T)` and `stream(T)` diverge here even though both snapshot to
+  `Vec<T'>`.** A list is index-addressed through the runtime's
+  `State<Vec<T>>`; a stream is key-addressed and needs its own handle.
+- **`Params`, command payloads, command replies and event payloads get no
+  navigation**, nor does anything hoisted out of them: they never appear in the
+  state tree.
 
 Notes on the scalar choices:
 
@@ -538,18 +569,30 @@ generator emits already-formatted output; `cargo fmt` is never invoked).
 // client crate (`:rust_codegen_runtime_path`, default `musubi_client`).
 pub mod musubi {
     pub use ::musubi_client::generated::{
-        AsyncError, AsyncResult, Command, Event, NoReply, Store, StoreField, StoreId, UploadSlot,
+        AsyncError, AsyncResult, AsyncState, Command, Event, NoReply, State, StateTree, Store,
+        StoreField, StoreId, StoreState, StreamState, Subscription, UploadSlot, UploadSlotState,
     };
 }
 
 pub mod my_app {
     pub mod states {
         pub struct CartState { ... }
+        pub trait CartStateExt { ... }
+        impl CartStateExt for musubi::State<CartState> { ... }
         pub struct CartStateAddress { ... }
+        pub trait CartStateAddressExt { ... }
+        impl CartStateAddressExt for musubi::State<CartStateAddress> { ... }
     }
     pub mod stores {
         pub mod cart_store { ... }
     }
+}
+
+// Navigation traits, flat. One `use <bundle>::nav::*;` per consumer file
+// brings every generated accessor into scope.
+pub mod nav {
+    pub use super::my_app::states::CartStateExt;
+    ...
 }
 ```
 
@@ -559,9 +602,25 @@ second header line records. The prelude module exists so the rest of the bundle
 can name the shared runtime types through one depth-correct `super::`-chained
 path (§4.5).
 
-Order: header comment, inner attributes, prelude module, then the module tree
-sorted by segment (`Enum.sort_by/2` on segment strings, same as
-`emit_state_tree/3`). No `use` statements at file scope.
+Order: header comment, inner attributes, prelude module, the module tree sorted
+by segment (`Enum.sort_by/2` on segment strings, same as `emit_state_tree/3`),
+then the `nav` module. No `use` statements at file scope.
+
+**Dual surface.** Every shape struct is emitted twice over: once as the plain
+snapshot struct above, and once as the navigation trait beside it
+(`docs/rust-reactive-state.md` §4.2, §4.3, normative for that half). The
+snapshot column of §3.2 is unchanged by it; the emitted items are new.
+
+**The `nav` module.** The bundle's last top-level item re-exports every
+generated `<Name>Ext` trait flat, so a consumer writes `use
+<bundle>::nav::*;` once per file instead of importing one trait per shape (the
+`itertools::Itertools` pattern). It is emitted only when the bundle declares at
+least one shape, and its `pub use` items are sorted the way rustfmt sorts a
+`use` group — segment by segment, uppercase before lowercase — which is by
+trait name wherever two traits share a module. A top-level Elixir module whose
+segment snake_cases to `nav`, or a `:rust_codegen_root_module` configured as
+`nav`, raises `ArgumentError`: unlike the prelude, the module's contents are
+discovered *during* the tree walk, so there is nothing to merge into.
 
 **Prelude merge.** When a top-level Elixir segment snake_cases to the configured
 `:rust_codegen_root_module` **and** itself emits a `pub mod` — the case Musubi's
@@ -582,6 +641,24 @@ it fits there, otherwise the outermost generic argument list wrapped as
 `Outer<\n<indent+4>Arg,\n<indent>>`. Without this the two gates fight: a
 consumer running `cargo fmt` reformats the bundle, and
 `mix compile.musubi_rust --check` then reports drift.
+
+The navigation items add three more of rustfmt's shapes, each measured the same
+way:
+
+- **`fn` header** — one line; else the argument list broken
+  (`fn x(\n<indent+4>&self,\n<indent>) -> T;`), with the return type wrapped by
+  the generic rule above when `) -> T;` still does not fit.
+- **`impl` header** — one line; else `impl Trait\n<indent+4>for Type\n{`, with
+  the brace on its own line (and `}` under it even for an empty body).
+- **accessor body** — a method chain stays on one line only while it fits both
+  `max_width` and rustfmt's `chain_width` (60 under the default
+  `use_small_heuristics`); otherwise every link but the first goes on its own
+  line at `indent + 4`.
+
+The prelude's `use` tree is filled the same way rustfmt's `Mixed` import layout
+fills it — greedily to `max_width`, trailing comma included — measured at the
+one indent level the prelude item always lands on (§4.5's merge leaves the
+depth unchanged).
 
 ### 4.2 Module tree
 
@@ -687,11 +764,40 @@ prelude-merge rule in §4.1.
 
 ```rust
 pub use ::musubi_client::generated::{
-    AsyncError, AsyncResult, Command, Event, NoReply, Store, StoreField, StoreId, UploadSlot,
+    AsyncError, AsyncResult, AsyncState, Command, Event, NoReply, State, StateTree, Store,
+    StoreField, StoreId, StoreState, StreamState, Subscription, UploadSlot, UploadSlotState,
 };
 ```
 
 That list is normative and is mirrored verbatim in `docs/rust-client.md` §8.2.
+Seven of the names — `AsyncState`, `State`, `StateTree`, `StoreState`,
+`StreamState`, `Subscription`, `UploadSlotState` — were added by
+`docs/rust-reactive-state.md` §4.1: they are `musubi-state` types, re-exported
+*again* through `musubi_client::generated` so the bundle keeps naming exactly
+one crate (`:rust_codegen_runtime_path`). `StatusState` is deliberately **not**
+on the list — it is a `musubi-client` type, and the prelude re-exports only the
+tree's vocabulary. The line wrapping is rustfmt's, not the design document's:
+the same names, filled at the indent level the item lands on (§4.1).
+
+**Runtime contract the navigation emission depends on.** The bundle only ever
+calls two things, so `musubi-state` owes it exactly these:
+
+- `State::<T>::child<U>(&self, key: &str) -> State<U>` — signed in
+  `docs/rust-reactive-state.md` §2.4 as "the primitive every generated field
+  accessor is built from". A generated accessor is `self.child("<wire key>")`,
+  and it is **infallible**: a key the render does not carry — a root that is
+  still `Null` before the first patch, or one teardown has emptied — yields a
+  handle that reads `is_live() == false` and `try_value() == Err(Gone)`. The
+  panic budget §4.4 argues is `value()`'s, not navigation's.
+- `From<State<X>> for H` for each of the four handle newtypes — `X = Vec<T>` →
+  `StreamState<T>`, `StoreField<S>` → `StoreState<S>`, `AsyncResult<T>` →
+  `AsyncState<T>`, `UploadSlot` → `UploadSlotState` — which is the `.into()`
+  the accessor appends. `StoreState::fields()` (§2.4) carries the second impl
+  of a store shape, and that impl calls the trait method **by name**
+  (`CartStoreExt::title(&self.fields())`) rather than with a dot: a declared
+  field may be named after one of `State`'s own inherent methods (`child`,
+  `value`, `at`, `node`, ...), and an inherent method wins method resolution
+  outright.
 The crate-side definitions (`docs/rust-client.md` §6.1, §7) are the single
 source of truth for their shapes; reproduced here only for the reader:
 
@@ -842,6 +948,32 @@ pub struct State {
     pub avatar: R::UploadSlot,
 }
 
+/// Typed navigation for the shape above: one accessor per declared field,
+/// each handing back a handle rather than a value
+/// (`docs/rust-reactive-state.md` §4.2). Reach it through `nav`.
+pub trait CartStoreExt {
+    fn title(&self) -> R::State<String>;
+    fn avatar(&self) -> R::UploadSlotState;
+}
+
+impl CartStoreExt for R::State<State> {
+    fn title(&self) -> R::State<String> {
+        self.child("title")
+    }
+    fn avatar(&self) -> R::UploadSlotState {
+        self.child("avatar").into()
+    }
+}
+
+impl CartStoreExt for R::StoreState<State> {
+    fn title(&self) -> R::State<String> {
+        CartStoreExt::title(&self.fields())
+    }
+    fn avatar(&self) -> R::UploadSlotState {
+        CartStoreExt::avatar(&self.fields())
+    }
+}
+
 /// The mount params object, one field per `attr/3` declaration: required
 /// attrs are plain fields, optional ones `Option` that serialize to an
 /// absent key rather than an explicit `null`. A store declaring no `attr`
@@ -875,6 +1007,29 @@ impl R::Event<CartStore> for ToastPayload {
 
 Design points:
 
+- **The navigation trait is named after the marker, not after the shape.** A
+  store's shape is always literally `State`, so `<shape>Ext` would emit a
+  `StateExt` in every store module and the flat `nav` module could not
+  re-export two of them (`error[E0252]`). `<Marker>Ext` is unique wherever the
+  marker is, which is everywhere the module tree is. `kind: :state` modules
+  keep the design's `<shape>Ext` spelling (`CartStateExt`), because there the
+  shape name *is* the item name. Residual collisions across modules — two
+  stores with the same last segment — are resolved in `nav` by the same
+  append-`2` allocation hoisted names use.
+- **A store's shape carries two impls** (`docs/rust-reactive-state.md` §4.2):
+  one on `State<State>`, one forwarding through `StoreState::fields`, so
+  `snap.checkout_panel().total()` reads directly and
+  `snap.checkout_panel().store_id()` sits next to it. Every other shape —
+  a `kind: :state` module's struct, a struct hoisted out of a state field —
+  gets the single `State<X>` impl.
+- **`<Name>Ext` is claimed in the module's name table alongside the item**, and
+  a hoisted struct allocates its own trait name at hoist time, so a hoisted
+  type can never shadow a navigation trait. What claiming does *not* cover is
+  two **fixed** names colliding — an Elixir module `FooExt` beside `Foo`, or a
+  command named `foo_ext` in a store whose marker is `Foo`. That is the same
+  unguarded class as a command named `state` colliding with the shape struct,
+  which the generator has always left to `error[E0428]`; nothing about
+  navigation makes it more likely.
 - **Marker and shape are two types.** `CartStore` is the `St: Store` parameter
   (`Mounted<CartStore>`); `State` is what a snapshot holds
   (`Arc<<CartStore as Store>::State>`). They are never the same type.
@@ -1015,6 +1170,15 @@ discriminant and which candidate keys disqualify), literal collapse, and the
 `serde_json::Value` total fallback. `depth` and the `:root_module` override are
 exercised on the cross-module `super::`-chain rows.
 
+Two further groups cover the navigation half. `navigation types` is the same
+kind of table over `nav_type/3`, one row per §3.2 navigation row — the four
+wrapper shapes lifting into their handles, everything else falling to
+`State<snapshot>`, an unexpandable wrapper alias degrading to an opaque leaf,
+and the depth-correct prelude path. `navigation traits` pins where an `Ext`
+trait is and is not attached (state hoist yes; `Params`/command/event hoist no;
+union arm no) and the two `ext_blocks/4` bodies — `field` and the `:forward`
+impl through `StoreState::fields` — including the empty-shape shape.
+
 `test/musubi/codegen/rust/names_test.exs` is the companion table test for
 `Musubi.Codegen.Rust.Names`: raw-ident keyword escaping (`type` ⇒ `r#type`, no
 rename; non-raw-able keywords ⇒ trailing underscore plus
@@ -1043,9 +1207,19 @@ push events (a `<Name>Payload` struct per event implementing `Event`), and
 uploads (inert `UploadSlot` fields, plus `assert_raise ArgumentError` on a name
 colliding with a state field).
 
+A `navigation surface` group pins the emission of §3.2's navigation column on
+the real fixtures: a stream accessor against a list accessor, a child store as
+`StoreState`, an async node as `AsyncState` (and `stream_async` as
+`AsyncState<Vec<T>>`), a union as a leaf with no `Ext`, a store shape's two
+impls with the second forwarding through `fields()`, an upload slot as
+`UploadSlotState`, an accessor addressing the *wire* key while its ident stays
+escaped (`fn r#type` ⇒ `self.child("type")`), shapes that never reach the tree
+getting no trait at all, the `nav` module being the last top-level item and
+listing exactly the emitted traits, and the two `nav`-name collisions raising.
+
 Bundle invariants have their own group: input order doesn't change output,
-duplicate entries for one module render once, the only `use` is the prelude
-re-export, no `crate::`-absolute paths, no container renames / strict structs /
+duplicate entries for one module render once, the only `use`s are the prelude
+re-export and the `nav` module's, no `crate::`-absolute paths, no container renames / strict structs /
 TS-only markers, and every atom-literal variant carries an explicit
 `#[serde(rename = "...")]` (§3.4 — there is no `rename_all` anywhere). The
 `render/2` options group pins `:root_module` and `:runtime_path` retargeting,
@@ -1145,6 +1319,7 @@ type-checking generated code.
 | Cross-refs | namespace lookup | `super::`-chained paths | no ambient namespace merging |
 | Upload key casing | camelCase via renames | snake_case verbatim | wire is already snake_case |
 | Mount params | untyped (no params typing) | generated `Params` struct per store, plus `mount_with_params` for anything outside `:attrs` | `:attrs` is in the shared manifest; Rust has no structural object literal |
+| Navigation | none — the TS client hands out plain snapshots | a `<Name>Ext` trait per shape plus the flat `nav` module | the Rust client's state is a retained reactive tree, so a field access is a handle, not a value (`docs/rust-reactive-state.md` §4) |
 
 ---
 
@@ -1167,7 +1342,9 @@ Scope is deliberately capped at "what `:musubi_ts` does, for Rust".
   `UploadConfig`, `UploadAccept`, `UploadEntry`, `EntryStatus`,
   `UploadStatus`, `UploadError`, and the `UploadHandle` state machine live in
   `musubi-client` (`docs/rust-client.md` §10) and are reached through
-  `Mounted::upload(&store_id, name)`, not through a generated field type.
+  `Mounted::upload_at(&slot)` from the generated slot accessor, or through the
+  `Mounted::upload(&store_id, name)` primitive (`docs/rust-reactive-state.md`
+  §3.4) — never through a generated field type.
   Emitting them would ship seven types nothing deserializes.
 - **Typed mount params for the TS target.** `:attrs` is in the shared manifest
   and the Rust target generates a `Params` struct from it (§4.6), but the TS

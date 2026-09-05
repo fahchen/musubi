@@ -6,6 +6,12 @@ defmodule Musubi.Codegen.Rust.TypeRendererTest do
 
   doctest Musubi.Codegen.Rust.TypeRenderer
 
+  @ext_doc """
+  /// Typed navigation for the shape above: one accessor per declared field,
+  /// each handing back a handle rather than a value
+  /// (`docs/rust-reactive-state.md` §4.2). Reach it through `nav`.
+  """
+
   describe "primitives" do
     test "String.t()" do
       assert TypeRenderer.render!(quote(do: String.t())) == "String"
@@ -443,6 +449,118 @@ defmodule Musubi.Codegen.Rust.TypeRendererTest do
       assert TypeRenderer.render!(quote(do: :queue.t())) == "serde_json::Value"
       assert TypeRenderer.render!(quote(do: :queue.state())) == "serde_json::Value"
     end
+  end
+
+  # The navigation column of `docs/rust-reactive-state.md` §4.3, one AST shape
+  # per row. `nav_type/3` takes the already-rendered snapshot type so the two
+  # columns are derived from one render, never from two.
+  describe "navigation types" do
+    test "the four wrapper shapes lift into their own handle" do
+      assert nav(quote(do: stream(String.t()))) == {"musubi::StreamState<String>", true}
+
+      assert nav(quote(do: MyApp.CartStore.state())) ==
+               {"musubi::StoreState<my_app::cart_store::State>", true}
+
+      assert nav(quote(do: Musubi.AsyncResult.of(integer()))) ==
+               {"musubi::AsyncState<i64>", true}
+
+      # `stream_async`: the async node wraps the stream, so the handle keeps
+      # `Vec<T>` — the shape `AsyncState::ok_stream/1` is defined on.
+      assert nav(quote(do: Musubi.AsyncResult.of(stream(String.t())))) ==
+               {"musubi::AsyncState<Vec<String>>", true}
+    end
+
+    test "everything else navigates as a plain State over its snapshot type" do
+      assert nav(quote(do: String.t())) == {"musubi::State<String>", false}
+      assert nav(quote(do: list(String.t()))) == {"musubi::State<Vec<String>>", false}
+      assert nav(quote(do: String.t() | nil)) == {"musubi::State<Option<String>>", false}
+      assert nav(quote(do: MyApp.LineItem.t())) == {"musubi::State<my_app::LineItem>", false}
+
+      assert nav(quote(do: map())) ==
+               {"musubi::State<serde_json::Map<String, serde_json::Value>>", false}
+    end
+
+    test "a wrapper whose alias could not be expanded navigates as an opaque leaf" do
+      assert nav(quote(do: :queue.state())) == {"musubi::State<serde_json::Value>", false}
+
+      assert nav(quote(do: Other.Thing.of(integer()))) ==
+               {"musubi::State<serde_json::Value>", false}
+    end
+
+    test "the prelude path is depth-correct, like the snapshot column's" do
+      ctx = TypeRenderer.new(depth: 2, root_module: "rt")
+
+      assert TypeRenderer.nav_type(quote(do: stream(String.t())), "Vec<String>", ctx) ==
+               {"super::super::rt::StreamState<String>", true}
+    end
+  end
+
+  describe "navigation traits" do
+    test "a struct hoisted out of a state field carries its Ext trait" do
+      {_rendered, ctx} =
+        TypeRenderer.render(
+          quote(do: %{street: String.t()}),
+          %{ctx("CartState", [:address]) | nav: true}
+        )
+
+      assert [%{name: "CartStateAddress", ext: %{trait: "CartStateAddressExt", blocks: blocks}}] =
+               TypeRenderer.declarations(ctx)
+
+      assert Enum.join(blocks) =~
+               """
+               pub trait CartStateAddressExt {
+                   fn street(&self) -> musubi::State<String>;
+               }
+               """
+    end
+
+    test "a struct that never reaches the state tree carries none" do
+      {_rendered, ctx} =
+        TypeRenderer.render(quote(do: %{street: String.t()}), ctx("CartStateParams", [:address]))
+
+      assert [%{ext: nil}] = TypeRenderer.declarations(ctx)
+    end
+
+    test "a struct hoisted inside a union arm carries none — unions are leaves" do
+      ast = quote(do: %{type: :a} | %{type: :b, payload: %{x: integer()}})
+      {_rendered, ctx} = TypeRenderer.render(ast, %{ctx("P", [:node]) | nav: true})
+
+      assert Enum.map(TypeRenderer.declarations(ctx), & &1.ext) == [nil, nil]
+    end
+
+    test "the second impl of a store shape forwards through StoreState::fields" do
+      specs = [%{ident: "amount", key: "amount", nav: "musubi::State<i64>", into: false}]
+
+      [_trait, _direct, forwarding] =
+        TypeRenderer.ext_blocks(
+          "CartStoreExt",
+          [{"musubi::State<State>", :field}, {"musubi::StoreState<State>", :forward}],
+          specs,
+          0
+        )
+
+      assert forwarding == """
+             impl CartStoreExt for musubi::StoreState<State> {
+                 fn amount(&self) -> musubi::State<i64> {
+                     CartStoreExt::amount(&self.fields())
+                 }
+             }
+             """
+    end
+
+    test "a shape with no fields emits an empty trait and an empty impl" do
+      assert TypeRenderer.ext_blocks("EmptyExt", [{"musubi::State<Empty>", :field}], [], 0) == [
+               @ext_doc <> "pub trait EmptyExt {}\n",
+               "impl EmptyExt for musubi::State<Empty> {}\n"
+             ]
+    end
+  end
+
+  defp nav(ast) do
+    ctx = TypeRenderer.new()
+    {rendered, ctx} = TypeRenderer.render(ast, ctx)
+
+    TypeRenderer.nav_type(ast, rendered, ctx)
   end
 
   defp ctx(prefix, path), do: TypeRenderer.new(prefix: Names.hoisted_name(prefix, path))

@@ -43,6 +43,23 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
   | `Module.state()`                | `musubi::StoreField<my_app::stores::cart_store::State>` |
   | `Musubi.AsyncResult.of(T)`      | `musubi::AsyncResult<T>`                   |
   | anything unrecognized           | `serde_json::Value`                        |
+
+  ## Navigation types
+
+  Every snapshot type above has a second rendering: the handle a generated
+  `Ext` accessor hands back (`docs/rust-reactive-state.md` §4.3, mirrored in
+  `docs/rust-codegen.md` §3.2). `nav_type/3` derives it from the same AST node
+  plus the already-rendered snapshot type, so the two columns cannot drift:
+
+  | Musubi field type AST      | `Ext` accessor returns    |
+  | :------------------------- | :------------------------ |
+  | `stream(T)`                | `musubi::StreamState<T'>` |
+  | `Module.state()`           | `musubi::StoreState<S>`   |
+  | `Musubi.AsyncResult.of(T)` | `musubi::AsyncState<T'>`  |
+  | everything else            | `musubi::State<snapshot>` |
+
+  Declared uploads are the fifth shape (`musubi::UploadSlotState`); they are
+  not field types, so `Musubi.Codegen.Rust` builds that spec directly.
   """
 
   alias Musubi.Codegen.Rust.Names
@@ -55,6 +72,18 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
   # One level of Rust indentation. The generator emits already-formatted
   # output; `cargo fmt` is never invoked.
   @indent "    "
+
+  # rustfmt's `chain_width` under the default `use_small_heuristics`: 60% of
+  # `max_width`. A method chain wider than this goes vertical even when the
+  # line itself would fit, so the accessor bodies have to measure against both.
+  @chain_width 60
+
+  # Emitted above every generated navigation trait.
+  @ext_doc """
+  /// Typed navigation for the shape above: one accessor per declared field,
+  /// each handing back a handle rather than a value
+  /// (`docs/rust-reactive-state.md` §4.2). Reach it through `nav`.
+  """
 
   # rustfmt's `max_width`. A field line that would exceed it is emitted with its
   # outermost generic argument list wrapped, which is what rustfmt does — the
@@ -71,21 +100,33 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
   @fallback "serde_json::Value"
 
   @typedoc """
-  One hoisted `struct` / `enum` declaration: its allocated name and its
-  already-formatted, unindented Rust source (trailing newline included).
+  One hoisted `struct` / `enum` declaration: its allocated name, its
+  already-formatted, unindented Rust source (trailing newline included), and —
+  for a struct hoisted out of a *state* field — the navigation trait emitted
+  beside it (`nil` for enums, and for every shape that never reaches the state
+  tree).
   """
-  @type declaration() :: %{name: String.t(), code: String.t()}
+  @type declaration() :: %{
+          name: String.t(),
+          code: String.t(),
+          ext: %{trait: String.t(), blocks: [String.t()]} | nil
+        }
 
   @typedoc """
   One rendered struct field: its Rust ident, the `#[serde(rename)]` it needs (or
-  `nil`), its rendered type, and the `///` doc lines above it.
+  `nil`), its rendered type, and the `///` doc lines above it. State fields also
+  carry the navigation half: the wire key the accessor addresses, the handle
+  type it returns, and whether reaching that handle needs an `.into()`.
   """
   @type field_spec() :: %{
           :ident => String.t(),
           :rename => String.t() | nil,
           :type => String.t(),
           :docs => [String.t()],
-          optional(:skip_none) => boolean()
+          optional(:skip_none) => boolean(),
+          optional(:key) => String.t(),
+          optional(:nav) => String.t(),
+          optional(:into) => boolean()
         }
 
   @typedoc """
@@ -98,6 +139,8 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
     * `:claimed` — names already taken in the enclosing Rust module
     * `:hoists` — accumulated declarations, most recent first
     * `:notes` — doc-comment lines the caller must attach to the current field
+    * `:nav` — whether what is being rendered reaches the state tree, and so
+      whether hoisted structs get a navigation trait beside them
   """
   @type ctx() :: %{
           root_module: String.t(),
@@ -106,7 +149,8 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
           claimed: MapSet.t(String.t()),
           stores: MapSet.t([String.t()]),
           hoists: [declaration()],
-          notes: [String.t()]
+          notes: [String.t()],
+          nav: boolean()
         }
 
   @doc """
@@ -125,6 +169,11 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
       the bundle. A store is never a bare struct (`docs/rust-codegen.md` §4.2),
       so `Module.t()` on one resolves to its `State` shape instead. Defaults to
       `MapSet.new()`.
+    * `:nav` — `true` while rendering *state* fields, so that every struct
+      hoisted out of them gets its `Ext` navigation trait
+      (`docs/rust-reactive-state.md` §4.3). `Params`, command payloads/replies
+      and event payloads never reach the state tree and pass `false`, the
+      default.
 
   ## Examples
 
@@ -146,7 +195,8 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
       claimed: Keyword.get(opts, :claimed, MapSet.new()),
       stores: Keyword.get(opts, :stores, MapSet.new()),
       hoists: [],
-      notes: []
+      notes: [],
+      nav: Keyword.get(opts, :nav, false)
     }
   end
 
@@ -188,6 +238,56 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
 
     rendered
   end
+
+  @doc """
+  Returns the handle type a generated `Ext` accessor hands back for one field,
+  and whether reaching it needs an `.into()` conversion from the plain
+  `State<snapshot>` the `field` primitive yields.
+
+  Derived from the field-type AST plus its already-rendered snapshot type, so
+  the navigation column of `docs/rust-reactive-state.md` §4.3 cannot drift from
+  the snapshot column. Re-rendering the inner type instead would allocate a
+  second hoisted name for the same shape.
+
+  ## Examples
+
+      iex> alias Musubi.Codegen.Rust.TypeRenderer
+      iex> ctx = TypeRenderer.new()
+      iex> TypeRenderer.nav_type(quote(do: String.t()), "String", ctx)
+      {"musubi::State<String>", false}
+      iex> TypeRenderer.nav_type(quote(do: stream(String.t())), "Vec<String>", ctx)
+      {"musubi::StreamState<String>", true}
+  """
+  @spec nav_type(Macro.t(), String.t(), ctx()) :: {String.t(), boolean()}
+  def nav_type({:stream, _meta, [_inner]}, rendered, ctx),
+    do: handle_type("StreamState", rendered, ctx)
+
+  def nav_type({{:., _dot, [aliased, :state]}, _call, []}, rendered, ctx) do
+    if alias_segments(aliased),
+      do: handle_type("StoreState", rendered, ctx),
+      else: {plain_type(rendered, ctx), false}
+  end
+
+  def nav_type({{:., _dot, [aliased, :of]}, _call, [_inner]}, rendered, ctx) do
+    if async_result_alias?(aliased),
+      do: handle_type("AsyncState", rendered, ctx),
+      else: {plain_type(rendered, ctx), false}
+  end
+
+  def nav_type(_ast, rendered, ctx), do: {plain_type(rendered, ctx), false}
+
+  # The three wrapper shapes all render as `Outer<Inner>`; the handle keeps the
+  # inner type and swaps the wrapper. A shape that lost its wrapper on the way
+  # to Rust (an unresolvable alias falling back to `serde_json::Value`) has no
+  # inner type to lift, so it navigates as an opaque leaf.
+  defp handle_type(handle, rendered, ctx) do
+    case split_generic(rendered) do
+      {_outer, [inner]} -> {"#{prelude(ctx)}::#{handle}<#{inner}>", true}
+      _other -> {plain_type(rendered, ctx), false}
+    end
+  end
+
+  defp plain_type(rendered, ctx), do: "#{prelude(ctx)}::State<#{rendered}>"
 
   @doc """
   Returns the declarations hoisted into `ctx`, in allocation order (nested
@@ -258,6 +358,143 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
   end
 
   @doc """
+  Emits the navigation surface for one shape: the `pub trait <Name>Ext`
+  carrying one accessor per field, followed by one `impl` per target.
+
+  `targets` are `{rust_type, body}` pairs. `:field` bodies navigate through the
+  `State::child` primitive (`docs/rust-reactive-state.md` §2.4); `:forward`
+  bodies are the `StoreState::fields` forwarding that gives a child store's
+  shape its second impl (§4.2). `depth` is the enclosing `pub mod` nesting,
+  needed to measure the emitted lines against rustfmt's `max_width`.
+
+  ## Examples
+
+      iex> spec = %{ident: "title", key: "title", nav: "musubi::State<String>", into: false}
+      iex> [_trait, impl_block] =
+      ...>   Musubi.Codegen.Rust.TypeRenderer.ext_blocks(
+      ...>     "CartStateExt",
+      ...>     [{"musubi::State<CartState>", :field}],
+      ...>     [spec],
+      ...>     0
+      ...>   )
+      iex> String.contains?(impl_block, ~s|self.child("title")|)
+      true
+  """
+  @spec ext_blocks(
+          String.t(),
+          [{String.t(), :field | :forward}],
+          [field_spec()],
+          non_neg_integer()
+        ) ::
+          [String.t()]
+  def ext_blocks(trait, targets, specs, depth) do
+    offset = depth * String.length(@indent)
+
+    [
+      @ext_doc <> block("pub trait #{trait}", trait_body(specs, offset))
+      | Enum.map(targets, fn {target, body} ->
+          block(impl_header(trait, target, offset), impl_body(specs, {body, trait}, offset))
+        end)
+    ]
+  end
+
+  # rustfmt's two shapes for an `impl` header: all on one line, or the trait
+  # alone with `for <type>` indented under it and the brace on its own line.
+  defp impl_header(trait, target, offset) do
+    one_line = "impl #{trait} for #{target}"
+
+    if line_fits?(one_line <> " {", offset),
+      do: one_line,
+      else: "impl #{trait}\n#{@indent}for #{target}\n"
+  end
+
+  # rustfmt collapses an empty braced item onto one line — unless the header
+  # already broke, where the brace pair keeps its own lines.
+  defp block(header, body) do
+    if String.ends_with?(header, "\n"),
+      do: header <> "{\n" <> body <> "}\n",
+      else: braced(header, body)
+  end
+
+  defp braced(header, ""), do: header <> " {}\n"
+  defp braced(header, body), do: header <> " {\n" <> body <> "}\n"
+
+  defp trait_body(specs, offset),
+    do: Enum.map_join(specs, "", &signature(&1, @indent, ";", offset))
+
+  defp impl_body(specs, body, offset) do
+    Enum.map_join(specs, "", fn spec ->
+      signature(spec, @indent, " {", offset) <>
+        accessor_body(spec, body, @indent <> @indent, offset) <> @indent <> "}\n"
+    end)
+  end
+
+  # rustfmt's three shapes for a `fn` header, in the order it tries them: all on
+  # one line (the trailing `{` or `;` counted); then the argument list broken
+  # with the return type still on the `) -> ` line (the terminator *not*
+  # counted — the brace moves rather than the type wrapping); then the return
+  # type wrapped by the same generic-argument rule `declaration/4` uses for a
+  # struct field.
+  defp signature(spec, indent, tail, offset) do
+    head = "#{indent}fn #{spec.ident}(&self) -> "
+    returns = "#{indent}) -> "
+
+    cond do
+      line_fits?(head <> spec.nav <> tail, offset) ->
+        head <> spec.nav <> tail <> "\n"
+
+      line_fits?(returns <> spec.nav, offset) ->
+        broken_signature(spec, indent) <> returns <> spec.nav <> broken_tail(tail, indent) <> "\n"
+
+      true ->
+        broken_signature(spec, indent) <>
+          returns <> wrap_generic(spec.nav, indent, offset) <> tail <> "\n"
+    end
+  end
+
+  # A broken signature whose return type stayed on one line puts the opening
+  # brace on a line of its own — unconditionally, not only when the brace would
+  # overflow. A wrapped return type does not: its closing `>` is already back at
+  # the header's indent, so the brace follows it as it would any other block.
+  # A trait declaration's `;` never moves.
+  defp broken_tail(" {", indent), do: "\n#{indent}{"
+  defp broken_tail(tail, _indent), do: tail
+
+  defp broken_signature(spec, indent),
+    do: "#{indent}fn #{spec.ident}(\n#{indent}#{@indent}&self,\n"
+
+  # One accessor body, always a method chain: rustfmt keeps a chain on one line
+  # only while it fits `chain_width` (60 under the default
+  # `use_small_heuristics`) *and* `max_width`; otherwise every link but the
+  # first goes on its own line.
+  defp accessor_body(spec, body, indent, offset) do
+    [head | rest] = chain(spec, body)
+    width = offset + String.length(indent)
+
+    if String.length(Enum.join([head | rest])) <= min(@max_width - width, @chain_width) do
+      indent <> Enum.join([head | rest]) <> "\n"
+    else
+      indent <> head <> "\n" <> Enum.map_join(rest, "", &"#{indent}#{@indent}#{&1}\n")
+    end
+  end
+
+  # Called through the trait by name, not as a method: a declared field may be
+  # named after one of `State`'s own inherent methods (`child`, `value`, `at`,
+  # `node`, ...), and an inherent method wins method resolution outright — the
+  # forwarding body would then call the primitive instead of the accessor it is
+  # forwarding to, and fail on arity.
+  defp chain(spec, {:forward, trait}), do: ["#{trait}::#{spec.ident}(&self.fields())"]
+
+  # `State::child` is infallible: a key the render does not carry — a root that
+  # is still `Null` before the first patch, or one teardown has emptied — yields
+  # a handle that reads as gone, never a panic. Navigation is the zero-cost half
+  # of the handle/value split (docs/rust-reactive-state.md §2.4); `value()` is
+  # where a contract violation is allowed to be loud.
+  defp chain(spec, {:field, _trait}) do
+    ["self.child(\"#{spec.key}\")"] ++ if spec.into, do: [".into()"], else: []
+  end
+
+  @doc """
   One level of Rust indentation. The generator emits already-formatted output;
   `cargo fmt` is never invoked.
 
@@ -268,6 +505,19 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
   """
   @spec indent() :: String.t()
   def indent, do: @indent
+
+  @doc """
+  rustfmt's `max_width`. Owned here so the bundle assembler measures its own
+  lines — the prelude's `use` tree — against the same number the field renderer
+  uses.
+
+  ## Examples
+
+      iex> Musubi.Codegen.Rust.TypeRenderer.max_width()
+      100
+  """
+  @spec max_width() :: pos_integer()
+  def max_width, do: @max_width
 
   defp do_render({:|, _meta, [_left, _right]} = union, ctx), do: render_union(union, ctx)
 
@@ -434,8 +684,24 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
     {name, ctx} = claim(ctx)
     {specs, ctx} = render_field_specs(pairs, ctx)
     code = @derives <> "\n" <> struct_body(name, specs, offset(ctx))
+    {ext, ctx} = hoist_ext(name, specs, ctx)
 
-    {name, push_hoist(ctx, name, code)}
+    {name, push_hoist(ctx, name, code, ext)}
+  end
+
+  # A struct hoisted out of a state field is a node of the state tree, so it
+  # gets the same `<Name>Ext` navigation trait a named shape does
+  # (`docs/rust-reactive-state.md` §4.3). The trait name is allocated from the
+  # same table as the struct's, so the append-`2` strategy covers the
+  # (unreachable) case of a shape already holding the name.
+  defp hoist_ext(_name, _specs, %{nav: false} = ctx), do: {nil, ctx}
+
+  defp hoist_ext(name, specs, ctx) do
+    {trait, claimed} = Names.allocate(name <> "Ext", ctx.claimed)
+    target = "#{prelude(ctx)}::State<#{name}>"
+    blocks = ext_blocks(trait, [{target, :field}], specs, ctx.depth)
+
+    {%{trait: trait, blocks: blocks}, %{ctx | claimed: claimed}}
   end
 
   defp struct_body(name, [], _offset), do: "pub struct #{name} {}\n"
@@ -444,6 +710,8 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
     "pub struct #{name} {\n" <> field_lines(specs, @indent, "pub ", offset) <> "}\n"
   end
 
+  # Unions are leaves (`docs/rust-reactive-state.md` §4.3): Rust cannot
+  # navigate reactively *into* a variant, so a hoisted enum gets no `Ext`.
   defp hoist_atom_enum(atoms, ctx) do
     {name, ctx} = claim(ctx)
 
@@ -474,13 +742,16 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
     {name, push_hoist(ctx, name, code)}
   end
 
+  # A variant's payload is inside the leaf, so nothing under it is navigable —
+  # `nav: false` keeps a struct hoisted out of an arm from claiming an `Ext`
+  # trait no accessor could ever reach.
   defp variant({:%{}, _meta, pairs}, tag, ctx) do
     {variant, wire} = pairs |> pair_value(tag) |> Names.variant_ident()
     payload = List.keydelete(pairs, tag, 0)
-    {specs, inner_ctx} = render_field_specs(payload, descend(ctx, wire))
+    {specs, inner_ctx} = render_field_specs(payload, %{descend(ctx, wire) | nav: false})
     line = rename_line(wire, @indent) <> "#{@indent}#{variant}#{variant_body(specs, ctx)},\n"
 
-    {line, %{inner_ctx | prefix: ctx.prefix}}
+    {line, %{inner_ctx | prefix: ctx.prefix, nav: ctx.nav}}
   end
 
   defp variant_body([], _ctx), do: ""
@@ -508,7 +779,17 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
     Enum.map_reduce(pairs, ctx, fn {key, value}, acc ->
       {ident, rename} = Names.field_ident(key)
       {rendered, field_ctx} = do_render(value, %{descend(acc, key) | notes: []})
-      spec = %{ident: ident, rename: rename, type: rendered, docs: notes(field_ctx)}
+      {nav, into?} = nav_type(value, rendered, acc)
+
+      spec = %{
+        ident: ident,
+        rename: rename,
+        type: rendered,
+        docs: notes(field_ctx),
+        key: to_string(key),
+        nav: nav,
+        into: into?
+      }
 
       {spec, %{field_ctx | notes: acc.notes, prefix: acc.prefix}}
     end)
@@ -551,6 +832,10 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
   end
 
   defp fits?(type, prefix_width), do: prefix_width + String.length(type) + 1 <= @max_width
+
+  # The same measurement for a line that is already complete — a `fn` header
+  # carries its own terminator, so nothing is added for a trailing comma.
+  defp line_fits?(line, offset), do: offset + String.length(line) <= @max_width
 
   # Reproduces rustfmt's wrapping of a too-wide generic argument list:
   # `Outer<` on the field line, one argument per line at `indent + 4` with a
@@ -613,8 +898,8 @@ defmodule Musubi.Codegen.Rust.TypeRenderer do
     {name, %{ctx | claimed: claimed}}
   end
 
-  defp push_hoist(ctx, name, code),
-    do: %{ctx | hoists: [%{name: name, code: code} | ctx.hoists]}
+  defp push_hoist(ctx, name, code, ext \\ nil),
+    do: %{ctx | hoists: [%{name: name, code: code, ext: ext} | ctx.hoists]}
 
   # Cross-module references are `super::`-chained from the referencing module
   # up to the file root, prost-style, so the bundle never names its own crate.

@@ -979,7 +979,7 @@ defmodule Musubi.ResolverTest do
       socket = root_socket(MountInertRootStore)
 
       assert {:ok, %{title: "ready"}, _socket, resolved_registry} =
-               Resolver.resolve(Reconciler.mount_store(socket), registry(socket))
+               Resolver.resolve(Reconciler.init_store(socket), registry(socket))
 
       assert StoreTable.keys(resolved_registry) == [[]]
     end
