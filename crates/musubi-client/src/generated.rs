@@ -1,98 +1,47 @@
 //! The shared runtime types the generated bundle re-exports.
 //!
 //! `mix compile.musubi_rust` emits a type-only file whose prelude module is
-//! exactly one line (`docs/rust-codegen.md` §4.5):
+//! exactly one item (`docs/rust-codegen.md` §4.5):
 //!
 //! ```text
 //! pub use ::musubi_client::generated::{
-//!     AsyncError, AsyncResult, Command, Event, NoReply, Store, StoreField, StoreId, UploadSlot,
+//!     AsyncError, AsyncResult, AsyncState, Command, Event, NoReply, State, StateTree,
+//!     Store, StoreField, StoreId, StoreState, StreamState, Subscription, UploadSlot,
+//!     UploadSlotState,
 //! };
 //! ```
 //!
-//! Every item in that list lives here, because a bundle-local `trait Store`
-//! would be a *different* trait from the one [`Connection::mount`] is generic
-//! over. The generated `Params` struct is *not* in that list: it is per-store,
-//! so the bundle declares it rather than re-exporting it. [`AsyncErrorKind`]
-//! is reachable through [`AsyncError`] and is exported too, though no generated
+//! Every item in that list is nameable here, because a bundle-local
+//! `trait Store` would be a *different* trait from the one
+//! [`Connection::mount`](crate::Connection::mount) is generic over. The
+//! generated `Params` struct is *not* in that list: it is per-store, so the
+//! bundle declares it rather than re-exporting it. [`AsyncErrorKind`] is
+//! reachable through [`AsyncError`] and is exported too, though no generated
 //! item names it directly.
 //!
-//! [`Connection::mount`]: https://github.com/fahchen/musubi/blob/main/docs/rust-client.md
+//! # Where these live
+//!
+//! Three groups, and the split is the crate boundary of
+//! `docs/rust-reactive-state.md` §1.3:
+//!
+//! * The **tree vocabulary** — [`State`] and the four navigation views,
+//!   [`Subscription`], [`StateTree`] — is `musubi-state`'s, because the tree is.
+//! * The **value types a view's `value()` returns** — [`StoreId`],
+//!   [`StoreField`], [`UploadSlot`], [`AsyncResult`], [`AsyncError`] — sank into
+//!   `musubi-state` with them: a handle cannot name its own return type
+//!   otherwise. They are re-exported here verbatim, so no consumer path changed.
+//! * The **traits the generated marker types implement** — [`Store`],
+//!   [`Command`], [`Event`] — and [`NoReply`] stay here: they name
+//!   [`Mounted`](crate::Mounted), commands and events, none of which the tree
+//!   knows about.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-/// A server-authored store path; the root store's path is empty.
-///
-/// A newtype rather than a `Vec<String>` alias so a path cannot be confused
-/// with an arbitrary string vector. Store ids are **server-authored**: the
-/// client echoes them verbatim and never constructs or parses one.
-///
-/// ```
-/// use musubi_client::generated::StoreId;
-///
-/// let child: StoreId = serde_json::from_value(serde_json::json!(["cart", "0"])).unwrap();
-///
-/// assert_eq!(child.as_slice(), ["cart".to_owned(), "0".to_owned()]);
-/// assert!(StoreId::root().as_slice().is_empty());
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct StoreId(Vec<String>);
-
-impl StoreId {
-    /// The root store's path — the empty path.
-    ///
-    /// ```
-    /// use musubi_client::generated::StoreId;
-    ///
-    /// assert_eq!(serde_json::to_value(StoreId::root()).unwrap(), serde_json::json!([]));
-    /// ```
-    pub fn root() -> Self {
-        Self(Vec::new())
-    }
-
-    /// The path segments, parent first.
-    ///
-    /// ```
-    /// use musubi_client::generated::StoreId;
-    ///
-    /// let id: StoreId = serde_json::from_value(serde_json::json!(["panel"])).unwrap();
-    ///
-    /// assert_eq!(id.as_slice(), ["panel".to_owned()]);
-    /// ```
-    pub fn as_slice(&self) -> &[String] {
-        &self.0
-    }
-}
-
-/// A mounted child store: the wire node carries `__musubi_store_id__`
-/// alongside the child's own rendered fields.
-///
-/// `store_id` lives on the wrapper, never as a hand-declared field on a
-/// generated `State` struct, so `mounted.command_on(&snap.panel.store_id, ..)`
-/// is how a child command reaches its target.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StoreField<S> {
-    /// The child's server-authored path.
-    #[serde(rename = "__musubi_store_id__")]
-    pub store_id: StoreId,
-    /// The child's rendered fields, flattened into the same wire object.
-    #[serde(flatten)]
-    pub state: S,
-}
-
-/// An upload slot. The wire node is `{"__musubi_upload__": "<name>"}`.
-///
-/// Inert by design: the live upload state is not part of the state tree. The
-/// slot carries the declared name, which is the key the handle is reached by —
-/// `mounted.upload(&store_id, &slot.name)` (`docs/rust-client.md` §10).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UploadSlot {
-    /// The declared upload name.
-    #[serde(rename = "__musubi_upload__")]
-    pub name: String,
-}
+pub use musubi_state::{
+    AsyncError, AsyncErrorKind, AsyncResult, AsyncState, State, StateTree, StoreField, StoreId,
+    StoreState, StreamState, Subscription, UploadSlot, UploadSlotState,
+};
 
 /// The reply type generated for a command that declares no `reply do` block.
 ///
@@ -101,98 +50,11 @@ pub struct UploadSlot {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct NoReply {}
 
-/// The wire shape of `Musubi.AsyncResult`.
-///
-/// Field names are the **wire** names (`result` / `reason`), not the
-/// TypeScript client's app-facing `data` / `error` normalization: the derive
-/// then works with no hand-written `Deserialize` and the three variants line
-/// up 1:1 with `%Musubi.AsyncResult{status, result, reason}`.
-///
-/// The wire node also carries `"__musubi_async__": true`; an internally-tagged
-/// enum ignores the extra key, so serializing an `AsyncResult` back out omits
-/// it. That is acceptable because state never travels client → server.
-///
-/// ```
-/// use musubi_client::generated::AsyncResult;
-/// use serde_json::json;
-///
-/// let wire = json!({"__musubi_async__": true, "status": "ok", "result": 7, "reason": null});
-///
-/// assert_eq!(
-///     serde_json::from_value::<AsyncResult<u8>>(wire).unwrap(),
-///     AsyncResult::Ok { result: 7, reason: None }
-/// );
-/// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum AsyncResult<T> {
-    /// The task is running. `result` is the prior value when the server kept
-    /// it for stale-while-loading UX.
-    Loading {
-        /// The prior value, when one was preserved.
-        result: Option<T>,
-        /// The prior failure, when one was preserved.
-        reason: Option<AsyncError>,
-    },
-    /// The task succeeded.
-    Ok {
-        /// The resolved value.
-        result: T,
-        /// Always `None` in practice; the wire renders the key regardless.
-        reason: Option<AsyncError>,
-    },
-    /// The task failed. `result` is the prior value when the server kept it.
-    Failed {
-        /// The prior value, when one was preserved.
-        result: Option<T>,
-        /// Why the task failed.
-        reason: Option<AsyncError>,
-    },
-}
-
-/// Why an [`AsyncResult`] failed.
-///
-/// The server renders `%{"kind" => "error" | "exit", "value" => ...}` when it
-/// can classify the failure, and falls back to an `inspect/1`-shaped term
-/// otherwise — hence the untagged [`Opaque`](AsyncError::Opaque) arm.
-///
-/// ```
-/// use musubi_client::generated::{AsyncError, AsyncErrorKind};
-/// use serde_json::json;
-///
-/// let structured: AsyncError =
-///     serde_json::from_value(json!({"kind": "exit", "value": "timeout"})).unwrap();
-///
-/// assert!(matches!(structured, AsyncError::Structured { kind: AsyncErrorKind::Exit, .. }));
-/// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum AsyncError {
-    /// The classified shape `{"kind": ..., "value": ...}`.
-    Structured {
-        /// Whether the task raised or exited.
-        kind: AsyncErrorKind,
-        /// The wire-serialized reason term.
-        value: Value,
-    },
-    /// Anything else the server rendered.
-    Opaque(Value),
-}
-
-/// How a failed [`AsyncResult`] failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AsyncErrorKind {
-    /// The task raised.
-    Error,
-    /// The task exited.
-    Exit,
-}
-
 /// A store the client can mount, implemented by the generated marker type.
 ///
 /// The marker (`CartStore`) and the rendered shape (`State`) are two distinct
-/// types: `Mounted<CartStore>` holds `Arc<<CartStore as Store>::State>`.
+/// types: `Mounted<CartStore>` hands out
+/// [`State<<CartStore as Store>::State>`](State).
 ///
 /// Not sealed — a sealed trait could not be implemented by a file generated
 /// into a consumer crate.

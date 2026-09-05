@@ -1,0 +1,23 @@
+[package]
+name = "musubi-state"
+description = "The retained reactive state tree of the Musubi client: nodes, semantic equality, transactional patch reconciliation and per-node subscriptions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "musubi_state"
+
+# No network, no UI, no runtime (`docs/rust-reactive-state.md` §1.3): `serde` +
+# `serde_json` because the tree is built from and projected back to `Value` and
+# `NodeKind::Number` *is* a `serde_json::Number`, `slotmap` for the generational
+# node arena, and `thiserror` for the two error enums §2.3/§2.4 sign.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+slotmap.workspace = true
+thiserror.workspace = true

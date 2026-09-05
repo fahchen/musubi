@@ -12,7 +12,8 @@
 //!     answers the oldest unanswered push, a `"patch"` push rides the join the
 //!     fixture established.
 //!
-//! Afterwards the root's snapshot must equal `expected_state`. That document
+//! Afterwards the root's `state().value()` must equal `expected_state`. That
+//! document
 //! is the server's **pre-hydration** wire tree, so the only rewriting this file
 //! does is substituting each `{"__musubi_stream__": name}` marker with the
 //! array the scenario's `stream_ops` materialize to — hand-derived from
@@ -405,7 +406,7 @@ fn run<St: Store<State = Value, Params = Value>>(fixture: &Fixture) {
                             .clone()
                             .unwrap_or_else(|| panic!("{scenario}: no upload was selected"));
                         let entry_ref = handle
-                            .snapshot()
+                            .value()
                             .entries
                             .first()
                             .map(|entry| entry.r#ref.clone())
@@ -647,7 +648,7 @@ fn assert_events(
     }
 }
 
-/// Asserts the mounted root's snapshot against `expected_state`.
+/// Asserts the mounted root's `state().value()` against `expected_state`.
 fn assert_state<St: Store<State = Value>>(
     scenario: &str,
     fixture: &Fixture,
@@ -665,14 +666,20 @@ fn assert_state<St: Store<State = Value>>(
 
     let mounted =
         mounted.unwrap_or_else(|| panic!("{scenario}: the scenario's root is not mounted"));
-    let state = mounted
-        .snapshot()
-        .unwrap_or_else(|| panic!("{scenario}: the root published no state"));
+    let state = mounted.state();
 
+    assert!(
+        state.revision() > 0,
+        "{scenario}: the root published no state"
+    );
+    // A fixture store declares `State = serde_json::Value`, so `value()` is a
+    // total function here: no generated struct, no drift layering, no panic
+    // path — the tree's hydrated projection compared against the server's own
+    // wire root.
     assert_eq!(
-        state.as_ref(),
-        &hydrated(fixture),
-        "{scenario}: the client's document does not match the server's wire root"
+        state.value(),
+        hydrated(fixture),
+        "{scenario}: the client's tree does not match the server's wire root"
     );
 }
 

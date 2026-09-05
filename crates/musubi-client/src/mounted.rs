@@ -1,18 +1,36 @@
 //! The mounted-root handle and the shared cell the actor publishes into
-//! (`docs/rust-client.md` §2.4, §6.2, §6.3, §7).
+//! (`docs/rust-client.md` §2.4, §6.2, §6.3, §7;
+//! `docs/rust-reactive-state.md` §5.3, §5.4).
 //!
 //! The actor is not generic over [`Store`], so everything typed lives in a
 //! [`RootCell`] the mount call creates: the actor keeps it as a
-//! `dyn RootSink` and publishes into it, while [`Mounted`] keeps the same
-//! allocation typed and reads out of it. That is what makes `snapshot()` a
-//! lock-and-clone instead of an actor round trip, and it keeps every send on
-//! the actor task as §2.4 requires.
+//! `dyn RootSink` and drives it, while [`Mounted`] keeps the same allocation
+//! typed and reads out of it. Every send stays on the actor task, as §2.4
+//! requires.
 //!
-//! State and status are [`Latest`] cells — one value, not a queue — because
-//! each of their items subsumes the one before it (§2.4). Push events are the
-//! opposite kind of thing, so they stay one unbounded queue per subscription.
+//! # Three properties, one shape
+//!
+//! [`Mounted`] has exactly three property accessors, and each hands back a
+//! **handle** carrying `.value()` and `.subscribe(..)`:
+//!
+//! ```text
+//! mounted.state()          -> State<St::State>   the retained tree's root
+//! mounted.status()         -> StatusState        the liveness cell (BDR-0033)
+//! mounted.upload_at(&slot) -> Option<Upload>     the upload plane, keyed by the node
+//! ```
+//!
+//! There is no second way to read any of them (§5.3). The state one is not a
+//! cell at all — it is a view on the [`StateTree`] the actor applies envelopes
+//! to, so a read
+//! costs the subtree it reads and a subscription wakes only when *that* node's
+//! semantic value changes.
+//!
+//! Push events are the one thing that does not take this shape, and deliberately
+//! (§6.2): an event is a discrete occurrence, so it has no current value to
+//! read and cannot coalesce. It stays one unbounded queue per subscription.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::{self, UnboundedSender};
@@ -20,14 +38,15 @@ use futures_channel::oneshot;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use futures_util::future::ready;
+use musubi_state::{StateTree, UploadSlotState};
 use serde::Serialize;
 use serde::de::{Deserialize, DeserializeOwned};
 use serde_json::Value;
 
 use crate::actor::{ActorMsg, CommandRequest, ConnectionInner, RootHold};
 use crate::error::{MusubiError, Result};
-use crate::generated::{Command, Event, Store, StoreId};
-use crate::latest::Latest;
+use crate::generated::{Command, Event, State, Store, StoreId};
+use crate::latest::{Latest, StatusState};
 use crate::lock;
 use crate::uploads::{Upload, UploadControl, Uploads};
 
@@ -61,24 +80,33 @@ pub enum MountStatus {
     /// A cache seed renders data without leaving this state — seeded state is
     /// last-known, not live.
     Connecting,
-    /// The initial patch landed; [`Mounted::snapshot`] tracks the server.
+    /// The initial patch landed; [`Mounted::state`] tracks the server.
     Live,
     /// Liveness was lost after the root had been live — socket drop, heartbeat
     /// timeout, or version-gap recovery — and the reconnect machinery is
     /// working its way back. Ends when the rejoin's fresh initial patch lands.
     ///
     /// The last-good tree **keeps rendering** through this state (BDR-0015):
-    /// [`Mounted::snapshot`] stays `Some`, so the status is how an embedder
-    /// annotates stale rendering, never a cue to blank it.
+    /// nothing on [`Mounted::state`] is cleared, and the rejoin's initial patch
+    /// is *reconciled* into the same tree, so an unchanged subtree keeps its
+    /// identity and notifies nobody. The status is how an embedder annotates
+    /// stale rendering, never a cue to blank it.
     Reconnecting,
 }
 
 /// What the actor needs from a mounted root without knowing its [`Store`] type.
 pub(crate) trait RootSink: Send + Sync + 'static {
-    /// Deserializes the hydrated tree and publishes it into the state cell,
-    /// which is what `snapshot()` reads and every live `updates()` subscriber
-    /// converges on.
-    fn publish(&self, state: &Value) -> std::result::Result<(), serde_json::Error>;
+    /// Deserializes a whole hydrated wire root into `St::State` and throws the
+    /// result away.
+    ///
+    /// **Validation only** — the tree is built from the wire value, not from
+    /// this. It is the dyn-erasure that keeps the actor non-generic over
+    /// [`Store`], and it is where codegen drift becomes a loud failure instead
+    /// of a silently partial rendering (§4.4).
+    fn validate(&self, hydrated: &Value) -> std::result::Result<(), serde_json::Error>;
+
+    /// The retained tree this root publishes into.
+    fn tree(&self) -> &StateTree;
 
     /// Delivers one push event to every live `events()` subscriber of
     /// `(store_id, name)`. An event with no subscriber is dropped silently.
@@ -90,9 +118,9 @@ pub(crate) trait RootSink: Send + Sync + 'static {
     /// churn before the first accepted initial patch is still `Connecting`.
     fn set_status(&self, status: MountStatus);
 
-    /// The root's upload registry, which the actor hands to its
-    /// [`PatchEngine`](crate::PatchEngine) so the folded `upload_ops` land in
-    /// the same handles [`Mounted::upload`] reads.
+    /// The root's upload registry, which the actor hands to its patch engine so
+    /// the folded `upload_ops` land in the same handles [`Mounted::upload`]
+    /// reads.
     fn uploads(&self) -> Arc<Uploads>;
 
     /// Ends every subscription and puts the readable surface back to its
@@ -100,46 +128,57 @@ pub(crate) trait RootSink: Send + Sync + 'static {
     fn clear(&self);
 }
 
-/// One mounted root's typed cell: the state and status cells, plus the
-/// subscription senders of everything that is not a latest value.
+/// One mounted root's typed cell: the retained tree, the status cell, and the
+/// subscription senders of everything that is neither.
+///
+/// `St` no longer appears in a field — the tree is untyped, and the typing is
+/// [`Mounted::state`]'s `State<St::State>` view plus the `St::State`
+/// deserialization [`validate`](RootSink::validate) runs. The marker is what
+/// keeps that deserialization bound to the right store, and it is
+/// `fn() -> St` so the cell is `Send + Sync` regardless of `St`.
 pub(crate) struct RootCell<St: Store> {
-    state: Latest<Arc<St::State>>,
+    tree: StateTree,
     events: Mutex<EventRegistry>,
-    status: Latest<MountStatus>,
+    /// Behind an `Arc` because [`StatusState`] is a handle over it: the cell
+    /// outlives this struct for as long as one handle does.
+    status: Arc<Latest<MountStatus>>,
     // Not behind a `Mutex` here: the registry has its own interior locking,
     // because the actor folds ops into it while the embedder reads handles out
     // of it.
     uploads: Arc<Uploads>,
+    _marker: PhantomData<fn() -> St>,
 }
 
 impl<St: Store> RootCell<St> {
-    /// An empty cell: no state yet, no subscribers, no upload handles.
+    /// An empty cell: a tree holding a `Null` root at revision `0`, no
+    /// subscribers, no upload handles.
     ///
     /// `control` is how the upload handles this cell hands out reach the
     /// server; it is built by the mount call, which is the only place that
     /// knows the root id.
     pub(crate) fn new(control: Arc<UploadControl>) -> Self {
         Self {
-            state: Latest::new(None),
+            tree: StateTree::new(),
             events: Mutex::new(EventRegistry::default()),
-            // Seeded where the state cell is empty: the pre-initial baseline is
-            // a real status, and a subscriber replays it (BDR-0033).
-            status: Latest::new(Some(MountStatus::Connecting)),
+            // The pre-initial baseline is a real status, and a subscriber
+            // replays it (BDR-0033).
+            status: Arc::new(Latest::new(Some(MountStatus::Connecting))),
             uploads: Arc::new(Uploads::new(control)),
+            _marker: PhantomData,
         }
     }
 }
 
 impl<St: Store> RootSink for RootCell<St> {
-    fn publish(&self, state: &Value) -> std::result::Result<(), serde_json::Error> {
-        // Deserialize from the borrowed tree: `&Value` is a `Deserializer`, so
-        // the owned copy `from_value` would need is a third full clone of the
-        // hydrated tree on the one per-envelope hot path (§4.2).
-        let next = Arc::new(St::State::deserialize(state)?);
+    fn validate(&self, hydrated: &Value) -> std::result::Result<(), serde_json::Error> {
+        // Deserialize from the borrowed tree — `&Value` is a `Deserializer`, so
+        // this needs no owned copy — and drop the result. It is a shape check,
+        // not a read: what an embedder reads is the tree.
+        St::State::deserialize(hydrated).map(drop)
+    }
 
-        self.state.set(next);
-
-        Ok(())
+    fn tree(&self) -> &StateTree {
+        &self.tree
     }
 
     fn dispatch_event(&self, store_id: &StoreId, name: &str, payload: &Value) {
@@ -182,10 +221,10 @@ impl<St: Store> RootSink for RootCell<St> {
     }
 
     fn clear(&self) {
-        // Closing a cell is the terminal signal: a subscriber still takes the
-        // last value it has not seen and *then* ends, while `snapshot()` and
-        // `status()` fall back to their pre-initial baseline (BDR-0033).
-        self.state.close();
+        // Closing the tree empties the root and tells every node subscriber the
+        // root is gone; dropping the `Notify` is what runs them, and it runs
+        // them with the tree lock already released.
+        drop(self.tree.close());
 
         {
             // Terminal for the event registry too, and recorded rather than
@@ -211,13 +250,10 @@ impl<St: Store> RootSink for RootCell<St> {
 ///
 /// ```text
 /// let cart: Mounted<CartStore> = connection.mount("cart:page", Params {}).await?;
+/// let state = cart.state();
 ///
-/// let mut updates = cart.updates();
+/// let _title = state.title().subscribe(|_| redraw());
 /// let reply = cart.command(Checkout { coupon: None }).await?;
-///
-/// while let Some(state) = updates.next().await {
-///     render(&state.title);
-/// }
 /// ```
 pub struct Mounted<St: Store> {
     inner: Arc<ConnectionInner>,
@@ -226,108 +262,65 @@ pub struct Mounted<St: Store> {
 }
 
 impl<St: Store> Mounted<St> {
-    /// The last published state, or `None` before the initial patch lands.
+    /// This root's state, as the root view of its retained tree.
     ///
-    /// A reconnect does **not** clear it: the last-good rendering is kept while
-    /// the channel rejoins and is swapped atomically when the fresh initial
-    /// patch arrives (`docs/rust-client.md` §9).
+    /// A **handle**, not a value: it costs nothing, cannot fail, and is the
+    /// thing every generated field accessor navigates from. Nothing is
+    /// materialized until a `.value()` somewhere below it.
     ///
-    /// [`Connection::disconnect`](crate::Connection::disconnect) does clear it,
-    /// and nothing rejoins afterwards: a handle still held across a disconnect
-    /// reads `None` **forever**, which is indistinguishable here from a root
-    /// whose initial patch has not landed yet. There is no terminal variant to
-    /// read; the ended [`updates`](Self::updates) stream is the terminal
-    /// signal.
+    /// Not an `Option`. The root node always exists, so the lifecycle
+    /// questions are answered on the view:
+    ///
+    /// | question | read |
+    /// |---|---|
+    /// | nothing has landed yet | `state().revision() == 0` |
+    /// | one field | `state().title().value()` |
+    /// | the whole root | `state().value()` / `state().try_value()` |
+    /// | torn down by `disconnect()` | `!state().is_live()` |
+    ///
+    /// A reconnect does **not** clear it: the last-good rendering keeps
+    /// rendering while the channel rejoins, and the fresh initial patch is
+    /// *reconciled* into the same tree rather than replacing it, so a subtree
+    /// the server re-sent unchanged keeps its `NodeId`, its subscribers and its
+    /// revision (`docs/rust-client.md` §9).
+    ///
+    /// [`Connection::disconnect`](crate::Connection::disconnect) closes the
+    /// tree, and nothing rejoins afterwards: the view stays valid and reads
+    /// `is_live() == false` **forever**.
     ///
     /// ```text
-    /// let Some(state) = cart.snapshot() else { return };
+    /// let state = cart.state();
     ///
-    /// render(&state.title);
+    /// render(&state.title().value());
+    /// let _watch = state.title().subscribe(|_| redraw());
     /// ```
-    pub fn snapshot(&self) -> Option<Arc<St::State>> {
-        self.cell.state.get()
+    pub fn state(&self) -> State<St::State> {
+        self.cell.tree.root::<St::State>()
     }
 
-    /// The latest state, and every later one this consumer keeps up with.
+    /// Where this root is in its connection lifecycle (BDR-0033), as a handle.
     ///
-    /// **Latest-value, not a queue.** Each item is a whole root that subsumes
-    /// the one before it, so the stream carries no backlog: a consumer that
-    /// falls behind gets the newest state on its next poll and *never* the
-    /// intermediates it missed. Nothing is lost by that — no client-side fold
-    /// reads them — and a consumer that stalls cannot grow the client's
-    /// memory. An app that needs every envelope needs
-    /// [`events`](Self::events), which is a queue of discrete items.
+    /// One property, three actions: `status().value()` reads,
+    /// `status().subscribe(cb)` observes, and `status().into_stream()` hands the
+    /// same subscription back in `await` shape. Every rule BDR-0033 fixes is
+    /// unchanged — [`MountStatus::Connecting`] until the first accepted initial
+    /// patch, [`MountStatus::Reconnecting`] only after a root has been live,
+    /// terminal outcomes on the mount error path with no error arm here, and
+    /// [`MountStatus::Connecting`] **forever** for a handle held across a
+    /// [`Connection::disconnect`](crate::Connection::disconnect).
     ///
-    /// The first poll **replays** [`snapshot`](Self::snapshot) when there is
-    /// one, so subscribing is enough to be current; reading `snapshot()` too is
-    /// only for a synchronous first paint, not a race to close.
-    ///
-    /// The stream **is** the subscription: dropping it unsubscribes, and it
-    /// ends when the root is unmounted or the connection is disconnected —
-    /// after delivering a last value it had not yet seen.
+    /// The status is deliberately *not* a node of the tree: no wire message
+    /// carries it, so a node for it would have to be excluded from the wire
+    /// projection, from the hydrated projection and from drift validation
+    /// (`docs/rust-reactive-state.md` §5.4).
     ///
     /// ```text
-    /// let mut updates = cart.updates();
-    ///
-    /// while let Some(state) = updates.next().await {
-    ///     render(&state.title);
-    /// }
-    /// ```
-    #[must_use = "the stream is the subscription; dropping it unsubscribes"]
-    pub fn updates(&self) -> impl Stream<Item = Arc<St::State>> + Send + 'static {
-        self.cell.state.subscribe()
-    }
-
-    /// Where this root is in its connection lifecycle (BDR-0033).
-    ///
-    /// [`MountStatus::Connecting`] until the first accepted initial patch,
-    /// [`MountStatus::Live`] after, [`MountStatus::Reconnecting`] from a
-    /// socket drop / heartbeat timeout / version-gap recovery until the
-    /// rejoin's fresh initial patch lands. Terminal outcomes stay on the
-    /// mount error path; there is no error arm here.
-    ///
-    /// That has a consequence after
-    /// [`Connection::disconnect`](crate::Connection::disconnect): teardown puts
-    /// the cell back to the pre-initial baseline, so a handle still held across
-    /// a disconnect reports [`MountStatus::Connecting`] **forever** — a root
-    /// that will never connect, reading exactly like one that has not connected
-    /// yet. As with [`snapshot`](Self::snapshot), the ended
-    /// [`status_updates`](Self::status_updates) stream is the terminal signal.
-    ///
-    /// ```text
-    /// if cart.status() == MountStatus::Reconnecting {
+    /// if cart.status().value() == MountStatus::Reconnecting {
     ///     render_stale_badge();
     /// }
     /// ```
-    pub fn status(&self) -> MountStatus {
-        // A closed cell reports no value, which is exactly the pre-initial
-        // baseline a torn-down root reads as.
-        self.cell.status.get().unwrap_or(MountStatus::Connecting)
-    }
-
-    /// The current [`MountStatus`], and every later one this consumer keeps up
-    /// with (BDR-0033).
-    ///
-    /// **Latest-value, not a queue**, like [`updates`](Self::updates): the
-    /// first poll replays [`status`](Self::status), so a subscriber is current
-    /// without reading it first, and a consumer that was not polling across a
-    /// transition sees where the root ended up rather than a replay of a
-    /// window that has already closed. Writes are edges only, so a status that
-    /// did not change is not an item.
-    ///
-    /// The stream **is** the subscription: dropping it unsubscribes, and it
-    /// ends when the root is unmounted or the connection is disconnected.
-    ///
-    /// ```text
-    /// let mut statuses = cart.status_updates();
-    ///
-    /// while let Some(status) = statuses.next().await {
-    ///     pill.set(status);
-    /// }
-    /// ```
-    #[must_use = "the stream is the subscription; dropping it unsubscribes"]
-    pub fn status_updates(&self) -> impl Stream<Item = MountStatus> + Send + 'static {
-        self.cell.status.subscribe()
+    pub fn status(&self) -> StatusState {
+        StatusState::new(Arc::clone(&self.cell.status))
     }
 
     /// Dispatches a command on the root store.
@@ -341,8 +334,8 @@ impl<St: Store> Mounted<St> {
     /// patch reach this client's actor through two independently woken tasks,
     /// so on a multi-threaded executor either can be handled first
     /// (`docs/rust-client.md` §2.4). A resolved reply therefore says nothing
-    /// about [`snapshot`](Self::snapshot); apps that need "state settled" watch
-    /// [`updates`](Self::updates) for the condition they care about.
+    /// about [`state`](Self::state); apps that need "state settled" subscribe to
+    /// the node whose condition they care about.
     ///
     /// ```text
     /// let reply = cart.command(Checkout { coupon: None }).await?;
@@ -355,13 +348,14 @@ impl<St: Store> Mounted<St> {
     /// Dispatches a command on a child store, addressed by its server-authored
     /// [`StoreId`].
     ///
-    /// Store ids are never constructed by hand: they arrive on the snapshot as
-    /// `StoreField::store_id`. `T` is inferred from `cmd`'s [`Command`] impl.
+    /// Store ids are never constructed by hand: they come off the tree, as
+    /// [`StoreState::store_id`](musubi_state::StoreState::store_id). `T` is
+    /// inferred from `cmd`'s [`Command`] impl.
     ///
     /// ```text
-    /// let panel = &cart.snapshot().unwrap().checkout_panel;
+    /// let panel = cart.state().checkout_panel();
     ///
-    /// cart.command_on(&panel.store_id, Pay { amount: 12 }).await?;
+    /// cart.command_on(&panel.store_id(), Pay { amount: 12 }).await?;
     /// ```
     pub async fn command_on<C, T>(&self, target: &StoreId, cmd: C) -> Result<C::Reply>
     where
@@ -374,18 +368,20 @@ impl<St: Store> Mounted<St> {
 
     /// Push events (BDR-0032) of one store, as a typed stream.
     ///
-    /// A **queue**, unlike [`updates`](Self::updates): events are discrete
-    /// occurrences, none of which stands in for another, so a slow consumer
-    /// gets all of them (and pays for the backlog) rather than the latest one.
+    /// A **queue**, unlike every property handle on this type: events are
+    /// discrete occurrences, none of which stands in for another, so a slow
+    /// consumer gets all of them (and pays for the backlog) rather than the
+    /// latest one. That is also why events do not take the
+    /// `value()`/`subscribe()` shape — there is no "current event"
+    /// (`docs/rust-reactive-state.md` §6.2).
     ///
     /// The stream is the subscription: dropping it unregisters. Events with no
     /// live stream are dropped, and a payload that fails to deserialize is
     /// logged and skipped — an event is not state, so it never fails a cycle.
     ///
-    /// Like [`updates`](Self::updates), it ends when the root is unmounted or
-    /// the connection is disconnected — and a subscription taken *after* that
-    /// is an already-ended stream, never one waiting on events that can no
-    /// longer arrive.
+    /// It ends when the root is unmounted or the connection is disconnected —
+    /// and a subscription taken *after* that is an already-ended stream, never
+    /// one waiting on events that can no longer arrive.
     ///
     /// ```text
     /// let mut toasts = cart.events::<ToastPayload, _>(&StoreId::root());
@@ -439,28 +435,48 @@ impl<St: Store> Mounted<St> {
         })
     }
 
-    /// One upload of one store, as a handle over its live state.
+    /// The live upload handle for a slot on this mount's tree.
+    ///
+    /// **The way a consumer walks from the state tree to the upload plane.**
+    /// Both halves of the `(store_id, name)` key come from the node — the owner
+    /// is the nearest enclosing store, resolved once when the node was created —
+    /// so there is nothing for the caller to spell, no bare string taken out of
+    /// a materialized value, and no hand-written `StoreId::root()` that is
+    /// simply wrong for a slot declared inside a child store
+    /// (`docs/rust-reactive-state.md` §3.4).
+    ///
+    /// `None` exactly when the slot node is gone: its store was unmounted, or
+    /// the root was torn down.
+    ///
+    /// ```text
+    /// let avatar = cart.upload_at(&cart.state().avatar()).expect("the root is mounted");
+    ///
+    /// let _bar = avatar.subscribe(|handle| set_bar(handle.progress()));
+    /// avatar.start().await?;
+    /// ```
+    pub fn upload_at(&self, slot: &UploadSlotState) -> Option<Upload> {
+        let (store_id, name) = slot.key()?;
+
+        Some(self.upload(&store_id, &name))
+    }
+
+    /// One upload of one store, addressed by its raw key.
+    ///
+    /// The registry primitive, kept for the handful of hand-written embedders
+    /// that address a slot they never navigated to — but no longer the way a
+    /// consumer walks from the tree, which is
+    /// [`upload_at`](Self::upload_at) (§3.4).
     ///
     /// Uploads are singletons per store (BDR-0028), so `(store_id, name)`
-    /// addresses exactly one handle; `name` is the declared upload name, which
-    /// arrives on the snapshot as [`UploadSlot::name`](crate::generated::UploadSlot).
-    /// A handle exists from the first call — before any op has landed it reads
-    /// as idle with the framework defaults — and the same key always resolves
-    /// to the same handle, so it can be taken as soon as the marker appears.
+    /// addresses exactly one handle. A handle exists from the first call —
+    /// before any op has landed it reads as idle with the framework defaults —
+    /// and the same key always resolves to the same handle, so it can be taken
+    /// as soon as the marker appears.
     ///
     /// The handle carries the server-driven state *and* the control plane:
     /// [`select`](Upload::select), [`start`](Upload::start),
     /// [`cancel`](Upload::cancel) and [`reset`](Upload::reset) are on it
     /// (`docs/rust-client.md` §10.2).
-    ///
-    /// ```text
-    /// let avatar = cart.upload(&StoreId::root(), &cart.snapshot()?.avatar.name);
-    /// let mut updates = avatar.updates();
-    ///
-    /// while let Some(handle) = updates.next().await {
-    ///     render(handle.progress());
-    /// }
-    /// ```
     pub fn upload(&self, store_id: &StoreId, name: &str) -> Upload {
         self.cell.uploads.handle(store_id, name)
     }

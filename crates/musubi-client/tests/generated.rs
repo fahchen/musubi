@@ -2,12 +2,16 @@
 //! (`docs/rust-client.md` §6.1, §12; `docs/rust-codegen.md` §4.5/§4.6): the
 //! `AsyncResult` wire shape, the store/upload wrappers, and the three traits
 //! the bundle implements.
+//!
+//! Every case here is a serde-shape assertion, so none of them needs state fed
+//! through the client. The one that did — a `stream_async` field materializing
+//! as `AsyncResult<Vec<T>>` — is now a projection test in `musubi-state`, where
+//! the collection it projects lives (`docs/rust-reactive-state.md` §5.5).
 
 use musubi_client::generated::{
     AsyncError, AsyncErrorKind, AsyncResult, Command, Event, NoReply, Store, StoreField, StoreId,
     UploadSlot,
 };
-use musubi_client::{PatchEngine, PatchEnvelope};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -125,22 +129,6 @@ fn an_unknown_status_or_a_missing_key_is_a_deserialization_failure() {
     }
 }
 
-#[test]
-fn a_stream_async_field_deserializes_as_an_async_vec() {
-    let mut engine = PatchEngine::new();
-
-    engine.apply(&initial()).unwrap();
-    let applied = engine
-        .apply(&messages_insert(1, 2, "m-1"))
-        .expect("stream op applies");
-    let state: FeedState = serde_json::from_value(applied).unwrap();
-
-    assert!(matches!(
-        state.feed,
-        AsyncResult::Ok { ref result, reason: None } if result == &[Message { id: "m-1".to_owned() }]
-    ));
-}
-
 // ---------------------------------------------------------------------------
 // Store, upload and reply wrappers
 // ---------------------------------------------------------------------------
@@ -232,7 +220,9 @@ struct CartParams {
     currency: Option<String>,
 }
 
+/// The rendered shape of a store whose only field is `stream_async(:feed)`.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code, reason = "the field is what `Deserialize` fills in")]
 struct FeedState {
     feed: AsyncResult<Vec<Message>>,
 }
@@ -272,50 +262,4 @@ impl Event<CartStore> for ToastPayload {
 
 fn async_result(wire: Value) -> AsyncResult<u8> {
     serde_json::from_value(wire).expect("async result deserializes")
-}
-
-/// A root whose only field is `stream_async(:feed)`: an async node whose
-/// `result` is a stream marker.
-fn initial() -> PatchEnvelope {
-    PatchEnvelope::decode(json!({
-        "type": "patch",
-        "root_id": "MyApp.Stores.CartStore:cart",
-        "base_version": 0,
-        "version": 1,
-        "ops": [{
-            "op": "replace",
-            "path": "",
-            "value": {
-                "__musubi_store_id__": [],
-                "feed": {
-                    "__musubi_async__": true,
-                    "status": "ok",
-                    "result": {"__musubi_stream__": "messages"},
-                    "reason": null
-                }
-            }
-        }]
-    }))
-    .expect("fixture envelope decodes")
-}
-
-fn messages_insert(base_version: u64, version: u64, item_key: &str) -> PatchEnvelope {
-    PatchEnvelope::decode(json!({
-        "type": "patch",
-        "root_id": "MyApp.Stores.CartStore:cart",
-        "base_version": base_version,
-        "version": version,
-        "ops": [],
-        "stream_ops": [{
-            "op": "insert",
-            "stream": "messages",
-            "ref": "0",
-            "store_id": [],
-            "item_key": item_key,
-            "at": -1,
-            "item": {"id": item_key},
-            "limit": null
-        }]
-    }))
-    .expect("fixture envelope decodes")
 }

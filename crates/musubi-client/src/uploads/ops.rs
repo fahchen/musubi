@@ -234,18 +234,6 @@ impl UploadEntry {
 /// Applied in array order, independently of `ops` and `stream_ops`. Uploads
 /// are singletons per store, so `(store_id, upload)` identifies the handle and
 /// `ref` identifies the entry within it.
-///
-/// ```
-/// use musubi_client::UploadOp;
-/// use serde_json::json;
-///
-/// let op: UploadOp = serde_json::from_value(json!({
-///     "op": "progress", "upload": "avatar", "store_id": [], "ref": "u_a3f", "progress": 33
-/// }))
-/// .unwrap();
-///
-/// assert_eq!(op.upload(), "avatar");
-/// ```
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum UploadOp {
@@ -450,6 +438,7 @@ mod tests {
                 && error.code == UploadErrorCode::TooLarge
         ));
         assert!(ops.iter().all(|op| op.store_id() == &StoreId::root()));
+        assert!(ops.iter().all(|op| op.upload() == "avatar"));
     }
 
     #[test]

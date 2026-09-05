@@ -213,7 +213,7 @@ impl fmt::Debug for UploadProgress {
 /// One external entry's report channel to the server, and the only producer in
 /// this client that an app controls the rate of.
 ///
-/// Each report used to be an independent detached push: one unbounded
+/// One independent detached push per report would be: one unbounded
 /// `ActorMsg::RootPush`, one spawned task, one unbounded socket push, one
 /// inflight-map entry and one timeout task, with nothing throttling any of it.
 /// That is the one thing here that can sustainably outrun frame encoding, and
@@ -654,7 +654,7 @@ impl Upload {
     /// ```
     pub async fn select(&self, files: Vec<UploadFile>) -> Result<Vec<UploadEntry>> {
         if files.is_empty() {
-            return Ok(self.snapshot().entries);
+            return Ok(self.value().entries);
         }
 
         let control = self.control()?.clone();
@@ -817,7 +817,7 @@ impl Upload {
         self.cell
             .update(|handle| handle.status = UploadStatus::Uploading);
 
-        let handle = self.snapshot();
+        let handle = self.value();
         // Driven off the handle's entry order rather than the transport map's,
         // so concurrent transfers start in selection order.
         let jobs: Vec<UploadEntry> = handle
@@ -875,7 +875,7 @@ impl Upload {
             // and so is an entry another client of the same store selected.
             None => {
                 let mut refs: Vec<String> = self
-                    .snapshot()
+                    .value()
                     .entries
                     .into_iter()
                     .map(|entry| entry.r#ref)
@@ -940,7 +940,7 @@ impl Upload {
     }
 
     /// The connection behind this handle, or [`MusubiError::NotConnected`] for
-    /// a registry with none — a bare [`PatchEngine`](crate::PatchEngine).
+    /// a registry with none — one that no mount built.
     fn control(&self) -> Result<&Arc<UploadControl>> {
         self.control.as_ref().ok_or(MusubiError::NotConnected)
     }

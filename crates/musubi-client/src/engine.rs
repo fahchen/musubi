@@ -1,347 +1,209 @@
-//! The per-root patch engine: version discipline, patch application, stream
-//! materialization and hydration (`docs/rust-client.md` §4.2–§4.6).
+//! The per-root patch engine: version discipline, one transaction per envelope,
+//! and the two planes that are not the tree
+//! (`docs/rust-reactive-state.md` §3.6, `docs/rust-client.md` §4.5).
 //!
-//! The engine owns the **shadow document** — the authoritative wire tree as a
-//! `serde_json::Value`. Ops address that tree, so it is kept pristine: every
-//! cycle works on an owned copy, hydrates that copy in place, and the
-//! connection actor deserializes it into `Arc<S::State>`.
+//! There is no shadow document any more. The engine owns a
+//! [`StateTree`] — the retained tree of one mounted root — and one envelope is
+//! one transaction against it: `ops` land first, because the initial
+//! `replace ""` is what creates the slot a `stream_op` in the same envelope
+//! fills, and `upload_ops` fold into the registry afterwards, because an upload
+//! slot on the tree is an inert leaf (§3.4).
 //!
-//! Applying an envelope is therefore two calls, not one: [`PatchEngine::prepare`]
-//! produces the hydrated state without touching a thing, and
-//! [`PatchEngine::commit`] lands it. The caller deserializes in between, so a
-//! tree that does not match the generated types is dropped with the engine
-//! still on the previous version (§11).
+//! Applying is **one** call: the transaction journal makes
+//! [`apply`](PatchEngine::apply) atomic on its own, and the drift check runs
+//! *inside* the transaction, against
+//! [`Transaction::to_hydrated`](musubi_state::Transaction::to_hydrated) (§4.4),
+//! so nothing has to be deserialized between two halves of a commit.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use musubi_state::{Notify, PatchOp, StateTree};
 use serde_json::Value;
 
 use crate::envelope::PatchEnvelope;
-use crate::error::{MusubiError, Result};
+use crate::error::{MusubiError, PatchError, Result};
 use crate::generated::StoreId;
-use crate::index::{StoreIndex, build_store_index};
-use crate::streams::{StagedStreams, StreamStore, StreamsView};
 use crate::uploads::Uploads;
-use crate::{hydrate, patch};
 
 /// The message an out-of-sequence initial envelope produces.
 const INITIAL_VERSION_MESSAGE: &str = "Initial patch envelope must start at version 1";
 
-/// One root's shadow document, store index, streams, uploads and version.
+/// The drift check §4.4 runs inside the transaction, before it commits.
+///
+/// A function rather than the [`RootSink`](crate::mounted::RootSink) itself so
+/// the engine stays free of the `Store` type erasure: all it needs is "hand this
+/// hydrated root to the generated types and tell me whether they took it".
+pub(crate) type Validate<'a> = &'a dyn Fn(&Value) -> std::result::Result<(), serde_json::Error>;
+
+/// One root's retained tree, upload registry and version.
 #[derive(Debug)]
-pub struct PatchEngine {
+pub(crate) struct PatchEngine {
     version: u64,
-    document: Value,
-    index: StoreIndex,
-    streams: StreamStore,
+    tree: StateTree,
     uploads: Arc<Uploads>,
 }
 
 impl PatchEngine {
-    /// A fresh engine, awaiting its initial envelope.
-    ///
-    /// ```
-    /// use musubi_client::PatchEngine;
-    ///
-    /// assert_eq!(PatchEngine::new().version(), 0);
-    /// ```
-    pub fn new() -> Self {
-        Self::with_uploads(Arc::new(Uploads::default()))
-    }
-
-    /// The engine a mounted root gets: same as [`new`](Self::new), except the
-    /// upload registry is the one its [`Mounted`](crate::Mounted) hands out
-    /// handles from, so folded `upload_ops` and observed handles are the same
-    /// objects.
-    pub(crate) fn with_uploads(uploads: Arc<Uploads>) -> Self {
+    /// The engine a mounted root gets: the tree its [`Mounted`](crate::Mounted)
+    /// hands out [`State`](musubi_state::State) views of, and the upload
+    /// registry its handles come from — so folded ops and observed values are
+    /// the same objects.
+    pub(crate) fn new(tree: StateTree, uploads: Arc<Uploads>) -> Self {
         Self {
             version: 0,
-            document: Value::Null,
-            index: StoreIndex::new(),
-            streams: StreamStore::default(),
+            tree,
             uploads,
         }
     }
 
-    /// The root's upload handles, keyed by `(store_id, name)`.
-    ///
-    /// ```
-    /// use musubi_client::PatchEngine;
-    /// use musubi_client::generated::StoreId;
-    ///
-    /// let engine = PatchEngine::new();
-    /// let avatar = engine.uploads().handle(&StoreId::root(), "avatar");
-    ///
-    /// assert!(avatar.snapshot().is_idle());
-    /// ```
-    pub fn uploads(&self) -> &Uploads {
-        &self.uploads
-    }
-
     /// The last accepted envelope's `version`; `0` means "awaiting the initial
     /// envelope" (fresh, or mid-reconnect).
-    ///
-    /// ```
-    /// use musubi_client::{PatchEngine, PatchEnvelope};
-    /// use serde_json::json;
-    ///
-    /// let mut engine = PatchEngine::new();
-    /// let envelope = PatchEnvelope::decode(json!({
-    ///     "type": "patch",
-    ///     "root_id": "MyApp.CartStore:cart",
-    ///     "base_version": 0,
-    ///     "version": 1,
-    ///     "ops": [{"op": "replace", "path": "", "value": {"__musubi_store_id__": []}}]
-    /// }))
-    /// .unwrap();
-    ///
-    /// engine.apply(&envelope).unwrap();
-    ///
-    /// assert_eq!(engine.version(), 1);
-    /// ```
-    pub fn version(&self) -> u64 {
+    pub(crate) fn version(&self) -> u64 {
         self.version
     }
 
-    /// The pristine wire tree the ops address.
-    ///
-    /// Stream markers are still in place here; what [`PatchEngine::apply`]
-    /// returns is the hydrated view.
-    ///
-    /// ```
-    /// use musubi_client::PatchEngine;
-    ///
-    /// assert!(PatchEngine::new().document().is_null());
-    /// ```
-    pub fn document(&self) -> &Value {
-        &self.document
+    /// The wire projection of the whole tree — stream slots back to their
+    /// markers — which is the shape the mount cache stores (§7).
+    pub(crate) fn document(&self) -> Value {
+        self.tree
+            .to_wire(self.tree.root_id())
+            .unwrap_or(Value::Null)
     }
 
-    /// Forgets the version while keeping the tree, index, streams and uploads
-    /// (§9).
+    /// Forgets the version while keeping the tree and uploads (§9).
     ///
     /// Every recovery path — a rejoin, a version gap, a transport drop — leaves
     /// the last-good rendering in place and waits for a fresh initial envelope
-    /// to swap it out atomically. Only the version is reset, so the next
-    /// envelope must again be `base_version: 0, version: 1`.
-    ///
-    /// ```
-    /// use musubi_client::{PatchEngine, PatchEnvelope};
-    /// use serde_json::json;
-    ///
-    /// let mut engine = PatchEngine::new();
-    /// let initial = PatchEnvelope::decode(json!({
-    ///     "type": "patch",
-    ///     "root_id": "MyApp.CartStore:cart",
-    ///     "base_version": 0,
-    ///     "version": 1,
-    ///     "ops": [{"op": "replace", "path": "", "value": {"title": "Cart"}}]
-    /// }))
-    /// .unwrap();
-    ///
-    /// engine.apply(&initial).unwrap();
-    /// engine.soft_reset();
-    ///
-    /// assert_eq!(engine.version(), 0);
-    /// assert_eq!(engine.document()["title"], json!("Cart"));
-    /// ```
-    pub fn soft_reset(&mut self) {
+    /// to reconcile it. Only the version is reset, so the next envelope must
+    /// again be `base_version: 0, version: 1`.
+    pub(crate) fn soft_reset(&mut self) {
         self.version = 0;
     }
 
-    /// Adopts a cached wire tree as the current document, without touching the
-    /// version (`docs/rust-client.md` §6.4).
+    /// Builds the tree from a cached wire tree, without touching the version
+    /// (`docs/rust-client.md` §6.4).
     ///
     /// The engine stays at `0`, so the live initial envelope is still required
-    /// to be `base_version: 0, version: 1` and still swaps the whole tree out
+    /// to be `base_version: 0, version: 1` and still reconciles the whole tree
     /// in one `replace ""`. Streams are **not** seeded — `stream_ops` are not
-    /// part of the cached tree — so a seeded stream slot hydrates to `[]` until
-    /// the live envelope refills it, exactly as in the TypeScript client.
-    ///
-    /// ```
-    /// use musubi_client::PatchEngine;
-    /// use serde_json::json;
-    ///
-    /// let mut engine = PatchEngine::new();
-    /// let state = engine.seed(json!({"__musubi_store_id__": [], "title": "Cart"}));
-    ///
-    /// assert_eq!(state["title"], json!("Cart"));
-    /// assert_eq!(engine.version(), 0);
-    /// ```
-    pub fn seed(&mut self, document: Value) -> Value {
-        self.document = document;
-        self.index = build_store_index(&self.document);
-
-        self.prune_to_index();
-
-        let mut state = self.document.clone();
-
-        hydrate::hydrate(&mut state, StreamsView::committed(&self.streams));
-
-        state
-    }
-
-    /// Undoes a [`seed`](Self::seed) whose tree did not match the generated
-    /// types, putting the engine back where a cold mount would have left it.
+    /// part of a cached tree — so a seeded stream slot reads as `[]` until the
+    /// live envelope refills it, exactly as in the TypeScript client.
     ///
     /// A cached tree written by an older build can be a shape this binary can
-    /// no longer deserialize; dropping it is always safe, because the live
-    /// initial patch replaces the whole tree anyway.
-    ///
-    /// ```
-    /// use musubi_client::PatchEngine;
-    /// use serde_json::json;
-    ///
-    /// let mut engine = PatchEngine::new();
-    ///
-    /// engine.seed(json!({"title": "Cart"}));
-    /// engine.discard_seed();
-    ///
-    /// assert!(engine.document().is_null());
-    /// ```
-    pub fn discard_seed(&mut self) {
-        self.document = Value::Null;
-        self.index = StoreIndex::new();
+    /// no longer deserialize. That is what `validate` catches, and the seed is
+    /// then **rolled back** by the transaction rather than undone by a second
+    /// call: the root is left exactly where a cold mount would have left it.
+    pub(crate) fn seed(&mut self, document: Value, validate: Validate<'_>) -> Result<Notify> {
+        let mut transaction = self.tree.begin();
+
+        transaction
+            .apply(
+                &[PatchOp::Replace {
+                    path: String::new(),
+                    value: document,
+                }],
+                &[],
+            )
+            .map_err(|error| PatchError::from_tree(0, error))?;
+
+        Self::validate(&transaction, validate)?;
+
+        let notify = transaction.commit();
+
+        self.prune();
+
+        Ok(notify)
     }
 
-    /// Applies one envelope in the order §4.3 fixes: validate, patch, rebuild
-    /// the index, fold `stream_ops`, hydrate — then adopt all of it, fold
-    /// `upload_ops`, and prune.
+    /// Applies one envelope as one transaction, in the order §3.6 fixes.
     ///
-    /// Upload ops are folded into the registry rather than into the tree: an
-    /// upload slot stays the inert `{"__musubi_upload__": name}` marker on the
-    /// hydrated state, and its live state is read through
-    /// [`uploads`](Self::uploads) (§10).
+    /// Steps 1–8: check the version, open the transaction, land `ops` then
+    /// `stream_ops`, validate the root when this envelope carries one (§4.4),
+    /// commit, fold `upload_ops`, prune, advance the version. **Step 9 is the
+    /// caller's**: dropping the returned [`Notify`] is what runs the state
+    /// subscribers, and holding it is how the actor sequences them against
+    /// `Live`, the events and the cache write.
     ///
-    /// Nothing is mutated unless every step succeeds — `json_patch::patch` is
-    /// atomic, the op allowlist already ran at decode, and the version check
-    /// runs first — so a rejected envelope leaves the previous tree
-    /// authoritative and the caller can enter recovery (§9).
-    ///
-    /// This is the crate-internal `prepare` step followed immediately by
-    /// `commit`. A caller that has to *validate* the state before it lands —
-    /// the connection actor, which deserializes it into the generated types —
-    /// takes the two steps separately instead.
-    ///
-    /// ```
-    /// use musubi_client::{PatchEngine, PatchEnvelope};
-    /// use serde_json::json;
-    ///
-    /// let mut engine = PatchEngine::new();
-    /// let initial = PatchEnvelope::decode(json!({
-    ///     "type": "patch",
-    ///     "root_id": "MyApp.CartStore:cart",
-    ///     "base_version": 0,
-    ///     "version": 1,
-    ///     "ops": [{
-    ///         "op": "replace",
-    ///         "path": "",
-    ///         "value": {"__musubi_store_id__": [], "title": "Cart"}
-    ///     }]
-    /// }))
-    /// .unwrap();
-    ///
-    /// let state = engine.apply(&initial).unwrap();
-    ///
-    /// assert_eq!(state["title"], json!("Cart"));
-    /// ```
-    //
-    // ponytail: no change set is returned — v1 publishes one whole-root
-    // snapshot per envelope, so nothing consumes it. The §5 change-notification
-    // rule gets computed here when the per-store snapshot cache lands.
-    pub fn apply(&mut self, envelope: &PatchEnvelope) -> Result<Value> {
-        let staged = self.prepare(envelope)?;
-
-        Ok(self.commit(staged))
-    }
-
-    /// Runs everything an envelope can fail at, against a working copy: the
-    /// version check, the ops, the index rebuild, the stream fold and the
-    /// hydration walk (§4.3 steps 1–5 and §4.6).
-    ///
-    /// Takes `&self`: preparing cannot move the engine, so a
-    /// [`StagedPatch`] that is dropped rather than committed leaves the
-    /// version, the tree, the streams and every upload subscriber exactly as
-    /// they were.
-    ///
-    /// The working copy is the cycle's only copy of the tree: the ops land on
-    /// it, the index is read off it, and the hydration walk then rewrites it in
-    /// place into the state the caller deserializes.
-    ///
-    /// Pruning is a commit-phase step, so the walk runs against streams that
-    /// still include ones the commit is about to drop. It cannot see the
-    /// difference: a stream is pruned when its owning store is absent from the
-    /// freshly rebuilt index, and every store id the walk resolves a marker
-    /// against is one it read out of that same tree — a prunable stream has no
-    /// marker left to look it up with. The one store id the walk can name
-    /// without reading it is the root, and the wire root is always a store node
-    /// (§4.6).
-    pub(crate) fn prepare<'a>(&self, envelope: &'a PatchEnvelope) -> Result<StagedPatch<'a>> {
+    /// A failure at any of steps 1, 3 or 4 drops the transaction, which rolls
+    /// the tree back to exactly what it was: the version does not advance, no
+    /// upload subscriber has heard of this envelope, no state subscriber is
+    /// notified, and the last-good tree keeps rendering while
+    /// `docs/rust-client.md` §9 recovery restarts the root.
+    pub(crate) fn apply(
+        &mut self,
+        envelope: &PatchEnvelope,
+        validate: Validate<'_>,
+    ) -> Result<Notify> {
         self.check_version(envelope)?;
 
-        let mut state = self.document.clone();
+        let mut transaction = self.tree.begin();
 
-        patch::apply_ops(&mut state, &envelope.ops)?;
+        // One op at a time, so a failure can name *which* op failed — the index
+        // `PatchError::Apply` has always carried. Every call joins the same
+        // transaction, so this is one transaction, not one per op (§2.3).
+        for (index, op) in envelope.ops.iter().enumerate() {
+            transaction
+                .apply(std::slice::from_ref(op), &[])
+                .map_err(|error| PatchError::from_tree(index, error))?;
+        }
 
-        let index = build_store_index(&state);
-        let streams = self.streams.stage(&envelope.stream_ops);
+        transaction
+            .apply(&[], &envelope.stream_ops)
+            .map_err(|error| PatchError::from_tree(envelope.ops.len(), error))?;
 
-        hydrate::hydrate(&mut state, StreamsView::staged(&self.streams, &streams));
+        if Self::carries_drift_check(envelope) {
+            Self::validate(&transaction, validate)?;
+        }
 
-        Ok(StagedPatch {
-            envelope,
-            state,
-            index,
-            streams,
+        let notify = transaction.commit();
+
+        // The first thing outside the tree to hear that this envelope was
+        // accepted (§3.6 steps 6–8).
+        self.uploads.apply_ops(&envelope.upload_ops);
+        self.prune();
+        self.version = envelope.version;
+
+        Ok(notify)
+    }
+
+    /// Whether this envelope runs the whole-root drift check (§4.4).
+    ///
+    /// Layer 1 — every envelope carrying a root `replace ""`, i.e. once per
+    /// mount and once per rejoin — is always on, release builds included, and is
+    /// the only whole-root deserialization left in the client. Layer 2 widens it
+    /// to *every* accepted envelope under `debug_assertions`, which is v1's
+    /// per-envelope cost kept exactly where it is free.
+    fn carries_drift_check(envelope: &PatchEnvelope) -> bool {
+        cfg!(debug_assertions)
+            || envelope
+                .ops
+                .iter()
+                .any(|op| matches!(op, PatchOp::Replace { path, .. } if path.is_empty()))
+    }
+
+    /// Runs the drift check against the transaction's own view of the root.
+    ///
+    /// The root's own subtree is what failed, so the reported store is the root
+    /// path even when a nested store node is the culprit.
+    fn validate(transaction: &musubi_state::Transaction<'_>, validate: Validate<'_>) -> Result<()> {
+        let root = transaction.root_id();
+        let hydrated = transaction.to_hydrated(root).unwrap_or(Value::Null);
+
+        validate(&hydrated).map_err(|source| MusubiError::Decode {
+            store_id: StoreId::root(),
+            source,
         })
     }
 
-    /// Lands a prepared envelope and hands back its hydrated state: the tree,
-    /// the index, the streams and the version first, then the upload ops —
-    /// whose subscribers are the first thing outside the engine to hear that
-    /// this envelope was accepted (§10).
+    /// Drops the upload handles of every store the tree no longer holds
+    /// (§3.6 step 7, BDR-0011).
     ///
-    /// The shadow document replays the ops rather than adopting the working
-    /// copy, because that copy has already been rewritten in place into the
-    /// hydrated state; replaying a delta is what keeps the cycle at one copy of
-    /// the tree instead of two.
-    pub(crate) fn commit(&mut self, staged: StagedPatch<'_>) -> Value {
-        let StagedPatch {
-            envelope,
-            state,
-            index,
-            streams,
-        } = staged;
+    /// Streams need no equivalent: a `Collection` node is freed with the store
+    /// subtree that owns it, so pruning them is structural (§3.5).
+    fn prune(&self) {
+        let live_store_ids: HashSet<StoreId> = self.tree.store_ids().into_iter().collect();
 
-        if let Err(error) = patch::apply_ops(&mut self.document, &envelope.ops) {
-            // Unreachable: `prepare` just applied these same ops to a copy of
-            // this same tree, and `json_patch::patch` is a pure function of the
-            // two. Should it ever happen, the tree is left as it was and the
-            // version is not bumped — the state of a *rejected* envelope, which
-            // the next one recovers from (§9) — rather than a tree and a
-            // version that disagree.
-            tracing::error!(%error, "a prepared envelope did not replay onto the shadow document");
-
-            return state;
-        }
-
-        self.index = index;
-        self.streams.commit(streams);
-        self.uploads.apply_ops(&envelope.upload_ops);
-        self.prune_to_index();
-
-        self.version = envelope.version;
-
-        state
-    }
-
-    /// Drops the streams and upload handles of every store the freshly rebuilt
-    /// index no longer names (§4.3 step 8, BDR-0011).
-    fn prune_to_index(&mut self) {
-        let live_store_ids: HashSet<StoreId> = self.index.keys().cloned().collect();
-
-        self.streams.prune(&live_store_ids);
         self.uploads.prune(&live_store_ids);
     }
 
@@ -367,182 +229,488 @@ impl PatchEngine {
     }
 }
 
-impl Default for PatchEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// One envelope, applied to a working copy and not yet accepted.
-///
-/// Everything the envelope changes lives here until [`PatchEngine::commit`]
-/// takes it: the hydrated state, the rebuilt index, the stream fold, and the
-/// envelope whose ops the shadow document still has to see. It borrows the
-/// envelope and shares nothing with the engine, so dropping it is how a caller
-/// rejects an envelope it has already inspected.
-pub(crate) struct StagedPatch<'a> {
-    envelope: &'a PatchEnvelope,
-    state: Value,
-    index: StoreIndex,
-    streams: StagedStreams,
-}
-
-impl StagedPatch<'_> {
-    /// The hydrated tree this envelope produces, for the caller to deserialize
-    /// before deciding.
-    pub(crate) fn state(&self) -> &Value {
-        &self.state
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use futures_executor::block_on;
-    use futures_util::{FutureExt, StreamExt};
+    use musubi_state::State;
     use serde_json::json;
 
     use super::*;
 
-    const ROOT_ID: &str = "MyApp.CartStore:cart";
+    const ROOT_ID: &str = "MyApp.Stores.CartStore:cart";
+
+    /// The validator a bare engine runs: the generated types are the mount's
+    /// business, and these tests have none.
+    const ACCEPT: Validate<'static> = &|_| Ok(());
+
+    // ---- version discipline ---------------------------------------------
 
     #[test]
-    fn a_staged_patch_carries_the_whole_envelope_before_any_of_it_lands() {
-        let mut engine = PatchEngine::new();
+    fn the_initial_envelope_must_be_base_zero_version_one() {
+        for (base_version, version) in [(0, 2), (1, 2), (0, 0)] {
+            let mut engine = bare();
+            let error = engine
+                .apply(&envelope(base_version, version, vec![]), ACCEPT)
+                .unwrap_err();
 
-        engine
-            .apply(&initial())
-            .expect("the initial envelope lands");
-
-        let second = second();
-        let staged = engine.prepare(&second).expect("the envelope prepares");
-
-        assert_eq!(staged.state()["title"], json!("Checkout"));
-        assert_eq!(
-            staged.state()["messages"],
-            json!([{"id": "a"}, {"id": "b"}]),
-            "the staged fold is what the walk materialized"
-        );
+            assert!(
+                matches!(error, MusubiError::Protocol(message) if message.contains("version 1")),
+                "expected {base_version}->{version} to be refused"
+            );
+            assert_eq!(engine.version(), 0);
+        }
     }
 
     #[test]
-    fn dropping_a_staged_patch_leaves_the_engine_exactly_as_it_was() {
-        let mut engine = PatchEngine::new();
+    fn a_gap_in_the_sequence_is_a_version_mismatch_and_changes_nothing() {
+        let mut engine = mounted();
 
-        engine
-            .apply(&initial())
-            .expect("the initial envelope lands");
+        let error = engine
+            .apply(
+                &envelope(
+                    2,
+                    3,
+                    vec![json!({"op": "replace", "path": "/title", "value": "Gapped"})],
+                ),
+                ACCEPT,
+            )
+            .unwrap_err();
 
-        let avatar = engine.uploads().handle(&StoreId::root(), "avatar");
-        let mut updates = avatar.updates();
-        let document = engine.document().clone();
+        assert!(matches!(error, MusubiError::VersionMismatch));
+        assert_eq!(engine.version(), 1);
+        assert_eq!(title(&engine), "Cart");
+    }
 
-        let second = second();
+    #[test]
+    fn a_replayed_envelope_is_a_version_mismatch() {
+        let mut engine = mounted();
 
-        drop(engine.prepare(&second).expect("the envelope prepares"));
-
-        assert_eq!(engine.version(), 1, "the version did not move");
-        assert_eq!(
-            engine.document(),
-            &document,
-            "the shadow document is intact"
-        );
-        assert_eq!(
+        drop(
             engine
-                .streams
-                .entries(&StoreId::root(), "messages")
-                .iter()
-                .map(|entry| entry.item_key.clone())
-                .collect::<Vec<_>>(),
-            ["a"],
-            "the stream fold was dropped with it"
+                .apply(
+                    &envelope(
+                        1,
+                        2,
+                        vec![json!({"op": "replace", "path": "/title", "value": "Second"})],
+                    ),
+                    ACCEPT,
+                )
+                .unwrap(),
         );
-        assert!(
-            avatar.snapshot().entry("u_1").is_none(),
-            "the upload ops were never folded"
-        );
-        assert!(
-            updates.next().now_or_never().is_none(),
-            "and no upload subscriber was told otherwise"
-        );
+        let error = engine
+            .apply(
+                &envelope(
+                    1,
+                    2,
+                    vec![json!({"op": "replace", "path": "/title", "value": "Replay"})],
+                ),
+                ACCEPT,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, MusubiError::VersionMismatch));
+        assert_eq!(title(&engine), "Second");
     }
 
     #[test]
-    fn committing_a_staged_patch_lands_every_part_of_it() {
-        let mut engine = PatchEngine::new();
+    fn a_stream_only_cycle_still_bumps_the_sequence() {
+        let mut engine = mounted();
 
-        engine
-            .apply(&initial())
-            .expect("the initial envelope lands");
-
-        let avatar = engine.uploads().handle(&StoreId::root(), "avatar");
-        let mut updates = avatar.updates();
-
-        let state = engine.apply(&second()).expect("the envelope lands");
+        drop(
+            engine
+                .apply(
+                    &stream_envelope(1, 2, vec![insert_op(&[], "m-1", -1)]),
+                    ACCEPT,
+                )
+                .unwrap(),
+        );
 
         assert_eq!(engine.version(), 2);
-        assert_eq!(engine.document()["title"], json!("Checkout"));
-        assert_eq!(state["messages"], json!([{"id": "a"}, {"id": "b"}]));
-        assert!(
-            engine.document()["messages"]["__musubi_stream__"] == json!("messages"),
-            "the shadow document keeps the marker the ops address"
-        );
+    }
+
+    // ---- atomicity -------------------------------------------------------
+
+    #[test]
+    fn a_failing_op_maps_to_apply_and_leaves_the_whole_envelope_unapplied() {
+        let mut engine = mounted();
+
+        let error = engine
+            .apply(
+                &stream_envelope_with_ops(
+                    1,
+                    2,
+                    vec![
+                        json!({"op": "replace", "path": "/title", "value": "Applied first"}),
+                        json!({"op": "remove", "path": "/absent"}),
+                    ],
+                    vec![insert_op(&[], "m-1", -1)],
+                ),
+                ACCEPT,
+            )
+            .unwrap_err();
+
         assert!(matches!(
-            block_on(updates.next()),
-            Some(handle) if handle.entry("u_1").is_some()
+            error,
+            MusubiError::Patch(PatchError::Apply { index: 1, ref path, .. }) if path == "/absent"
         ));
-    }
-
-    /// `version: 1`, one stream entry, no upload state yet.
-    fn initial() -> PatchEnvelope {
-        envelope(
-            0,
-            1,
-            json!([{
-                "op": "replace",
-                "path": "",
-                "value": {
-                    "__musubi_store_id__": [],
-                    "title": "Cart",
-                    "messages": {"__musubi_stream__": "messages"},
-                    "avatar": {"__musubi_upload__": "avatar"}
-                }
-            }]),
-            json!([{
-                "op": "insert", "stream": "messages", "store_id": [],
-                "item_key": "a", "at": -1, "item": {"id": "a"}, "limit": null
-            }]),
+        assert_eq!(title(&engine), "Cart");
+        assert_eq!(engine.version(), 1);
+        assert_eq!(
+            root(&engine).field::<Value>("messages").unwrap().value(),
             json!([]),
-        )
+            "the stream op travelling with it was rolled back too"
+        );
     }
 
-    /// The envelope under test: it moves the tree, the stream and an upload
-    /// handle at once, so a dropped stage has three things to leave alone.
-    fn second() -> PatchEnvelope {
-        envelope(
+    #[test]
+    fn a_malformed_pointer_is_an_application_failure_and_nothing_before_it_survives() {
+        let mut engine = mounted();
+
+        let error = engine
+            .apply(
+                &envelope(
+                    1,
+                    2,
+                    vec![
+                        json!({"op": "replace", "path": "/title", "value": "Applied first"}),
+                        json!({"op": "replace", "path": "nope", "value": 1}),
+                    ],
+                ),
+                ACCEPT,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MusubiError::Patch(PatchError::Apply { index: 1, ref path, .. }) if path == "nope"
+        ));
+        assert_eq!(title(&engine), "Cart");
+    }
+
+    #[test]
+    fn ops_apply_left_to_right() {
+        let mut engine = mounted();
+
+        drop(
+            engine
+                .apply(
+                    &envelope(
+                        1,
+                        2,
+                        vec![
+                            json!({"op": "add", "path": "/tags", "value": ["a"]}),
+                            json!({"op": "add", "path": "/tags/-", "value": "b"}),
+                            json!({"op": "replace", "path": "/tags/0", "value": "z"}),
+                        ],
+                    ),
+                    ACCEPT,
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(
+            root(&engine).field::<Value>("tags").unwrap().value(),
+            json!(["z", "b"])
+        );
+    }
+
+    #[test]
+    fn the_wire_projection_keeps_the_markers_the_ops_address() {
+        let mut engine = mounted();
+
+        drop(
+            engine
+                .apply(
+                    &stream_envelope(1, 2, vec![insert_op(&[], "m-1", -1)]),
+                    ACCEPT,
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(
+            engine.document()["messages"],
+            json!({"__musubi_stream__": "messages"}),
+            "the cache stores the wire tree, markers included"
+        );
+        assert_eq!(
+            root(&engine).field::<Value>("messages").unwrap().value(),
+            json!([{"id": "m-1"}]),
+            "while a reader sees the materialized list"
+        );
+    }
+
+    // ---- drift detection -------------------------------------------------
+
+    #[test]
+    fn a_rejected_root_replace_rolls_the_whole_transaction_back() {
+        let mut engine = mounted();
+        let reject: Validate<'_> =
+            &|_| Err(serde_json::from_value::<u8>(json!("not a number")).unwrap_err());
+
+        let error = engine
+            .apply(
+                &envelope(
+                    1,
+                    2,
+                    vec![json!({"op": "replace", "path": "", "value": {"title": "Drifted"}})],
+                ),
+                reject,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, MusubiError::Decode { .. }));
+        assert_eq!(engine.version(), 1);
+        assert_eq!(title(&engine), "Cart");
+    }
+
+    #[test]
+    fn the_drift_check_sees_the_transaction_before_it_commits() {
+        let mut engine = mounted();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let record: Validate<'_> = &|hydrated| {
+            seen.lock().unwrap().push(hydrated.clone());
+
+            Ok(())
+        };
+
+        drop(
+            engine
+                .apply(
+                    &envelope(
+                        1,
+                        2,
+                        vec![json!({"op": "replace", "path": "/title", "value": "Checkout"})],
+                    ),
+                    record,
+                )
+                .unwrap(),
+        );
+
+        let seen = seen.into_inner().unwrap();
+
+        assert_eq!(
+            seen.len(),
             1,
-            2,
-            json!([{"op": "replace", "path": "/title", "value": "Checkout"}]),
-            json!([{
-                "op": "insert", "stream": "messages", "store_id": [],
-                "item_key": "b", "at": -1, "item": {"id": "b"}, "limit": null
-            }]),
-            json!([{
-                "op": "add", "upload": "avatar", "store_id": [], "ref": "u_1",
-                "entry": {
-                    "ref": "u_1", "client_name": "me.png", "client_size": 12,
-                    "client_type": "image/png", "progress": 0, "status": "pending",
-                    "errors": []
-                }
-            }]),
-        )
+            "debug builds run layer 2 on every accepted envelope (§4.4)"
+        );
+        assert_eq!(seen[0]["title"], json!("Checkout"));
     }
 
-    fn envelope(
+    // ---- uploads ---------------------------------------------------------
+
+    #[test]
+    fn an_upload_op_reaches_the_registry_and_leaves_its_marker_in_place() {
+        let mut engine = mounted();
+
+        let envelope = PatchEnvelope::decode(json!({
+            "type": "patch",
+            "root_id": ROOT_ID,
+            "base_version": 1,
+            "version": 2,
+            "ops": [],
+            "upload_ops": [
+                {
+                    "op": "add", "upload": "avatar", "store_id": ["panel"], "ref": "entry-1",
+                    "entry": {
+                        "ref": "entry-1", "client_name": "me.png", "client_size": 1234,
+                        "client_type": "image/png", "progress": 0, "status": "pending",
+                        "errors": []
+                    }
+                },
+                {
+                    "op": "progress", "upload": "avatar", "store_id": ["panel"],
+                    "ref": "entry-1", "progress": 42
+                }
+            ]
+        }))
+        .expect("the envelope decodes");
+
+        drop(engine.apply(&envelope, ACCEPT).unwrap());
+
+        // The slot on the tree stays inert; the live state is the handle.
+        assert_eq!(
+            root(&engine).field::<Value>("avatar").unwrap().value(),
+            json!({"__musubi_upload__": "avatar"})
+        );
+
+        let handle = engine
+            .uploads
+            .handle(&store_id(&["panel"]), "avatar")
+            .value();
+
+        assert_eq!(handle.progress(), 42);
+    }
+
+    #[test]
+    fn a_vanished_store_loses_its_uploads() {
+        let mut engine = mounted();
+
+        drop(
+            engine
+                .apply(
+                    &PatchEnvelope::decode(json!({
+                        "type": "patch",
+                        "root_id": ROOT_ID,
+                        "base_version": 1,
+                        "version": 2,
+                        "ops": [],
+                        "upload_ops": [{
+                            "op": "error", "upload": "avatar", "store_id": ["panel"],
+                            "error": {"code": "too_large", "message": "too big"}
+                        }]
+                    }))
+                    .expect("the envelope decodes"),
+                    ACCEPT,
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(
+            engine
+                .uploads
+                .handle(&store_id(&["panel"]), "avatar")
+                .value()
+                .errors
+                .len(),
+            1
+        );
+
+        drop(
+            engine
+                .apply(
+                    &envelope(2, 3, vec![json!({"op": "remove", "path": "/panel"})]),
+                    ACCEPT,
+                )
+                .unwrap(),
+        );
+
+        assert!(
+            engine
+                .uploads
+                .handle(&store_id(&["panel"]), "avatar")
+                .value()
+                .errors
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_vanished_store_loses_its_streams_without_a_pruning_walk() {
+        let mut engine = mounted();
+
+        drop(
+            engine
+                .apply(
+                    &stream_envelope(1, 2, vec![insert_op(&["panel"], "p-1", -1)]),
+                    ACCEPT,
+                )
+                .unwrap(),
+        );
+        drop(
+            engine
+                .apply(
+                    &envelope(2, 3, vec![json!({"op": "remove", "path": "/panel"})]),
+                    ACCEPT,
+                )
+                .unwrap(),
+        );
+
+        // BDR-0011 fresh-mount semantics: the reappearing store starts empty,
+        // because its `Collection` node was freed with its subtree (§3.5).
+        drop(
+            engine
+                .apply(
+                    &envelope(
+                        3,
+                        4,
+                        vec![json!({
+                            "op": "add",
+                            "path": "/panel",
+                            "value": {
+                                "__musubi_store_id__": ["panel"],
+                                "messages": {"__musubi_stream__": "messages"}
+                            }
+                        })],
+                    ),
+                    ACCEPT,
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(
+            root(&engine).field::<Value>("panel").unwrap().value()["messages"],
+            json!([])
+        );
+    }
+
+    // ---- fixtures --------------------------------------------------------
+
+    /// An engine with no connection behind it: a tree and a bare registry.
+    fn bare() -> PatchEngine {
+        PatchEngine::new(StateTree::new(), Arc::new(Uploads::default()))
+    }
+
+    /// An engine holding the initial envelope's tree: a root store with a
+    /// stream, an upload slot, an async field and one child store.
+    fn mounted() -> PatchEngine {
+        let mut engine = bare();
+
+        drop(
+            engine
+                .apply(
+                    &envelope(
+                        0,
+                        1,
+                        vec![json!({
+                            "op": "replace",
+                            "path": "",
+                            "value": {
+                                "__musubi_store_id__": [],
+                                "title": "Cart",
+                                "messages": {"__musubi_stream__": "messages"},
+                                "avatar": {"__musubi_upload__": "avatar"},
+                                "feed": {
+                                    "__musubi_async__": true,
+                                    "status": "ok",
+                                    "result": 7,
+                                    "reason": null
+                                },
+                                "panel": {
+                                    "__musubi_store_id__": ["panel"],
+                                    "label": "",
+                                    "messages": {"__musubi_stream__": "messages"}
+                                }
+                            }
+                        })],
+                    ),
+                    ACCEPT,
+                )
+                .expect("the initial envelope lands"),
+        );
+
+        engine
+    }
+
+    fn root(engine: &PatchEngine) -> State<Value> {
+        engine.tree.root::<Value>()
+    }
+
+    fn title(engine: &PatchEngine) -> String {
+        root(engine).field::<String>("title").unwrap().value()
+    }
+
+    fn envelope(base_version: u64, version: u64, ops: Vec<Value>) -> PatchEnvelope {
+        stream_envelope_with_ops(base_version, version, ops, vec![])
+    }
+
+    fn stream_envelope(base_version: u64, version: u64, stream_ops: Vec<Value>) -> PatchEnvelope {
+        stream_envelope_with_ops(base_version, version, vec![], stream_ops)
+    }
+
+    fn stream_envelope_with_ops(
         base_version: u64,
         version: u64,
-        ops: Value,
-        stream_ops: Value,
-        upload_ops: Value,
+        ops: Vec<Value>,
+        stream_ops: Vec<Value>,
     ) -> PatchEnvelope {
         PatchEnvelope::decode(json!({
             "type": "patch",
@@ -550,9 +718,25 @@ mod tests {
             "base_version": base_version,
             "version": version,
             "ops": ops,
-            "stream_ops": stream_ops,
-            "upload_ops": upload_ops,
+            "stream_ops": stream_ops
         }))
-        .expect("the envelope decodes")
+        .expect("fixture envelope decodes")
+    }
+
+    fn store_id(segments: &[&str]) -> StoreId {
+        serde_json::from_value(json!(segments)).expect("store id is a string array")
+    }
+
+    fn insert_op(store_id: &[&str], item_key: &str, at: i64) -> Value {
+        json!({
+            "op": "insert",
+            "stream": "messages",
+            "ref": "0",
+            "store_id": store_id,
+            "item_key": item_key,
+            "at": at,
+            "item": {"id": item_key},
+            "limit": null
+        })
     }
 }

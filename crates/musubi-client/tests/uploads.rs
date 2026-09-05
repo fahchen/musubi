@@ -17,7 +17,7 @@ use futures_core::future::BoxFuture;
 use futures_util::future::{Either, select};
 use musubi_client::generated::{Store, StoreId};
 use musubi_client::{
-    Connection, EntryStatus, Mounted, MusubiError, PatchEngine, TransferError, Upload, UploadEntry,
+    Connection, EntryStatus, Mounted, MusubiError, TransferError, Upload, UploadEntry,
     UploadErrorCode, UploadFile, UploadRequest, UploadStatus, Uploader, UploaderError,
 };
 use phoenix_channel::{BinaryPush, Message, ReplyStatus};
@@ -86,7 +86,7 @@ fn select_preflights_every_file_and_seeds_only_the_accepted_ones() {
             if r#ref == "u_1" && client_name == "me.png"
     ));
 
-    let handle = avatar.snapshot();
+    let handle = avatar.value();
     assert_eq!(
         handle.status,
         UploadStatus::Error,
@@ -129,7 +129,7 @@ fn select_keeps_the_entry_an_add_op_already_created() {
     harness.settle(selecting).expect("preflight replied");
 
     assert!(matches!(
-        avatar.snapshot().entries.as_slice(),
+        avatar.value().entries.as_slice(),
         [UploadEntry { r#ref, progress: 40, status: EntryStatus::Uploading, .. }]
             if r#ref == "u_1"
     ));
@@ -158,7 +158,7 @@ fn a_rejected_preflight_leaves_the_handle_in_error_rather_than_selecting() {
     ));
     // The caller gets the error, but it is rarely the only one watching: a
     // spinner bound to `status` would otherwise never resolve.
-    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+    assert_eq!(avatar.value().status, UploadStatus::Error);
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn a_preflight_that_times_out_leaves_the_handle_in_error_rather_than_selecting()
         harness.settle(selecting),
         Err(MusubiError::Timeout)
     ));
-    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+    assert_eq!(avatar.value().status, UploadStatus::Error);
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn abandoning_a_preflight_leaves_the_handle_in_error_rather_than_selecting() {
 
     let (abandon, selecting) = harness.select_abandonable(&avatar, vec![png("me.png", b"abcde")]);
     assert_eq!(server.sent(&mut harness).len(), 1);
-    assert_eq!(avatar.snapshot().status, UploadStatus::Selecting);
+    assert_eq!(avatar.value().status, UploadStatus::Selecting);
 
     // Nothing on the error path runs when the future itself goes away, so the
     // transition out of `selecting` cannot live there.
@@ -199,7 +199,7 @@ fn abandoning_a_preflight_leaves_the_handle_in_error_rather_than_selecting() {
         harness.settle(selecting).is_none(),
         "the preflight was dropped"
     );
-    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+    assert_eq!(avatar.value().status, UploadStatus::Error);
 }
 
 #[test]
@@ -228,22 +228,7 @@ fn a_reply_naming_a_client_ref_this_selection_never_offered_is_a_protocol_error(
         harness.settle(selecting),
         Err(MusubiError::Protocol(_))
     ));
-    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
-}
-
-#[test]
-fn a_handle_with_no_connection_behind_it_cannot_transfer() {
-    let engine = PatchEngine::new();
-    let avatar = engine.uploads().handle(&StoreId::root(), "avatar");
-
-    assert!(matches!(
-        futures_executor::block_on(avatar.select(vec![png("me.png", b"a")])),
-        Err(MusubiError::NotConnected)
-    ));
-    assert!(matches!(
-        futures_executor::block_on(avatar.start()),
-        Err(MusubiError::NotConnected)
-    ));
+    assert_eq!(avatar.value().status, UploadStatus::Error);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +247,7 @@ fn channel_mode_pushes_the_file_as_binary_chunks_and_leaves_when_it_is_done() {
     let starting = harness.start(&avatar);
     let sent = server.sent(&mut harness);
 
-    assert_eq!(avatar.snapshot().status, UploadStatus::Uploading);
+    assert_eq!(avatar.value().status, UploadStatus::Uploading);
     assert!(
         matches!(
             sent.as_slice(),
@@ -316,7 +301,7 @@ fn channel_mode_pushes_the_file_as_binary_chunks_and_leaves_when_it_is_done() {
     );
     harness.pump();
 
-    let handle = avatar.snapshot();
+    let handle = avatar.value();
     assert_eq!(handle.status, UploadStatus::Success);
     assert_eq!(handle.progress(), 100);
     assert!(matches!(
@@ -352,7 +337,7 @@ fn an_empty_file_still_travels_as_one_empty_chunk() {
     server.reply_binary(&pushes[0], ReplyStatus::Ok, json!({"progress": 100}));
 
     assert!(harness.settle(starting).is_ok());
-    assert_eq!(avatar.snapshot().status, UploadStatus::Success);
+    assert_eq!(avatar.value().status, UploadStatus::Success);
 }
 
 #[test]
@@ -378,7 +363,7 @@ fn a_rejected_chunk_fails_the_entry_with_the_servers_reason() {
         Err(MusubiError::Transfer(TransferError::Chunk { entry_ref, reason }))
             if entry_ref == "u_1" && reason == "upload too large"
     ));
-    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+    assert_eq!(avatar.value().status, UploadStatus::Error);
     assert!(
         matches!(
             server.sent(&mut harness).as_slice(),
@@ -406,7 +391,7 @@ fn a_rejected_chunk_fails_the_entry_with_the_servers_reason() {
     harness.pump();
 
     assert!(matches!(
-        avatar.snapshot().entry("u_1"),
+        avatar.value().entry("u_1"),
         Some(UploadEntry { status: EntryStatus::Error, errors, .. })
             if errors[0].code == UploadErrorCode::TooLarge
     ));
@@ -450,7 +435,7 @@ fn a_chunk_that_is_never_answered_times_the_transfer_out() {
     );
     harness.pump();
 
-    let handle = avatar.snapshot();
+    let handle = avatar.value();
     assert_eq!(handle.status, UploadStatus::Error);
     assert!(matches!(
         handle.entry("u_1"),
@@ -498,7 +483,7 @@ fn cancelling_mid_transfer_leaves_the_sub_channel_and_tells_the_page_server() {
     // own push timeout and the handle reports the failure.
     harness.fire(PUSH_TIMEOUT);
     assert!(harness.settle(starting).is_err());
-    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+    assert_eq!(avatar.value().status, UploadStatus::Error);
 
     // Cancellation is a deletion, never a status (BDR-0025).
     server.push_event(
@@ -515,7 +500,7 @@ fn cancelling_mid_transfer_leaves_the_sub_channel_and_tells_the_page_server() {
     );
     harness.pump();
 
-    assert!(avatar.snapshot().entries.is_empty());
+    assert!(avatar.value().entries.is_empty());
 }
 
 #[test]
@@ -660,7 +645,7 @@ fn reset_cancels_every_entry_and_returns_the_handle_to_idle() {
     server.reply(&sent[0], ReplyStatus::Ok, json!({}));
     assert!(harness.settle(resetting).is_ok());
 
-    let handle = avatar.snapshot();
+    let handle = avatar.value();
     assert_eq!(handle.status, UploadStatus::Idle);
     assert!(handle.entries.is_empty() && handle.errors.is_empty());
 }
@@ -807,7 +792,7 @@ fn a_dropped_socket_fails_the_transfer_rather_than_resuming_it() {
         harness.settle(starting),
         Err(MusubiError::Disconnected)
     ));
-    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+    assert_eq!(avatar.value().status, UploadStatus::Error);
 }
 
 // ---------------------------------------------------------------------------
@@ -876,7 +861,7 @@ fn external_mode_hands_the_bytes_to_the_registered_uploader_and_relays_progress(
         ),
         "then 100 once the uploader resolves — the only completion signal there is"
     );
-    assert_eq!(avatar.snapshot().status, UploadStatus::Success);
+    assert_eq!(avatar.value().status, UploadStatus::Success);
 }
 
 #[test]
@@ -971,7 +956,7 @@ fn an_uploader_that_rejects_is_reported_as_external_failed() {
         "the failure is the last word: a progress the relay had not sent yet dies with it, \
          because the server moves an entry it already failed back to uploading for one"
     );
-    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+    assert_eq!(avatar.value().status, UploadStatus::Error);
 }
 
 #[test]
@@ -999,7 +984,7 @@ fn an_uploader_the_connection_never_registered_fails_the_entry_locally() {
         server.sent(&mut harness).is_empty(),
         "a missing registration is a client-side misconfiguration, not a transfer failure"
     );
-    assert_eq!(avatar.snapshot().status, UploadStatus::Error);
+    assert_eq!(avatar.value().status, UploadStatus::Error);
 }
 
 // ---------------------------------------------------------------------------

@@ -9,8 +9,8 @@
 //!
 //! [`Connection`] is one socket; [`Connection::mount`] joins one channel per
 //! root store and hands back a [`Mounted`] handle. Everything past that point —
-//! `snapshot()`, `updates()`, `status()`, `command()`, `events()` — is a
-//! method on the handle, and unmounting is [`Drop`].
+//! `state()`, `status()`, `command()`, `events()`, `upload_at()` — is a method
+//! on the handle, and unmounting is [`Drop`].
 //!
 //! ```text
 //! let cart: Mounted<CartStore> = connection.mount("cart:page", Params {}).await?;
@@ -22,35 +22,41 @@
 //! phx_reply / "patch" push
 //!        │
 //!        ▼
-//! PatchEnvelope::decode   ── op allowlist (add/remove/replace only)
+//! envelope decode         ── op allowlist (add/remove/replace only)
 //!        │
 //!        ▼
-//! PatchEngine::apply      ── version discipline
-//!        │                  ── json-patch over the pristine shadow document
-//!        │                  ── stream materialization (client-owned)
-//!        │                  ── store index rebuild + stream pruning
+//! one transaction on the retained tree   ── version discipline
+//!        │                                ── pointer-addressed reconciliation
+//!        │                                ── key-addressed stream reconciliation
+//!        │                                ── whole-root drift check (§4.4)
 //!        ▼
-//! hydrated state Value
-//!        │
-//!        ▼
-//! serde into the generated `S::State`, published to `Mounted::snapshot`
+//! ChangeSet ──▶ the subscribers of exactly the nodes whose semantic value moved
 //! ```
 //!
-//! The shadow document is a `serde_json::Value` kept exactly as it arrived:
-//! patch pointers address the wire tree, so a cycle works on one owned copy of
-//! it — hydration (stream-marker substitution) rewrites that copy in place —
-//! and never mutates the tree itself.
+//! There is no shadow document and no whole-root snapshot. The tree is
+//! **retained**: a node's identity outlives every envelope, so a `State<T>` an
+//! embedder is holding survives a reconnect, and a patch that puts a value back
+//! where it was notifies nobody. `docs/rust-reactive-state.md` is the design
+//! record; [`musubi_state`] is where the tree lives.
+//!
+//! # Four words
+//!
+//! `x.prop()` gives a **handle**, `handle.value()` gives a **value**,
+//! `handle.subscribe(cb)` gives a **subscription**, and `drop(subscription)` is
+//! the only way to unsubscribe. [`Mounted::state`], [`Mounted::status`] and
+//! [`Mounted::upload_at`] are the three property accessors; nothing is spelled a
+//! second way.
 //!
 //! # Concurrency
 //!
 //! One actor owns the socket and every mounted root; the public handles are
-//! cheap `Clone` values over its inbox. State and mount status reach the
-//! embedder through per-root **latest-value cells** — `snapshot()`/`status()`
-//! read the cell, `updates()`/`status_updates()` subscribe to it and deliver
-//! whatever it holds, never a backlog — while the discrete-item subscriptions
-//! (`events()`, upload `updates()`) stay unbounded queues. Neither goes back
-//! through the inbox, and there is no callback registry: a subscription **is**
-//! a `Stream`, and dropping it unsubscribes.
+//! cheap `Clone` values over its inbox. State reaches the embedder through the
+//! retained tree — one lock, written once per envelope on the actor task, read
+//! per `value()` — and mount status through a per-root **latest-value cell**.
+//! Subscriber callbacks run on the actor task with no lock held, so the contract
+//! is *schedule, do not compute*. The discrete-item subscriptions (`events()`,
+//! [`Upload::into_stream`]) stay unbounded queues. None of it goes back through
+//! the inbox.
 //!
 //! # Generated code
 //!
@@ -73,10 +79,11 @@
 //!
 //! Both halves are here (`docs/rust-client.md` §10). The **data plane** folds
 //! `upload_ops` into per-`(store_id, name)` [`UploadHandle`]s that
-//! [`Mounted::upload`] hands out, with `snapshot()`/`updates()` mirroring the
-//! state surface; an upload slot on the state stays the inert
-//! [`generated::UploadSlot`], which carries the name those handles are keyed
-//! by. The **control plane** — `select`/`start`/`cancel`/`reset` — is on the
+//! [`Mounted::upload_at`] hands out, reachable in one step from the slot node on
+//! the tree — both halves of the key come from the node, so no call site spells
+//! either. The slot itself is an **inert leaf**: the server re-renders the same
+//! marker every cycle, so a pure-upload envelope wakes no state subscriber at
+//! all. The **control plane** — `select`/`start`/`cancel`/`reset` — is on the
 //! same handle: preflight, channel-mode chunk transfer over binary frames, and
 //! external [`Uploader`]s. The crate stays runtime-free throughout, so the
 //! embedder reads the file and hands over an [`UploadFile`].
@@ -92,12 +99,8 @@ mod engine;
 mod envelope;
 mod error;
 pub mod generated;
-mod hydrate;
-mod index;
 mod latest;
 mod mounted;
-mod patch;
-mod streams;
 mod uploads;
 
 pub use crate::cache::{
@@ -105,14 +108,22 @@ pub use crate::cache::{
     cache_key, now_ms,
 };
 pub use crate::connection::{BuildError, Connection, ConnectionBuilder};
-pub use crate::engine::PatchEngine;
-pub use crate::envelope::{PatchEnvelope, PatchOp, PushEvent, StreamOp};
 pub use crate::error::{CommandError, MusubiError, PatchError, Result, TransferError};
+pub use crate::latest::StatusState;
 pub use crate::mounted::{MountStatus, Mounted};
 pub use crate::uploads::{
     CancelSignal, EntryStatus, Upload, UploadAccept, UploadConfig, UploadEntry, UploadError,
-    UploadErrorCode, UploadFile, UploadHandle, UploadOp, UploadProgress, UploadRequest,
-    UploadStatus, Uploader, UploaderError, Uploads,
+    UploadErrorCode, UploadFile, UploadHandle, UploadProgress, UploadRequest, UploadStatus,
+    Uploader, UploaderError,
+};
+// The consumer half of the retained tree (`docs/rust-reactive-state.md` §5.5).
+// The write half — `StateTree::apply`/`begin`/`close`, `Transaction`, `Notify`,
+// `ChangeSet`, `NodeKind`, `Node`, `SemanticValue`, `TreeError` — is reachable
+// only through `musubi_state` itself, is `#[doc(hidden)]` there, and has no
+// caller outside this crate.
+pub use musubi_state::{
+    AsyncState, AsyncStatus, Change, CollectionEdit, NodeId, ReadError, State, StateTree,
+    StoreState, StreamState, Subscription, UploadSlotState,
 };
 // The runtime seams are defined one layer down and re-exported here, so an
 // embedder implements them against `musubi_client` alone (§3).

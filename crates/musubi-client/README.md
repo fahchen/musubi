@@ -1,11 +1,15 @@
 # musubi-client
 
-The runtime-free core of the Musubi Rust client: the patch engine (RFC 6902
-subset over a shadow `serde_json::Value`), client-owned stream materialization,
-hydration of the wire markers, mount/command/event lifecycle, uploads (both
-planes), the stale-while-revalidate mount cache, the per-root mount status,
-and the support types the generated bundle (`mix compile.musubi_rust`) refers
-to.
+The runtime-free core of the Musubi Rust client: the socket seam, the
+mount/command/event lifecycle, reconnect and recovery, uploads (both planes),
+the stale-while-revalidate mount cache, the per-root mount status, and the
+retained reactive state tree every envelope is applied to (`musubi-state`,
+re-exported here). It also carries the support types the generated bundle
+(`mix compile.musubi_rust`) refers to.
+
+One envelope is **one transaction** against a retained tree, and only the nodes
+whose value actually changed wake their subscribers — see
+`docs/rust-reactive-state.md` for the design.
 
 The crate depends on no executor: the socket, the task spawner and the clock
 are the `Connector` / `Spawner` / `Timer` traits of `phoenix-channel`. Tokio
@@ -20,7 +24,13 @@ let connection = Connection::builder()
     .build()?;
 
 let cart: Mounted<CartStore> = connection.mount("cart:page", Params {}).await?;
-let state = cart.snapshot();
+let state = cart.state();
+
+// `x.prop()` gives a handle, `handle.value()` gives a value,
+// `handle.subscribe(cb)` gives a subscription, and dropping it unsubscribes.
+let title = state.title().value();
+let _watch = state.items().subscribe(|_change, _edits| redraw());
+
 let reply = cart.command(AddItem { sku: "ABC".into() }).await?;
 ```
 
@@ -63,20 +73,27 @@ branch.
 ## Scope
 
 Uploads are both observed and driven. `upload_ops` are folded into per-store
-handles you read with `Mounted::upload(&store_id, name)` — the same
-`snapshot()`/`updates()` pair as state, though an upload's stream is a queue of
-per-envelope handles rather than a latest-value cell — and the same handle
-carries `select()`, `start()`, `cancel()` and `reset()`. The state slot itself
-stays the inert `UploadSlot`, which carries the handle's name. The crate reads
-no files: you hand it an `UploadFile` (bytes plus name and content type), and
-an external destination is your own `Uploader` registered on the builder.
+handles you reach in one step from the slot node on the tree —
+`Mounted::upload_at(&state.avatar())`, which reads both halves of the
+`(store_id, name)` key off the node — and the handle carries the same
+`value()` / `subscribe()` pair every other handle does, plus `into_stream()`
+for a consumer whose shape is a loop. That stream is a queue of per-envelope
+values, not a latest-value cell. The same handle carries `select()`, `start()`,
+`cancel()` and `reset()`. The slot on the tree is an **inert leaf**: the server
+re-renders the same marker every cycle, so a pure-upload envelope wakes no state
+subscriber at all. The crate reads no files: you hand it an `UploadFile` (bytes
+plus name and content type), and an external destination is your own `Uploader`
+registered on the builder.
+
 Reconnect is reconnect-only: a version gap or a rejoin keeps the last-good
 rendering and waits for a fresh initial envelope, and an upload in flight fails
-rather than resuming. The reconnect window itself is renderable state:
-`Mounted::status()` / `status_updates()` report
-`MountStatus { Connecting, Live, Reconnecting }` (BDR-0033) while `snapshot()`
-keeps serving the last-good tree — the status annotates stale rendering, it
-never blanks it.
+rather than resuming. The rejoin's initial patch is *reconciled* into the same
+tree, so a subtree the server re-sent unchanged keeps its identity and notifies
+nobody. The reconnect window itself is renderable state: `Mounted::status()`
+hands back a handle whose `value()` / `subscribe()` / `into_stream()` report
+`MountStatus { Connecting, Live, Reconnecting }` (BDR-0033) while the tree keeps
+serving the last-good rendering — the status annotates stale rendering, it never
+blanks it.
 
 Mounts can be stale-while-revalidate. `ConnectionBuilder::cache` takes a
 `CacheStore` — `MemoryCacheStore` ships here, a durable one is yours — and every
@@ -86,5 +103,6 @@ replaces the seed in one whole-root op. Writes are throttled, entries carry a
 `buster` you set to your build version, and a seeded root queues command
 dispatches behind its in-flight initial patch instead of rejecting them.
 
-See `docs/rust-client.md` §6.4 and §9–§10 in the Musubi repository for the full
-contract, and `docs/rust-codegen.md` for the generated bundle.
+See `docs/rust-reactive-state.md` for the state tree, `docs/rust-client.md`
+§6.4 and §9–§10 for the rest of the contract, and `docs/rust-codegen.md` for the
+generated bundle.

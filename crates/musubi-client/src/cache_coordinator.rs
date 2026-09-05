@@ -150,12 +150,17 @@ impl CacheCoordinator {
     ///
     /// The *wire* tree is what is stored: seeding is then the same marker
     /// substitution the engine already does, with no second decoding path.
-    pub(crate) fn on_publish(&mut self, key: Option<&Arc<str>>, document: &Value) {
+    ///
+    /// The tree arrives as a thunk, and an owned `Value` when it does. Producing
+    /// it is a whole-root projection — the per-envelope cost this design exists
+    /// to delete — and a connection with no cache configured, which is the
+    /// default, must not pay it (§3.6 step 13).
+    pub(crate) fn on_publish(&mut self, key: Option<&Arc<str>>, document: impl FnOnce() -> Value) {
         let (Some(config), Some(key)) = (self.config.clone(), key) else {
             return;
         };
         let entry = CacheEntry {
-            data: document.clone(),
+            data: document(),
             updated_at: now_ms(),
             buster: config.buster.to_string(),
         };

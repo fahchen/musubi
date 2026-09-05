@@ -4,6 +4,7 @@
 //! server sends are propagated verbatim and are not parsed into variants — the
 //! server's reason list is not a stability contract.
 
+use musubi_state::TreeError;
 use phoenix_channel::TransportError;
 use serde_json::Value;
 use thiserror::Error;
@@ -70,8 +71,10 @@ pub enum MusubiError {
 
 /// Why applying an envelope's `ops` failed.
 ///
-/// The document is left untouched in every case: the allowlist runs at decode,
-/// before anything is applied, and `json_patch::patch` is atomic on failure.
+/// The tree is left untouched in every case: the allowlist runs at decode,
+/// before anything is applied, and the transaction's journal rolls back
+/// whatever the failing op had already reached
+/// (`docs/rust-reactive-state.md` §2.3).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PatchError {
@@ -82,31 +85,39 @@ pub enum PatchError {
         /// The rejected op name, verbatim.
         op: String,
     },
-    /// An op's `path` was not a valid RFC 6901 JSON Pointer.
-    #[error("invalid json pointer: {path}")]
-    InvalidPointer {
-        /// The rejected pointer, verbatim.
-        path: String,
-    },
-    /// The RFC 6902 application itself failed: bad pointer, index out of
-    /// bounds, traversal into a non-container.
+    /// The RFC 6902 application itself failed: malformed pointer, pointer into
+    /// a node that is not there, index out of bounds, traversal into a
+    /// non-container.
     #[error("patch op {index} at {path} failed: {reason}")]
     Apply {
         /// Index of the failing op within the envelope's `ops`.
         index: usize,
         /// The failing op's pointer.
         path: String,
-        /// The `json-patch` description of the failure.
+        /// Which rule the op broke.
         reason: String,
     },
 }
 
-impl From<json_patch::PatchError> for PatchError {
-    fn from(error: json_patch::PatchError) -> Self {
+impl PatchError {
+    /// Maps one [`TreeError`] onto the taxonomy, stamped with the index of the
+    /// op that produced it (`docs/rust-reactive-state.md` §2.3).
+    ///
+    /// `Pointer` and `Index` are the same class of failure `json-patch` used to
+    /// report, so they keep the same variant. [`TreeError::Closed`] is
+    /// unreachable from the actor — it drops a root before closing its tree —
+    /// and is reported as an application failure rather than given a variant
+    /// nothing can observe.
+    pub(crate) fn from_tree(index: usize, error: TreeError) -> Self {
+        let path = match &error {
+            TreeError::Pointer { path, .. } | TreeError::Index { path } => path.clone(),
+            _ => String::new(),
+        };
+
         Self::Apply {
-            index: error.operation,
-            path: error.path.to_string(),
-            reason: error.kind.to_string(),
+            index,
+            path,
+            reason: error.to_string(),
         }
     }
 }

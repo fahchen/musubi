@@ -1,6 +1,6 @@
 [package]
 name = "musubi-client"
-description = "Runtime-agnostic Musubi client core: patch engine, stream materialization and the generated-code support types"
+description = "Runtime-agnostic Musubi client core: transport, mount and reconnect, commands, events, uploads, and the retained state tree it drives"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,7 @@ name = "musubi_client"
 futures-channel.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
-json-patch.workspace = true
+musubi-state.workspace = true
 phoenix-channel.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -20,7 +20,8 @@ use futures_util::task::noop_waker;
 use musubi_client::generated::{Command, Event, NoReply, Store, StoreId};
 use musubi_client::{
     CACHE_WRITE_THROTTLE, CacheEntry, CacheStore, CommandError, Connection, EntryStatus,
-    MemoryCacheStore, MountStatus, Mounted, MusubiError, UploadEntry, cache_key, now_ms,
+    MemoryCacheStore, MountStatus, Mounted, MusubiError, State, StreamState, Subscription,
+    UploadEntry, cache_key, now_ms,
 };
 use phoenix_channel::{Message, ReplyStatus};
 use serde::{Deserialize, Serialize};
@@ -67,13 +68,12 @@ fn mount_joins_one_channel_per_root_and_hydrates_the_initial_patch() {
     harness.pump();
     let cart = harness.finish_mount(&mut server, &sent[0], pending);
 
-    let state = cart.snapshot().expect("the initial patch has been applied");
+    let state = cart.state();
+
+    assert!(state.revision() > 0, "the initial patch has been applied");
+    assert_eq!(state.title().value(), "Cart");
     assert!(matches!(
-        state.as_ref(),
-        CartState { title, messages } if title == "Cart" && messages.len() == 1
-    ));
-    assert!(matches!(
-        state.messages.as_slice(),
+        state.messages().value().as_slice(),
         [ChatMessage { id, body }] if id == "m-1" && body == "hello"
     ));
 }
@@ -140,10 +140,7 @@ fn mount_with_params_sends_keys_the_generated_params_struct_has_no_attr_for() {
     harness.pump();
 
     let cart = harness.finish_mount(&mut server, &sent[0], pending);
-    assert_eq!(
-        cart.snapshot().expect("the initial patch landed").title,
-        "Cart"
-    );
+    assert_eq!(cart.state().title().value(), "Cart");
 }
 
 #[test]
@@ -180,10 +177,26 @@ fn a_duplicate_mount_aliases_the_live_root_instead_of_joining_twice() {
         panic!("the aliasing mount resolves from the live root")
     };
     assert!(server.sent(&mut harness).is_empty(), "no second phx_join");
-    assert!(matches!(
-        (first.snapshot(), second.snapshot()),
-        (Some(one), Some(two)) if Arc::ptr_eq(&one, &two)
-    ));
+
+    // One root means one tree: a subscription taken through the aliasing
+    // handle is woken by the envelope the first one's channel delivers, and
+    // both read the value it carried.
+    let seen = revisions(&second.state());
+
+    server.push_event(
+        &join,
+        "patch",
+        envelope(
+            1,
+            2,
+            json!([{"op": "replace", "path": "/title", "value": "Aliased"}]),
+        ),
+    );
+    harness.pump();
+
+    assert_eq!(seen.take(), [2]);
+    assert_eq!(first.state().title().value(), "Aliased");
+    assert_eq!(second.state().title().value(), "Aliased");
 
     // Only the last handle to go away tears the root down.
     drop(second);
@@ -225,10 +238,9 @@ fn an_aliasing_mount_awaits_the_in_flight_initial_patch() {
     };
 
     assert!(server.sent(&mut harness).is_empty(), "no second phx_join");
-    assert!(matches!(
-        (first.snapshot(), second.snapshot()),
-        (Some(one), Some(two)) if Arc::ptr_eq(&one, &two)
-    ));
+    assert_eq!(first.state().node(), second.state().node());
+    assert_eq!(first.state().title().value(), "Cart");
+    assert_eq!(second.state().title().value(), "Cart");
 }
 
 #[test]
@@ -296,11 +308,9 @@ fn a_command_reply_is_not_gated_on_the_patch_it_caused() {
         harness.settle(pending),
         Ok(CheckoutReply { order_id }) if order_id == "o-1"
     ));
-    assert!(
-        matches!(
-            cart.snapshot().as_deref(),
-            Some(CartState { title, .. }) if title == "Cart"
-        ),
+    assert_eq!(
+        cart.state().title().value(),
+        "Cart",
         "a resolved reply must not imply the command's patch was applied"
     );
 
@@ -315,10 +325,7 @@ fn a_command_reply_is_not_gated_on_the_patch_it_caused() {
     );
     harness.pump();
 
-    assert!(matches!(
-        cart.snapshot().as_deref(),
-        Some(CartState { title, .. }) if title == "Checked out"
-    ));
+    assert_eq!(cart.state().title().value(), "Checked out");
 }
 
 #[test]
@@ -390,7 +397,7 @@ fn a_command_dispatched_mid_reconnect_is_rejected_rather_than_queued() {
         Err(MusubiError::NotConnected)
     ));
     // Last-good rendering survives the reconnect window.
-    assert!(cart.snapshot().is_some());
+    assert_eq!(cart.state().title().value(), "Cart");
 }
 
 // ---------------------------------------------------------------------------
@@ -419,8 +426,9 @@ fn dropping_the_last_handle_leaves_the_channel_and_drops_the_root() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
     let (_join, cart) = harness.mount(&mut server, "cart");
-    let mut updates = cart.updates();
-    let mut statuses = cart.status_updates();
+    let state = cart.state();
+    let seen = revisions(&state);
+    let mut statuses = cart.status().into_stream();
 
     drop(cart);
     harness.pump();
@@ -432,7 +440,10 @@ fn dropping_the_last_handle_leaves_the_channel_and_drops_the_root() {
         ),
         "leaving the channel is what stops the server-side root"
     );
-    assert!(ended(&mut updates), "subscriptions end with the root");
+    // Teardown closes the tree, which empties the root and tells its
+    // subscribers once before every view on it goes dead.
+    assert_eq!(seen.take().len(), 1, "the root is notified that it is gone");
+    assert!(!state.is_live(), "and every view on it reads as dead");
     assert!(ended(&mut statuses), "the status stream ends with the root");
 }
 
@@ -458,7 +469,7 @@ fn disconnect_tears_every_root_down_and_rejects_pending_commands() {
     let mut server = harness.queue_socket();
     let (_join, cart) = harness.mount(&mut server, "cart");
     let pending = harness.command_later(&cart, Checkout { coupon: None });
-    let mut updates = cart.updates();
+    let seen = revisions(&cart.state());
 
     server.sent(&mut harness);
     harness.disconnect();
@@ -467,8 +478,8 @@ fn disconnect_tears_every_root_down_and_rejects_pending_commands() {
         harness.settle(pending),
         Err(MusubiError::Disconnected)
     ));
-    assert!(cart.snapshot().is_none(), "the root is gone");
-    assert!(ended(&mut updates), "subscriptions end with the root");
+    assert!(!cart.state().is_live(), "the root is gone");
+    assert_eq!(seen.take().len(), 1, "subscribers are told once, then die");
 
     let later = harness.command_later(&cart, Checkout { coupon: None });
     assert!(matches!(
@@ -499,11 +510,9 @@ fn a_version_gap_leaves_and_rejoins_while_the_last_good_state_keeps_rendering() 
         ),
         "recovery leaves the diverged channel and joins a fresh one"
     );
-    assert!(
-        matches!(
-            cart.snapshot().as_deref(),
-            Some(CartState { title, .. }) if title == "Cart"
-        ),
+    assert_eq!(
+        cart.state().title().value(),
+        "Cart",
         "the last-good tree keeps rendering through the recreate window"
     );
 
@@ -526,10 +535,7 @@ fn a_version_gap_leaves_and_rejoins_while_the_last_good_state_keeps_rendering() 
     );
     harness.pump();
 
-    assert!(matches!(
-        cart.snapshot().as_deref(),
-        Some(CartState { title, .. }) if title == "Recovered"
-    ));
+    assert_eq!(cart.state().title().value(), "Recovered");
 }
 
 #[test]
@@ -560,10 +566,7 @@ fn an_op_outside_the_allowlist_recovers_while_a_non_envelope_is_only_dropped() {
         [Message { event: leave, .. }, Message { event: rejoin, .. }]
             if leave == "phx_leave" && rejoin == "phx_join"
     ));
-    assert!(matches!(
-        cart.snapshot().as_deref(),
-        Some(CartState { title, .. }) if title == "Cart"
-    ));
+    assert_eq!(cart.state().title().value(), "Cart");
 }
 
 #[test]
@@ -612,14 +615,12 @@ fn an_envelope_addressed_to_another_root_recovers_a_published_root() {
         [Message { event: leave, .. }, Message { event: rejoin, .. }]
             if leave == "phx_leave" && rejoin == "phx_join"
     ));
-    assert!(
-        matches!(
-            cart.snapshot().as_deref(),
-            Some(CartState { title, .. }) if title == "Cart"
-        ),
+    assert_eq!(
+        cart.state().title().value(),
+        "Cart",
         "the last-good tree keeps rendering through the recreate window"
     );
-    assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert_eq!(cart.status().value(), MountStatus::Reconnecting);
 }
 
 #[test]
@@ -638,11 +639,9 @@ fn a_failed_re_join_during_recovery_keeps_the_last_good_state() {
     );
     harness.pump();
 
-    assert!(
-        matches!(
-            cart.snapshot().as_deref(),
-            Some(CartState { title, .. }) if title == "Cart"
-        ),
+    assert_eq!(
+        cart.state().title().value(),
+        "Cart",
         "a failed re-join must not blank the consumer"
     );
 
@@ -660,12 +659,17 @@ fn a_rejoin_after_a_transport_drop_re_arms_the_initial_patch_waiter() {
     let mut harness = Harness::new();
     let mut first = harness.queue_socket();
     let (_join, cart) = harness.mount(&mut first, "cart");
-    let mut updates = cart.updates();
+    let title = cart.state().title();
+    let seen = revisions(&title);
 
     let mut second = harness.queue_socket();
     first.disconnect();
     harness.pump();
-    assert!(cart.snapshot().is_some(), "last-good state is kept");
+    assert_eq!(
+        cart.state().title().value(),
+        "Cart",
+        "last-good state is kept"
+    );
 
     harness.fire_backoff();
     let rejoin = second.sent(&mut harness);
@@ -686,14 +690,14 @@ fn a_rejoin_after_a_transport_drop_re_arms_the_initial_patch_waiter() {
     );
     harness.pump();
 
-    assert!(matches!(
-        cart.snapshot().as_deref(),
-        Some(CartState { title, .. }) if title == "Rejoined"
-    ));
-    assert!(matches!(
-        drain(&mut updates).as_slice(),
-        [state] if state.title == "Rejoined"
-    ));
+    // The rejoin's `replace ""` is *reconciled* into the same tree, so the
+    // title node an embedder was holding across the drop is the one that moved.
+    assert_eq!(title.value(), "Rejoined");
+    assert_eq!(
+        seen.take(),
+        [2],
+        "one transaction moved it, and it kept the revision it had before the drop"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -706,7 +710,7 @@ fn a_cold_mount_is_live_once_its_initial_patch_has_been_accepted() {
     let mut server = harness.queue_socket();
     let (_join, cart) = harness.mount(&mut server, "cart");
 
-    assert_eq!(cart.status(), MountStatus::Live);
+    assert_eq!(cart.status().value(), MountStatus::Live);
 }
 
 #[test]
@@ -719,11 +723,11 @@ fn a_seeded_mount_stays_connecting_until_the_live_initial_patch() {
     let pending = harness.mount_later("cart", currency("EUR"));
     let sent = server.sent(&mut harness);
     let cart = harness.settle(pending).expect("the seeded mount resolves");
-    let mut statuses = cart.status_updates();
+    let mut statuses = cart.status().into_stream();
 
     // Rendering cached state is not being live: the seed is last-known data,
     // not an accepted initial patch.
-    assert_eq!(cart.status(), MountStatus::Connecting);
+    assert_eq!(cart.status().value(), MountStatus::Connecting);
     // A fresh subscription opens with the current status rather than the next
     // transition, so the pill is right without reading `status()` first.
     assert_eq!(drain(&mut statuses), vec![MountStatus::Connecting]);
@@ -733,7 +737,7 @@ fn a_seeded_mount_stays_connecting_until_the_live_initial_patch() {
     server.push_event(&sent[0], "patch", initial_envelope());
     harness.pump();
 
-    assert_eq!(cart.status(), MountStatus::Live);
+    assert_eq!(cart.status().value(), MountStatus::Live);
     assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
 }
 
@@ -744,17 +748,18 @@ fn a_transport_drop_reports_reconnecting_and_the_rejoins_fresh_patch_restores_li
     let (_join, cart) = harness.mount(&mut first, "cart");
     // A consumer that keeps up sees every edge; the drains below are what
     // "keeping up" means for a latest-value stream.
-    let mut statuses = cart.status_updates();
+    let mut statuses = cart.status().into_stream();
     assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
 
     let mut second = harness.queue_socket();
     first.disconnect();
     harness.pump();
 
-    assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert_eq!(cart.status().value(), MountStatus::Reconnecting);
     assert_eq!(drain(&mut statuses), vec![MountStatus::Reconnecting]);
-    assert!(
-        cart.snapshot().is_some(),
+    assert_eq!(
+        cart.state().title().value(),
+        "Cart",
         "the last-good tree keeps rendering through the window (BDR-0015)"
     );
 
@@ -765,13 +770,13 @@ fn a_transport_drop_reports_reconnecting_and_the_rejoins_fresh_patch_restores_li
 
     // The rejoin alone is not recovery: live returns only with the fresh
     // initial patch that swaps the state in.
-    assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert_eq!(cart.status().value(), MountStatus::Reconnecting);
     assert!(drain(&mut statuses).is_empty(), "no edge was crossed");
 
     second.push_event(&rejoin[0], "patch", initial_envelope());
     harness.pump();
 
-    assert_eq!(cart.status(), MountStatus::Live);
+    assert_eq!(cart.status().value(), MountStatus::Live);
     assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
 }
 
@@ -780,7 +785,7 @@ fn a_heartbeat_timeout_reports_reconnecting_without_any_command() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
     let (_join, cart) = harness.mount(&mut server, "cart");
-    let mut statuses = cart.status_updates();
+    let mut statuses = cart.status().into_stream();
 
     harness.fire(HEARTBEAT);
     assert!(
@@ -794,10 +799,11 @@ fn a_heartbeat_timeout_reports_reconnecting_without_any_command() {
     // the transport has not noticed — and no command was ever dispatched.
     harness.fire(HEARTBEAT);
 
-    assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert_eq!(cart.status().value(), MountStatus::Reconnecting);
     assert_eq!(drain(&mut statuses), vec![MountStatus::Reconnecting]);
-    assert!(
-        cart.snapshot().is_some(),
+    assert_eq!(
+        cart.state().title().value(),
+        "Cart",
         "the last-good tree keeps rendering"
     );
 }
@@ -807,13 +813,13 @@ fn a_version_gap_recovery_passes_through_reconnecting() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
     let (join, cart) = harness.mount(&mut server, "cart");
-    let mut statuses = cart.status_updates();
+    let mut statuses = cart.status().into_stream();
     assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
 
     server.push_event(&join, "patch", envelope(7, 8, json!([])));
     harness.pump();
 
-    assert_eq!(cart.status(), MountStatus::Reconnecting);
+    assert_eq!(cart.status().value(), MountStatus::Reconnecting);
     assert_eq!(drain(&mut statuses), vec![MountStatus::Reconnecting]);
 
     // Recovery left the diverged channel and joined a fresh one; its initial
@@ -825,7 +831,7 @@ fn a_version_gap_recovery_passes_through_reconnecting() {
     server.push_event(rejoin, "patch", initial_envelope());
     harness.pump();
 
-    assert_eq!(cart.status(), MountStatus::Live);
+    assert_eq!(cart.status().value(), MountStatus::Live);
     assert_eq!(drain(&mut statuses), vec![MountStatus::Live]);
 }
 
@@ -839,7 +845,7 @@ fn a_root_that_was_never_live_stays_connecting_through_a_socket_drop() {
     let pending = harness.mount_later("cart", currency("EUR"));
     server.sent(&mut harness);
     let cart = harness.settle(pending).expect("the seeded mount resolves");
-    let mut statuses = cart.status_updates();
+    let mut statuses = cart.status().into_stream();
     // The opening replay, not a transition — consumed here so the assertion
     // below is about edges only.
     assert_eq!(drain(&mut statuses), vec![MountStatus::Connecting]);
@@ -850,7 +856,7 @@ fn a_root_that_was_never_live_stays_connecting_through_a_socket_drop() {
 
     // Socket churn before the root was ever live is still `Connecting`; only
     // a root that has been live can be `Reconnecting`.
-    assert_eq!(cart.status(), MountStatus::Connecting);
+    assert_eq!(cart.status().value(), MountStatus::Connecting);
     assert!(drain(&mut statuses).is_empty(), "no edge was crossed");
 }
 
@@ -859,53 +865,74 @@ fn a_root_that_was_never_live_stays_connecting_through_a_socket_drop() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn updates_open_with_the_current_state_and_coalesce_to_the_latest_one() {
+fn a_node_subscription_is_called_once_per_transaction_that_changed_it() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
     let (join, cart) = harness.mount(&mut server, "cart");
-    let mut updates = cart.updates();
+    let title = cart.state().title();
+    let messages = cart.state().messages();
+    let titles = revisions(&title);
+    let rows = revisions(&messages.as_state());
 
-    // The subscription opens with what `snapshot()` holds: reading it first is
-    // a first-paint convenience, not a window a consumer has to close.
-    assert!(matches!(
-        drain(&mut updates).as_slice(),
-        [initial] if initial.title == "Cart"
-    ));
+    // Subscribing calls nothing: the current value is `value()`, not a replay
+    // (`docs/rust-reactive-state.md` §2.4).
+    assert!(titles.take().is_empty());
+    assert_eq!(title.value(), "Cart");
 
+    for (base_version, version, value) in [(1, 2, "Second"), (2, 3, "Third")] {
+        server.push_event(
+            &join,
+            "patch",
+            envelope(
+                base_version,
+                version,
+                json!([{"op": "replace", "path": "/title", "value": value}]),
+            ),
+        );
+        harness.pump();
+    }
+
+    // Two accepted envelopes, two calls — and the revision each carries is the
+    // node's own transaction counter, not the envelope's version.
+    assert_eq!(titles.take(), [2, 3]);
+    assert_eq!(title.value(), "Third");
+    // The sibling the envelopes never touched was not woken at all: that is
+    // what per-node subscription buys over the whole-root publish it replaces.
+    assert!(rows.take().is_empty());
+}
+
+#[test]
+fn a_transaction_that_puts_a_value_back_notifies_nobody() {
+    let mut harness = Harness::new();
+    let mut server = harness.queue_socket();
+    let (join, cart) = harness.mount(&mut server, "cart");
+    let title = cart.state().title();
+    let titles = revisions(&title);
+    let revision = title.revision();
+
+    // §9.2: the patch is only input. Two ops that cancel out inside one
+    // envelope leave the node's semantic value where it was, so no subscriber
+    // is called and the revision does not move.
     server.push_event(
         &join,
         "patch",
         envelope(
             1,
             2,
-            json!([{"op": "replace", "path": "/title", "value": "Second"}]),
-        ),
-    );
-    harness.pump();
-    server.push_event(
-        &join,
-        "patch",
-        envelope(
-            2,
-            3,
-            json!([{"op": "replace", "path": "/title", "value": "Third"}]),
+            json!([
+                {"op": "replace", "path": "/title", "value": "Second"},
+                {"op": "replace", "path": "/title", "value": "Cart"}
+            ]),
         ),
     );
     harness.pump();
 
-    // Two accepted envelopes, one item: each state is a whole root that
-    // subsumes the one before it, so a consumer that was not polling gets
-    // where the root ended up instead of a backlog to replay.
-    assert!(matches!(
-        drain(&mut updates).as_slice(),
-        [third] if third.title == "Third"
-    ));
-    // And a subscription taken now opens on the same value — no consumer can
-    // observe the state that was skipped.
-    assert!(matches!(
-        drain(&mut cart.updates()).as_slice(),
-        [third] if third.title == "Third"
-    ));
+    assert!(titles.take().is_empty());
+    assert_eq!(title.revision(), revision);
+    assert_eq!(title.value(), "Cart");
+    // The envelope was still *accepted*: the version advanced, which is what
+    // keeps the next one from reading as a gap.
+    assert_eq!(cart.status().value(), MountStatus::Live);
 }
 
 #[test]
@@ -928,10 +955,7 @@ fn push_events_are_dispatched_to_their_store_after_the_state_is_published() {
     server.push_event(&join, "patch", payload);
     harness.pump();
 
-    assert!(matches!(
-        cart.snapshot().as_deref(),
-        Some(CartState { title, .. }) if title == "Second"
-    ));
+    assert_eq!(cart.state().title().value(), "Second");
     assert!(
         matches!(
             drain(&mut toasts).as_slice(),
@@ -963,9 +987,12 @@ fn a_subscription_taken_after_teardown_ends_instead_of_waiting_forever() {
         ended(&mut cart.events::<ToastPayload, _>(&panel)),
         "and a key it never had — closure is the registry's, not a key's"
     );
-    // The same rule the state and status cells already keep (`Latest::close`).
-    assert!(ended(&mut cart.updates()));
-    assert!(ended(&mut cart.status_updates()));
+    // The same rule the status cell keeps (`Latest::close`), and the tree's
+    // own version of it: a view taken after teardown is valid but dead, and a
+    // subscription on it is inert rather than one nothing can ever reach.
+    assert!(ended(&mut cart.status().into_stream()));
+    assert!(!cart.state().is_live());
+    assert!(revisions(&cart.state()).take().is_empty());
 }
 
 #[test]
@@ -998,7 +1025,7 @@ fn upload_ops_reach_the_handles_the_root_hands_out() {
     let mut server = harness.queue_socket();
     let (join, cart) = harness.mount(&mut server, "cart");
     let avatar = cart.upload(&StoreId::root(), "avatar");
-    let mut updates = avatar.updates();
+    let mut updates = avatar.clone().into_stream();
 
     let mut payload = envelope(1, 2, json!([]));
     payload["upload_ops"] = json!([
@@ -1017,7 +1044,7 @@ fn upload_ops_reach_the_handles_the_root_hands_out() {
 
     // The handle taken before the ops landed is the one the actor folded into.
     assert!(matches!(
-        avatar.snapshot().entry("u_1"),
+        avatar.value().entry("u_1"),
         Some(UploadEntry {
             progress: 60,
             status: EntryStatus::Uploading,
@@ -1035,7 +1062,7 @@ fn unmounting_a_root_ends_its_upload_streams() {
     let mut harness = Harness::new();
     let mut server = harness.queue_socket();
     let (_join, cart) = harness.mount(&mut server, "cart");
-    let mut updates = cart.upload(&StoreId::root(), "avatar").updates();
+    let mut updates = cart.upload(&StoreId::root(), "avatar").into_stream();
 
     drop(cart);
     harness.pump();
@@ -1056,11 +1083,11 @@ fn an_upload_subscription_taken_after_teardown_ends_instead_of_waiting_forever()
     harness.disconnect();
 
     assert!(
-        ended(&mut held.updates()),
+        ended(&mut held.clone().into_stream()),
         "a handle kept across the teardown"
     );
     assert!(
-        ended(&mut cart.upload(&StoreId::root(), "avatar").updates()),
+        ended(&mut cart.upload(&StoreId::root(), "avatar").into_stream()),
         "and one taken from the root afterwards, which the registry no longer has a cell for"
     );
 }
@@ -1212,11 +1239,9 @@ fn an_envelope_the_generated_types_reject_lands_none_of_what_travelled_with_it()
     let mut server = harness.queue_socket();
     let (join, cart) = harness.mount(&mut server, "cart");
     let avatar = cart.upload(&StoreId::root(), "avatar");
-    let mut uploads = avatar.updates();
-    let mut updates = cart.updates();
-
-    // The replay of the state the mount already published.
-    assert_eq!(drain(&mut updates).len(), 1);
+    let mut uploads = avatar.clone().into_stream();
+    let state = cart.state();
+    let seen = revisions(&state);
 
     // `title` is gone (§11) — and a stream op and an upload op are travelling
     // on the same envelope, neither of which the deserialize gets to see.
@@ -1249,12 +1274,10 @@ fn an_envelope_the_generated_types_reject_lands_none_of_what_travelled_with_it()
     // The last-good rendering is kept, and nothing else moved either: an
     // upload subscriber must not run ahead of an envelope the embedder never
     // saw.
-    assert!(matches!(
-        cart.snapshot(),
-        Some(state) if state.title == "Cart" && state.messages.len() == 1
-    ));
-    assert!(drain(&mut updates).is_empty(), "no state was published");
-    assert!(avatar.snapshot().entry("u_1").is_none());
+    assert_eq!(state.title().value(), "Cart");
+    assert_eq!(state.messages().len(), 1);
+    assert!(seen.take().is_empty(), "no state subscriber was notified");
+    assert!(avatar.value().entry("u_1").is_none());
     assert!(drain(&mut uploads).is_empty(), "no upload op was published");
 
     // The root recovers, and the rejoin's fresh initial patch renders without a
@@ -1274,8 +1297,8 @@ fn an_envelope_the_generated_types_reject_lands_none_of_what_travelled_with_it()
     harness.pump();
 
     assert!(matches!(
-        cart.snapshot(),
-        Some(state) if matches!(state.messages.as_slice(), [message] if message.id == "m-1")
+        cart.state().messages().value().as_slice(),
+        [message] if message.id == "m-1"
     ));
 }
 
@@ -1323,13 +1346,12 @@ fn a_cache_hit_renders_before_the_initial_patch_and_is_replaced_by_it() {
         Err(error) => panic!("the seeded mount resolves: {error}"),
     };
 
-    let seeded = cart.snapshot().expect("the cache entry was published");
-    assert!(matches!(
-        seeded.as_ref(),
-        CartState { title, messages }
-            // Streams are not cached, so a seeded stream slot hydrates empty.
-            if title == "Cached cart" && messages.is_empty()
-    ));
+    let seeded = cart.state();
+
+    assert!(seeded.revision() > 0, "the cache entry was published");
+    assert_eq!(seeded.title().value(), "Cached cart");
+    // Streams are not cached, so a seeded stream slot reads empty.
+    assert!(seeded.messages().is_empty());
 
     // The live initial patch swaps the whole tree out atomically.
     server.reply(&sent[0], ReplyStatus::Ok, json!({"root_id": ROOT_ID}));
@@ -1337,11 +1359,8 @@ fn a_cache_hit_renders_before_the_initial_patch_and_is_replaced_by_it() {
     server.push_event(&sent[0], "patch", initial_envelope());
     harness.pump();
 
-    let live = cart.snapshot().expect("the initial patch has been applied");
-    assert!(matches!(
-        live.as_ref(),
-        CartState { title, messages } if title == "Cart" && messages.len() == 1
-    ));
+    assert_eq!(cart.state().title().value(), "Cart");
+    assert_eq!(cart.state().messages().len(), 1);
 }
 
 #[test]
@@ -1369,10 +1388,7 @@ fn a_stale_entry_is_evicted_and_the_mount_falls_back_to_the_cold_path() {
     harness.pump();
 
     let cart = harness.finish_mount(&mut server, &sent[0], pending);
-    assert_eq!(
-        cart.snapshot().expect("the initial patch landed").title,
-        "Cart"
-    );
+    assert_eq!(cart.state().title().value(), "Cart");
 }
 
 #[test]
@@ -1404,10 +1420,7 @@ fn a_cached_tree_the_generated_types_reject_is_dropped_rather_than_published() {
     harness.pump();
 
     let cart = harness.finish_mount(&mut server, &sent[0], pending);
-    assert_eq!(
-        cart.snapshot().expect("the initial patch landed").title,
-        "Cart"
-    );
+    assert_eq!(cart.state().title().value(), "Cart");
 }
 
 #[test]
@@ -1591,9 +1604,7 @@ fn a_cache_read_that_outlives_its_own_mount_does_not_seed_the_next_one() {
     let cart = harness.finish_mount(&mut server, &rejoin[0], second);
 
     assert_eq!(
-        cart.snapshot()
-            .expect("the live initial patch published")
-            .title,
+        cart.state().title().value(),
         "Cart",
         "the EUR slot's tree must not reach the USD mount"
     );
@@ -1654,12 +1665,45 @@ fn a_remount_inside_the_gc_window_cancels_the_eviction() {
         block_on(store.get(&cart_key())).is_some(),
         "the re-mount owns the slot again"
     );
-    assert!(remounted.snapshot().is_some());
+    assert_eq!(remounted.state().title().value(), "Cart");
 }
 
 // ---------------------------------------------------------------------------
 // Generated-code stand-ins
 // ---------------------------------------------------------------------------
+
+/// Installs a node subscription and records the revision of every `Change` it
+/// is handed — how a test observes a sequence of transactions against one node
+/// (`docs/rust-reactive-state.md` §5.3).
+///
+/// The token is held by the returned value, so the subscription lives exactly
+/// as long as the assertions that read it.
+fn revisions<T>(state: &State<T>) -> Revisions {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+
+    Revisions {
+        _subscription: state.subscribe(move |change| {
+            record
+                .lock()
+                .expect("the recorder is not poisoned")
+                .push(change.revision);
+        }),
+        seen,
+    }
+}
+
+struct Revisions {
+    seen: Arc<Mutex<Vec<u64>>>,
+    _subscription: Subscription,
+}
+
+impl Revisions {
+    /// The revisions recorded since the last call, emptying the log.
+    fn take(&self) -> Vec<u64> {
+        std::mem::take(&mut self.seen.lock().expect("the recorder is not poisoned"))
+    }
+}
 
 /// The zero-sized marker `mix compile.musubi_rust` emits per store.
 struct CartStore;
@@ -1698,12 +1742,34 @@ impl Store for OddParamsStore {
     type Params = OddParams;
 }
 
+/// The snapshot struct. Its fields are read through the navigation trait
+/// below and through `value()`, never as struct fields — which is the point of
+/// the retained tree, and why serde is the only thing that names them.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code, reason = "the fields are what `Deserialize` fills in")]
 struct CartState {
     title: String,
-    /// `stream(Message)` renders as a plain `Vec`: hydration substitutes the
-    /// materialized array before serde runs.
+    /// `stream(Message)` still renders as a plain `Vec` on the snapshot struct;
+    /// the navigation trait below is where it becomes a keyed collection.
     messages: Vec<ChatMessage>,
+}
+
+/// The navigation trait `mix compile.musubi_rust` emits beside every shape that
+/// reaches the state tree (`docs/rust-reactive-state.md` §4.2, §4.3), written
+/// out here exactly as the generator would.
+trait CartStateExt {
+    fn title(&self) -> State<String>;
+    fn messages(&self) -> StreamState<ChatMessage>;
+}
+
+impl CartStateExt for State<CartState> {
+    fn title(&self) -> State<String> {
+        self.child("title")
+    }
+
+    fn messages(&self) -> StreamState<ChatMessage> {
+        self.child("messages").into()
+    }
 }
 
 #[derive(Debug, Deserialize)]

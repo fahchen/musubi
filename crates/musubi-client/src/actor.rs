@@ -21,6 +21,7 @@ use std::sync::Arc;
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
 use futures_util::StreamExt;
+use musubi_state::Notify;
 use phoenix_channel::{
     Channel, ChannelEvent, ChannelEvents, PhoenixSocket, PushError, Reply, ReplyStatus, Spawner,
     Timer,
@@ -29,7 +30,7 @@ use serde_json::{Value, json};
 
 use crate::cache::CacheEntry;
 use crate::cache_coordinator::{CacheConfig, CacheCoordinator};
-use crate::engine::{PatchEngine, StagedPatch};
+use crate::engine::PatchEngine;
 use crate::envelope::PatchEnvelope;
 use crate::error::{CommandError, MusubiError, Result};
 use crate::generated::StoreId;
@@ -393,7 +394,7 @@ impl Actor {
                 refcount: 1,
                 generation: 0,
                 channel: None,
-                engine: PatchEngine::with_uploads(request.sink.uploads()),
+                engine: PatchEngine::new(request.sink.tree().clone(), request.sink.uploads()),
                 sink: request.sink,
                 cell: request.cell,
                 published: false,
@@ -808,8 +809,11 @@ impl Actor {
             return;
         }
 
-        let staged = match root.engine.prepare(&envelope) {
-            Ok(staged) => staged,
+        let sink = Arc::clone(&root.sink);
+        let validate = move |hydrated: &Value| sink.validate(hydrated);
+
+        let notify = match root.engine.apply(&envelope, &validate) {
+            Ok(notify) => notify,
             // §4.5: the initial envelope must be `0 -> 1`. Nothing is recovered
             // by rejoining a root that never started, so the mount just fails —
             // unless nothing was waiting, in which case only a rejoin can move
@@ -824,6 +828,20 @@ impl Actor {
 
                 return;
             }
+            // Codegen drift (§4.4, §11). A silent partial state is worse than a
+            // loud stall, so the envelope fails and the last-good rendering is
+            // kept: the transaction rolled back, the version did not move, no
+            // upload subscriber heard of this envelope and no state subscriber
+            // was notified. The waiting mounts learn what it was before the
+            // root goes into recovery; recovery is how it gets moving again,
+            // not how it is repaired.
+            Err(error @ MusubiError::Decode { .. }) => {
+                tracing::error!(root_id = %root_id, %error, "root state did not match the generated types");
+                self.fail_mounts_with(root_id, error);
+                self.recover(root_id).await;
+
+                return;
+            }
             // A version gap or a failed op both mean client and server
             // diverged; the tree is untouched, so recovery keeps rendering it.
             Err(error) => {
@@ -834,21 +852,7 @@ impl Actor {
             }
         };
 
-        if let Err(error) = self.publish(root_id, &envelope, staged) {
-            // A silent partial state is worse than a loud stall, so the
-            // envelope fails and the last-good rendering is kept. The waiting
-            // mounts learn it is codegen drift (§11) before the root goes into
-            // recovery.
-            //
-            // Nothing of this envelope survives: the deserialize ran against
-            // the staged tree, which went out with the failure, so the engine
-            // is still on the previous version and no upload subscriber was
-            // told otherwise. Recovery below is how the root gets moving again,
-            // not how it is repaired.
-            tracing::error!(root_id = %root_id, %error, "root state did not match the generated types");
-            self.fail_mounts_with(root_id, error);
-            self.recover(root_id).await;
-        }
+        self.publish(root_id, &envelope, notify);
     }
 
     /// Handles an undecodable `"patch"` payload: fail whatever was waiting on
@@ -881,39 +885,28 @@ impl Actor {
         }
     }
 
-    /// Accepts a prepared envelope: deserialize, commit, then its push events,
-    /// then the mounts that were waiting for it (§4.3 steps 6–7).
+    /// Runs the rest of the accepted envelope's cycle, in the order §3.6 fixes:
+    /// state subscribers, then `Live`, then the push events, then the mounts
+    /// that were waiting, then the cache write.
     ///
-    /// Deserializing runs **before** the commit, and it is the last thing that
-    /// can fail. That ordering is the whole atomicity story: on failure the
-    /// staged tree is dropped here, so the engine is still on the previous
-    /// version, its shadow document and streams are untouched, and no upload
-    /// subscriber has been told about an envelope the embedder never saw.
-    ///
-    /// Returns [`MusubiError::Decode`] when the tree did not match the
-    /// generated types, which is codegen drift (§11).
-    fn publish(
-        &mut self,
-        root_id: &Arc<str>,
-        envelope: &PatchEnvelope,
-        staged: StagedPatch<'_>,
-    ) -> Result<()> {
+    /// The engine has already committed and released the tree lock; what is
+    /// left is the [`Notify`] it owes. **Dropping it is step 9** — the state
+    /// subscribers run there, on this task — and holding it until then is what
+    /// keeps the relative order this crate has always contracted: state is
+    /// current before the status reports `Live`, and both are before the events
+    /// are dispatched.
+    fn publish(&mut self, root_id: &Arc<str>, envelope: &PatchEnvelope, notify: Notify) {
         let Some(root) = self.roots.get_mut(root_id) else {
-            return Ok(());
+            return;
         };
 
-        // The root's own subtree is what failed, so the reported store is the
-        // root path even when a nested store node is the culprit.
-        root.sink
-            .publish(staged.state())
-            .map_err(|source| MusubiError::Decode {
-                store_id: StoreId::root(),
-                source,
-            })?;
-
-        root.engine.commit(staged);
         root.published = true;
         root.recovering = false;
+
+        // Step 9. Callbacks run here, with the tree lock already released, so
+        // one is free to read, subscribe, or drop its own subscription.
+        drop(notify);
+
         // Only an *accepted envelope* makes the root live — a cache seed
         // publishes state without ever reaching this path (BDR-0033).
         root.sink.set_status(MountStatus::Live);
@@ -928,10 +921,8 @@ impl Actor {
 
         if let Some(root) = self.roots.get(root_id) {
             self.cache
-                .on_publish(root.cache_key.as_ref(), root.engine.document());
+                .on_publish(root.cache_key.as_ref(), || root.engine.document());
         }
-
-        Ok(())
     }
 
     /// Hands the root's cell — and the hold each of them was counted for — to
@@ -992,7 +983,7 @@ impl Actor {
 
     /// Version-mismatch recovery on a still-live channel (§9).
     ///
-    /// Soft reset — the last-good tree, index and streams keep rendering — then
+    /// Soft reset — the last-good tree keeps rendering — then
     /// leave the diverged channel (which stops the server-side root) and join a
     /// fresh one. A failed re-join is **not** fatal: the transport keeps
     /// rejoining and the join-ok hook finishes the recovery.
@@ -1105,10 +1096,9 @@ impl Actor {
 
     // -- Cache seeding (`docs/rust-client.md` §6.4) -------------------------
 
-    /// Seeds one root from its cache entry: the shadow document is adopted and
-    /// published, and every mount waiting on the root resolves against it —
-    /// before the live initial patch, which then swaps the whole tree out
-    /// atomically.
+    /// Seeds one root from its cache entry: the tree is built from the cached
+    /// wire value, and every mount waiting on the root resolves against it —
+    /// before the live initial patch, which then reconciles the whole tree.
     ///
     /// A cache read can suspend past the live initial patch, so a root that has
     /// already published keeps what the server sent; the stale seed is dropped.
@@ -1130,29 +1120,37 @@ impl Actor {
             return;
         }
 
-        let state = root.engine.seed(entry.data);
+        let sink = Arc::clone(&root.sink);
+        let validate = move |hydrated: &Value| sink.validate(hydrated);
 
-        if let Err(error) = root.sink.publish(&state) {
+        let notify = match root.engine.seed(entry.data, &validate) {
+            Ok(notify) => notify,
             // A tree written by an older build can be a shape this binary no
             // longer deserializes. That is not a protocol failure — the live
-            // patch is still coming — so the seed is dropped, the slot is
-            // evicted, and the mount goes on waiting for the cold path.
-            tracing::warn!(
-                root_id = %root_id,
-                %error,
-                "dropping a cache entry whose tree did not match the generated types"
-            );
-            root.engine.discard_seed();
+            // patch is still coming — so the seed is rolled back by its own
+            // transaction, the slot is evicted, and the mount goes on waiting
+            // for the cold path.
+            Err(error) => {
+                tracing::warn!(
+                    root_id = %root_id,
+                    %error,
+                    "dropping a cache entry whose tree did not match the generated types"
+                );
 
-            if let Some(key) = root.cache_key.clone() {
-                self.cache.discard(key);
+                if let Some(key) = root.cache_key.clone() {
+                    self.cache.discard(key);
+                }
+
+                return;
             }
-
-            return;
-        }
+        };
 
         root.published = true;
         root.seeded = true;
+
+        // The seeded tree reaches its subscribers before the mounts resolve, so
+        // a consumer that subscribes on resolution never misses the seed.
+        drop(notify);
 
         self.resolve_mounts(root_id);
     }
@@ -1183,7 +1181,7 @@ struct Root {
     sink: Arc<dyn RootSink>,
     cell: AnyCell,
     /// Whether any state has ever been published. Aliasing mounts only wait
-    /// while it is `false`; afterwards the last-good snapshot is good enough.
+    /// while it is `false`; afterwards the last-good tree is good enough.
     published: bool,
     /// Guards re-entry into version-mismatch recovery (§9).
     recovering: bool,

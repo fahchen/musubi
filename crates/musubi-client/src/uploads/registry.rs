@@ -19,8 +19,8 @@
 //!                  │                + per-entry transport state (§10.2)
 //!                  └─ UploadCell ── …
 //!                       ▲
-//!                       │ Mounted::upload(&store_id, name)
-//!                    Upload ── snapshot() / updates()
+//!                       │ Mounted::upload_at(&slot)
+//!                    Upload ── value() / subscribe() / into_stream()
 //!                           ── select() / start() / cancel() / reset()
 //! ```
 //!
@@ -33,13 +33,17 @@
 //! what is inside them is [`transfer`](super::transfer)'s alone.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures_channel::mpsc::{self, UnboundedSender};
 use futures_core::Stream;
+use musubi_state::{SubscriberId, Subscription, Unsubscribe};
 
 use crate::generated::StoreId;
 use crate::lock;
+
+/// One registered callback on an upload cell.
+type UploadCallback = Arc<dyn Fn(&UploadHandle) + Send + Sync>;
 
 use super::ops::{
     COMPLETE, EntryStatus, UploadConfig, UploadEntry, UploadError, UploadOp, UploadStatus,
@@ -48,7 +52,8 @@ use super::transfer::{EntryTransport, UploadControl};
 
 /// One upload's observable state, as a value.
 ///
-/// Read with [`Upload::snapshot`] or received from [`Upload::updates`]. Unlike
+/// Read with [`Upload::value`], or received by an [`Upload::subscribe`]
+/// callback or from [`Upload::into_stream`]. Unlike
 /// the TypeScript client — whose handle is one mutable object kept alive for
 /// the connection — this is a plain clone, so an old snapshot never mutates
 /// under its reader.
@@ -305,7 +310,11 @@ pub(in crate::uploads) struct UploadCell {
     /// The declared upload name; immutable, as above.
     pub(in crate::uploads) name: String,
     handle: Mutex<UploadHandle>,
-    updates: Mutex<Vec<UnboundedSender<UploadHandle>>>,
+    /// Both faces of one subscription behind one lock: the queues
+    /// [`Upload::into_stream`](super::Upload::into_stream) hands out and the
+    /// callbacks [`Upload::subscribe`](super::Upload::subscribe) registers
+    /// (`docs/rust-reactive-state.md` §6.4).
+    subscribers: Mutex<Subscribers>,
     transport: Mutex<HashMap<String, EntryTransport>>,
     /// Terminal for the whole cell, set by [`close`](Self::close).
     ///
@@ -329,12 +338,33 @@ pub(in crate::uploads) struct UploadCell {
     transferring: Mutex<bool>,
 }
 
+/// One cell's subscribers, in both shapes §2.4 signs.
+#[derive(Default)]
+struct Subscribers {
+    senders: Vec<UnboundedSender<UploadHandle>>,
+    callbacks: Vec<(u64, UploadCallback)>,
+    /// Mints [`SubscriberId`]s for the callback half. Unique within this cell,
+    /// never globally.
+    next_id: u64,
+}
+
+impl std::fmt::Debug for Subscribers {
+    /// Counts, never the callbacks themselves.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Subscribers")
+            .field("senders", &self.senders.len())
+            .field("callbacks", &self.callbacks.len())
+            .finish()
+    }
+}
+
 impl UploadCell {
     /// A fresh cell holding a default handle.
     fn new(store_id: StoreId, name: String) -> Self {
         Self {
             handle: Mutex::new(UploadHandle::new(store_id.clone(), name.clone())),
-            updates: Mutex::new(Vec::new()),
+            subscribers: Mutex::new(Subscribers::default()),
             transport: Mutex::new(HashMap::new()),
             closed: Mutex::new(false),
             selection: Mutex::new(0),
@@ -498,9 +528,32 @@ impl UploadCell {
         }
     }
 
-    /// Delivers one snapshot to every live subscriber.
+    /// Delivers one value to every live subscriber, in both shapes.
+    ///
+    /// The callbacks are cloned under the cell's lock and invoked without it —
+    /// the tree's never-notify-under-the-lock discipline, so a callback is free
+    /// to read the handle, subscribe, or drop its own [`Subscription`]
+    /// (`docs/rust-reactive-state.md` §2.6, §6.4). The value travels with the
+    /// call because this cell is a **queue**: "which publish woke me" is not
+    /// answerable by re-reading the current value.
     fn publish(&self, snapshot: UploadHandle) {
-        lock(&self.updates).retain(|sender| sender.unbounded_send(snapshot.clone()).is_ok());
+        let owed = {
+            let mut subscribers = lock(&self.subscribers);
+
+            subscribers
+                .senders
+                .retain(|sender| sender.unbounded_send(snapshot.clone()).is_ok());
+
+            subscribers
+                .callbacks
+                .iter()
+                .map(|(_, callback)| Arc::clone(callback))
+                .collect::<Vec<_>>()
+        };
+
+        for callback in owed {
+            callback(&snapshot);
+        }
     }
 
     /// Subscribes to this cell, or hands back an already-ended stream once it
@@ -508,17 +561,47 @@ impl UploadCell {
     ///
     /// The read and the registration are one step under `closed`, so a teardown
     /// cannot land between them and leave a sender nothing will ever write to.
-    fn subscribe(&self) -> impl Stream<Item = UploadHandle> + Send + 'static {
+    fn stream(&self) -> impl Stream<Item = UploadHandle> + Send + use<> {
         let (sender, receiver) = mpsc::unbounded();
         let closed = lock(&self.closed);
 
         if !*closed {
-            lock(&self.updates).push(sender);
+            lock(&self.subscribers).senders.push(sender);
         }
 
         drop(closed);
 
         receiver
+    }
+
+    /// Registers one callback and hands back its RAII token.
+    ///
+    /// Read under `closed` exactly as [`stream`](Self::stream) is, so a
+    /// teardown cannot land between the check and the insert; a token minted
+    /// for a closed cell is simply inert. It does **not** fire on registration
+    /// (§5.4): registration must not run caller code on the registrant's
+    /// thread.
+    fn on_change(self: &Arc<Self>, callback: UploadCallback) -> Subscription {
+        let id = {
+            let closed = lock(&self.closed);
+            let mut subscribers = lock(&self.subscribers);
+            let id = subscribers.next_id;
+
+            subscribers.next_id += 1;
+
+            if !*closed {
+                subscribers.callbacks.push((id, callback));
+            }
+
+            drop(closed);
+
+            id
+        };
+
+        Subscription::cell(
+            Arc::downgrade(self) as Weak<dyn Unsubscribe>,
+            SubscriberId::from_raw(id),
+        )
     }
 
     /// Retires the cell: no more subscriptions, no more transport state.
@@ -536,11 +619,30 @@ impl UploadCell {
 
         *closed = true;
 
-        lock(&self.updates).clear();
+        {
+            let mut subscribers = lock(&self.subscribers);
+
+            subscribers.senders.clear();
+            // Retiring the callbacks is what makes a handle held across a
+            // teardown inert rather than attached to a cell nothing will ever
+            // publish to. Closing carries no value, so none is invoked.
+            subscribers.callbacks.clear();
+        }
+
         drop(closed);
 
         // After the flag, so nothing this aborts can be re-inserted behind it.
         self.drop_transport(None);
+    }
+}
+
+impl Unsubscribe for UploadCell {
+    /// Drops one callback. Streams deregister by dropping their receiver, which
+    /// the next publish notices.
+    fn unsubscribe(&self, id: SubscriberId) {
+        lock(&self.subscribers)
+            .callbacks
+            .retain(|(registered, _)| *registered != id.as_raw());
     }
 }
 
@@ -592,16 +694,15 @@ impl Drop for Selection {
 
 /// Every upload handle of one mounted root, keyed by `(store_id, name)`.
 ///
-/// Shared between the [`PatchEngine`](crate::PatchEngine) that folds the ops
-/// and the [`Mounted`](crate::Mounted) that hands out [`Upload`]s, so both see
-/// one set of handles.
+/// Shared between the patch engine that folds the ops and the
+/// [`Mounted`](crate::Mounted) that hands out [`Upload`]s, so both see one set
+/// of handles.
 #[derive(Debug, Default)]
-pub struct Uploads {
+pub(crate) struct Uploads {
     handles: Mutex<Handles>,
     /// How the control plane reaches the server. `None` for a registry with no
-    /// connection behind it — a bare [`PatchEngine`](crate::PatchEngine) — in
-    /// which case `select`/`start`/`cancel`/`reset` report
-    /// [`MusubiError::NotConnected`](crate::MusubiError).
+    /// connection behind it, in which case `select`/`start`/`cancel`/`reset`
+    /// report [`MusubiError::NotConnected`](crate::MusubiError).
     control: Option<Arc<UploadControl>>,
 }
 
@@ -648,11 +749,11 @@ impl Uploads {
     /// and the defaults stand in until the `config` op lands.
     ///
     /// A handle for a key the registry has closed is born closed and is **not**
-    /// filed: it reads as the defaults and its `updates()` ends immediately, and
+    /// filed: it reads as the defaults and its subscriptions are inert, and
     /// leaving it out of the index is what lets a pruned store that comes back
     /// (BDR-0011) get a live cell rather than the dead one minted while it was
     /// away.
-    pub fn handle(&self, store_id: &StoreId, name: &str) -> Upload {
+    pub(crate) fn handle(&self, store_id: &StoreId, name: &str) -> Upload {
         let mut handles = lock(&self.handles);
         let fresh = || Arc::new(UploadCell::new(store_id.clone(), name.to_owned()));
 
@@ -710,8 +811,8 @@ impl Uploads {
         }
     }
 
-    /// Drops every handle whose owning store is gone from the freshly rebuilt
-    /// index, ending its `updates()` streams and aborting its transfers.
+    /// Drops every handle whose owning store is gone from the tree, ending its
+    /// subscriptions and aborting its transfers.
     ///
     /// Uploads are not resumable (BDR-0003), and a store that reappears mounts
     /// fresh (BDR-0011), so a vanished store must not leave its handles behind.
@@ -743,8 +844,8 @@ impl Uploads {
         }
     }
 
-    /// Drops every handle, ending its `updates()` streams and aborting its
-    /// transfers. Called when the root leaves the registry.
+    /// Drops every handle, ending its subscriptions and aborting its transfers.
+    /// Called when the root leaves the registry.
     pub(crate) fn clear(&self) {
         let mut handles = lock(&self.handles);
 
@@ -762,17 +863,21 @@ impl Uploads {
 
 /// A handle on one upload of one store.
 ///
-/// Cheap to clone; every clone addresses the same upload. Reading is
-/// [`snapshot`](Self::snapshot), watching is [`updates`](Self::updates) — the
-/// same shape [`Mounted`](crate::Mounted) uses for state and events.
+/// Cheap to clone; every clone addresses the same upload. It is a handle in the
+/// §2.4 sense, so it carries the same three verbs every other one does:
+/// [`value`](Self::value) reads, [`subscribe`](Self::subscribe) observes, and
+/// [`into_stream`](Self::into_stream) converts that same subscription into
+/// `await` shape.
+///
+/// The value it hands back is named [`UploadHandle`] — a *value* whose name
+/// predates this vocabulary. It is not a handle in the §2.4 sense; the method
+/// name is what says which role you are holding.
 ///
 /// ```text
-/// let avatar = cart.upload(&StoreId::root(), "avatar");
-/// let mut updates = avatar.updates();
+/// let avatar = cart.upload_at(&state.avatar()).expect("the root is mounted");
 ///
-/// while let Some(handle) = updates.next().await {
-///     render(handle.progress());
-/// }
+/// let _bar = avatar.subscribe(|handle| set_bar(handle.progress()));
+/// let current = avatar.value();
 /// ```
 #[derive(Debug, Clone)]
 pub struct Upload {
@@ -781,26 +886,55 @@ pub struct Upload {
 }
 
 impl Upload {
-    /// The current handle state.
+    /// The current value of this upload.
     ///
     /// Always available — an upload with no ops yet reads as an idle handle
     /// carrying the framework defaults.
-    pub fn snapshot(&self) -> UploadHandle {
+    pub fn value(&self) -> UploadHandle {
         self.cell.snapshot()
     }
 
-    /// One item per envelope that touched this upload, oldest first.
+    /// Subscribe. RAII, and the same [`Subscription`] every tree view hands
+    /// back, so it lives in the same `Vec` as they do.
     ///
-    /// The stream **is** the subscription: dropping it unsubscribes, and it
-    /// ends when the owning store leaves the tree or the root is unmounted. A
-    /// subscription taken *after* that is an already-ended stream, never one
-    /// waiting on a publish that can no longer come — including one taken
-    /// through a handle the embedder kept across the teardown. It does not
-    /// replay [`snapshot`](Self::snapshot) — read that first if the current
-    /// state matters.
+    /// One call per envelope that touched this upload, plus one per control-plane
+    /// transition. The value is handed to the callback rather than re-read,
+    /// because this cell is a queue: "which publish woke me" is not answerable
+    /// from the current value. It is handed by reference — a consumer that wants
+    /// to keep it clones it.
+    ///
+    /// It does **not** fire on registration and does not replay
+    /// [`value`](Self::value): subscribe first, read second. Registering on a
+    /// handle whose store has left the tree, or whose root was unmounted, hands
+    /// back an inert token rather than one attached to a cell that can never
+    /// publish again.
+    ///
+    /// The callback runs on the actor task for a server-driven op and on the
+    /// **calling** task for a control-plane transition (`select`, `start`, a
+    /// failed transfer) — the same two tasks the stream shape has always been
+    /// fed from. The contract is the same either way: **schedule, do not
+    /// compute.**
+    #[must_use = "dropping the subscription unsubscribes"]
+    pub fn subscribe(
+        &self,
+        on_change: impl Fn(&UploadHandle) + Send + Sync + 'static,
+    ) -> Subscription {
+        self.cell.on_change(Arc::new(on_change))
+    }
+
+    /// **Consumes this handle** and hands back the same subscription in `await`
+    /// shape: one item per publish, oldest first.
+    ///
+    /// A **queue**, not a latest value, and it does not replay
+    /// [`value`](Self::value) — read that first if the current state matters.
+    /// The stream **is** the subscription: dropping it unsubscribes, and it ends
+    /// when the owning store leaves the tree or the root is unmounted.
+    ///
+    /// Handles are [`Clone`], so a caller that still needs this one converts a
+    /// clone: `upload.clone().into_stream()`.
     #[must_use = "the stream is the subscription; dropping it unsubscribes"]
-    pub fn updates(&self) -> impl Stream<Item = UploadHandle> + Send + 'static {
-        self.cell.subscribe()
+    pub fn into_stream(self) -> impl Stream<Item = UploadHandle> + Send + 'static {
+        self.cell.stream()
     }
 }
 
@@ -815,6 +949,7 @@ mod tests {
         add, cancel, complete, decode, entry, error, progress, reset,
     };
     use crate::uploads::ops::{UploadAccept, UploadErrorCode};
+    use crate::uploads::transfer::UploadFile;
 
     // ---- op application, table-driven ------------------------------------
 
@@ -967,7 +1102,7 @@ mod tests {
 
             uploads.apply_ops(&decode(row.ops));
 
-            let handle = uploads.handle(&StoreId::root(), "avatar").snapshot();
+            let handle = uploads.handle(&StoreId::root(), "avatar").value();
             let entries: Vec<(&str, EntryStatus, u32)> = handle
                 .entries
                 .iter()
@@ -1001,7 +1136,7 @@ mod tests {
             uploads.apply_ops(&decode(vec![op]));
 
             assert!(matches!(
-                avatar.snapshot().entry("u_1"),
+                avatar.value().entry("u_1"),
                 Some(entry) if entry.status == expected
             ));
         }
@@ -1019,7 +1154,7 @@ mod tests {
             }
         })]));
 
-        let handle = uploads.handle(&StoreId::root(), "avatar").snapshot();
+        let handle = uploads.handle(&StoreId::root(), "avatar").value();
 
         assert!(matches!(
             handle.config,
@@ -1032,7 +1167,7 @@ mod tests {
     fn a_fresh_handle_carries_the_framework_defaults() {
         let handle = Uploads::default()
             .handle(&StoreId::root(), "avatar")
-            .snapshot();
+            .value();
 
         assert!(matches!(
             handle,
@@ -1078,8 +1213,8 @@ mod tests {
 
         let second = uploads.handle(&StoreId::root(), "avatar");
 
-        assert_eq!(first.snapshot(), second.snapshot());
-        assert_eq!(first.snapshot().progress(), 20);
+        assert_eq!(first.value(), second.value());
+        assert_eq!(first.value().progress(), 20);
     }
 
     #[test]
@@ -1104,7 +1239,7 @@ mod tests {
     #[test]
     fn a_touched_handle_publishes_once_per_envelope() {
         let uploads = Uploads::default();
-        let mut updates = uploads.handle(&StoreId::root(), "avatar").updates();
+        let mut updates = uploads.handle(&StoreId::root(), "avatar").into_stream();
 
         uploads.apply_ops(&decode(vec![
             add("u_1", "pending", 0),
@@ -1126,7 +1261,7 @@ mod tests {
     #[test]
     fn an_untouched_handle_publishes_nothing() {
         let uploads = Uploads::default();
-        let mut updates = uploads.handle(&StoreId::root(), "avatar").updates();
+        let mut updates = uploads.handle(&StoreId::root(), "avatar").into_stream();
 
         // Every op addresses an unknown entry, so nothing changes.
         uploads.apply_ops(&decode(vec![progress("u_ghost", 10), complete("u_ghost")]));
@@ -1137,8 +1272,10 @@ mod tests {
     #[test]
     fn ops_for_two_handles_publish_to_their_own_subscribers() {
         let uploads = Uploads::default();
-        let mut root = uploads.handle(&StoreId::root(), "avatar").updates();
-        let mut panel = uploads.handle(&store_id(&["panel"]), "avatar").updates();
+        let mut root = uploads.handle(&StoreId::root(), "avatar").into_stream();
+        let mut panel = uploads
+            .handle(&store_id(&["panel"]), "avatar")
+            .into_stream();
 
         uploads.apply_ops(&decode(vec![json!({
             "op": "add", "upload": "avatar", "store_id": ["panel"], "ref": "u_2",
@@ -1155,7 +1292,9 @@ mod tests {
     #[test]
     fn pruning_a_store_ends_its_update_streams() {
         let uploads = Uploads::default();
-        let mut updates = uploads.handle(&store_id(&["panel"]), "avatar").updates();
+        let mut updates = uploads
+            .handle(&store_id(&["panel"]), "avatar")
+            .into_stream();
 
         uploads.prune(&HashSet::from([StoreId::root()]));
 
@@ -1165,40 +1304,40 @@ mod tests {
     #[test]
     fn clearing_the_registry_ends_every_update_stream() {
         let uploads = Uploads::default();
-        let mut updates = uploads.handle(&StoreId::root(), "avatar").updates();
+        let mut updates = uploads.handle(&StoreId::root(), "avatar").into_stream();
 
         uploads.clear();
 
         assert!(matches!(updates.next().now_or_never(), Some(None)));
     }
 
-    // The two tests above drop the `Upload` the moment `updates()` returns, so
-    // the cell dies with its registry entry. Holding the handle — what every
-    // real consumer does — keeps the cell's `Arc` alive, and the streams must
-    // still end.
+    // The two tests above drop the `Upload` the moment `into_stream()` consumes
+    // it, so the cell dies with its registry entry. Holding the handle — what
+    // every real consumer does, hence the `clone()` — keeps the cell's `Arc`
+    // alive, and the streams must still end.
 
     #[test]
     fn pruning_a_store_ends_its_update_streams_while_the_handle_is_held() {
         let uploads = Uploads::default();
         let held = uploads.handle(&store_id(&["panel"]), "avatar");
-        let mut updates = held.updates();
+        let mut updates = held.clone().into_stream();
 
         uploads.prune(&HashSet::from([StoreId::root()]));
 
         assert!(matches!(updates.next().now_or_never(), Some(None)));
-        assert_eq!(held.snapshot().store_id, store_id(&["panel"]));
+        assert_eq!(held.value().store_id, store_id(&["panel"]));
     }
 
     #[test]
     fn clearing_the_registry_ends_every_update_stream_while_the_handle_is_held() {
         let uploads = Uploads::default();
         let held = uploads.handle(&StoreId::root(), "avatar");
-        let mut updates = held.updates();
+        let mut updates = held.clone().into_stream();
 
         uploads.clear();
 
         assert!(matches!(updates.next().now_or_never(), Some(None)));
-        assert_eq!(held.snapshot().store_id, StoreId::root());
+        assert_eq!(held.value().store_id, StoreId::root());
     }
 
     // A handle the registry no longer has is the case a per-cell tombstone
@@ -1212,7 +1351,7 @@ mod tests {
 
         uploads.clear();
 
-        let mut updates = uploads.handle(&StoreId::root(), "avatar").updates();
+        let mut updates = uploads.handle(&StoreId::root(), "avatar").into_stream();
 
         assert!(matches!(updates.next().now_or_never(), Some(None)));
     }
@@ -1225,14 +1364,14 @@ mod tests {
         uploads.handle(&panel, "avatar");
         uploads.prune(&HashSet::from([StoreId::root()]));
 
-        let mut updates = uploads.handle(&panel, "avatar").updates();
+        let mut updates = uploads.handle(&panel, "avatar").into_stream();
 
         assert!(matches!(updates.next().now_or_never(), Some(None)));
         // Another store's handle is untouched by its neighbour's tombstone.
         assert!(
             uploads
                 .handle(&StoreId::root(), "avatar")
-                .updates()
+                .into_stream()
                 .next()
                 .now_or_never()
                 .is_none()
@@ -1252,7 +1391,7 @@ mod tests {
         uploads.prune(&HashSet::from([StoreId::root()]));
         uploads.prune(&HashSet::from([StoreId::root(), panel.clone()]));
 
-        let mut updates = uploads.handle(&panel, "avatar").updates();
+        let mut updates = uploads.handle(&panel, "avatar").into_stream();
 
         uploads.apply_ops(&decode(vec![json!({
             "op": "add", "upload": "avatar", "store_id": ["panel"], "ref": "u_2",
@@ -1274,9 +1413,82 @@ mod tests {
         uploads.apply_ops(&decode(vec![error(None, "quota_exceeded")]));
 
         assert!(matches!(
-            uploads.handle(&StoreId::root(), "avatar").snapshot().errors.as_slice(),
+            uploads.handle(&StoreId::root(), "avatar").value().errors.as_slice(),
             [UploadError { code: UploadErrorCode::Other(code), message }]
                 if code == "quota_exceeded" && message == "boom"
+        ));
+    }
+
+    // ---- the callback half (§6.4) ----------------------------------------
+
+    #[test]
+    fn a_callback_is_not_invoked_at_registration_and_sees_every_publish() {
+        let uploads = Uploads::default();
+        let avatar = uploads.handle(&StoreId::root(), "avatar");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+
+        let subscription = avatar.subscribe(move |handle| lock(&record).push(handle.progress()));
+
+        assert!(
+            lock(&seen).is_empty(),
+            "registration runs no caller code; `value()` is how you read the current one"
+        );
+
+        // One call per handle per *envelope*, not per op: the fold publishes
+        // once, exactly as the TypeScript client's single `notify()` does.
+        uploads.apply_ops(&decode(vec![
+            add("u_1", "pending", 10),
+            progress("u_1", 25),
+        ]));
+        uploads.apply_ops(&decode(vec![progress("u_1", 40)]));
+
+        assert_eq!(*lock(&seen), [25, 40]);
+
+        // RAII: the drop is what stops them, and there is no `unsubscribe()`.
+        drop(subscription);
+
+        uploads.apply_ops(&decode(vec![progress("u_1", 80)]));
+
+        assert_eq!(*lock(&seen), [25, 40]);
+        assert_eq!(avatar.value().progress(), 80, "the value moved regardless");
+    }
+
+    #[test]
+    fn the_callback_and_the_stream_are_the_same_publishes() {
+        let uploads = Uploads::default();
+        let avatar = uploads.handle(&StoreId::root(), "avatar");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+
+        let _subscription = avatar.subscribe(move |handle| lock(&record).push(handle.progress()));
+        let mut stream = avatar.clone().into_stream();
+
+        uploads.apply_ops(&decode(vec![add("u_1", "pending", 10)]));
+        uploads.apply_ops(&decode(vec![progress("u_1", 40)]));
+
+        assert_eq!(*lock(&seen), [10, 40]);
+        assert_eq!(
+            std::iter::from_fn(|| stream.next().now_or_never().flatten())
+                .map(|handle| handle.progress())
+                .collect::<Vec<_>>(),
+            [10, 40],
+            "neither shape sees a publish the other does not"
+        );
+    }
+
+    #[test]
+    fn a_handle_with_no_connection_behind_it_cannot_transfer() {
+        let uploads = Uploads::default();
+        let avatar = uploads.handle(&StoreId::root(), "avatar");
+
+        assert!(matches!(
+            block_on(avatar.select(vec![UploadFile::new("me.png", "image/png", b"a".to_vec())])),
+            Err(crate::MusubiError::NotConnected)
+        ));
+        assert!(matches!(
+            block_on(avatar.start()),
+            Err(crate::MusubiError::NotConnected)
         ));
     }
 
@@ -1285,7 +1497,7 @@ mod tests {
     fn refs(uploads: &Uploads, store_id: &StoreId, name: &str) -> Vec<String> {
         uploads
             .handle(store_id, name)
-            .snapshot()
+            .value()
             .entries
             .iter()
             .map(|entry| entry.r#ref.clone())
