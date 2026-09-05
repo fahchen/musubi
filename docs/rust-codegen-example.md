@@ -476,73 +476,93 @@ let mounted = connection
 ### 3.3 Reading plain state
 
 ```rust
-// One-shot read. `None` until the initial patch lands (and mid-reconnect —
-// keep rendering the last-good data you hold, per BDR-0015).
-if let Some(state) = mounted.snapshot() {
-    let _ = (&state.title, state.revision, state.subtotal_cents, state.locked);
-    let _ = &state.locale;                    // atom() ⇒ String
-    if let Some(code) = &state.coupon { show_coupon(code); }
-    let _ = &state.shipping.street;           // hoisted inline block
-    let _ = state.metadata.get("theme");      // map() ⇒ serde_json::Map
-    let _ = &state.profile.name;              // cross-module state struct
+// `state()` is a handle on the retained tree's root, not a snapshot: it is not
+// an `Option`, it costs nothing, and it survives a reconnect (BDR-0015 —
+// the last good tree keeps rendering). `use generated::nav::*;` brings every
+// generated accessor into scope, one import per file.
+use generated::nav::*;
 
-    match state.r#type {                      // keyword field, raw ident
-        generated::demo::stores::cart_page_store::CartPageStoreType::Guest => {}
-        generated::demo::stores::cart_page_store::CartPageStoreType::Member => {}
-    }
+let state = mounted.state();
 
-    match &state.sync {                       // internally tagged union
-        CartPageStoreSync::Idle => {}
-        CartPageStoreSync::Error { message } => show_sync_error(message),
-    }
+// Navigation is infallible and materializes nothing; `value()` is the single
+// materialization point, and reads only the subtree it is rooted at.
+let _ = (state.title().value(), state.subtotal_cents().value(), state.locked().value());
+let _ = state.locale().value();                     // atom() ⇒ String
+if let Some(code) = state.coupon().as_some() { show_coupon(&code.value()); }
+let _ = state.shipping().street().value();          // hoisted inline block
+let _ = state.metadata().value().get("theme");      // map() ⇒ serde_json::Map
+let _ = state.profile().name().value();             // cross-module state struct
+
+match state.r#type().value() {                      // keyword field, raw ident
+    generated::demo::stores::cart_page_store::CartPageStoreType::Guest => {}
+    generated::demo::stores::cart_page_store::CartPageStoreType::Member => {}
 }
 
-// Push-driven: the current snapshot, then every later one this loop keeps up
-// with (latest-value, not a queue — `docs/rust-client.md` §2.4).
-let mut updates = mounted.updates();
-while let Some(state) = updates.next().await {
-    redraw(&state);
+match state.sync().value() {                        // internally tagged union
+    CartPageStoreSync::Idle => {}
+    CartPageStoreSync::Error { message } => show_sync_error(&message),
 }
+
+// Before the initial patch lands, and after teardown, there is nothing to read:
+// the handles are still there, and the checked read says so.
+assert!(state.title().try_value().is_err() || state.revision() > 0);
+
+// Push-driven: one RAII subscription per node, woken only when *that* node's
+// semantic value changed (`docs/rust-reactive-state.md` §2.3).
+let subscription = state.title().subscribe(move |_change| redraw_title());
 ```
 
 ### 3.4 Streams and async values
 
 ```rust
-let state = mounted.snapshot().unwrap();
+let state = mounted.state();
 
-// stream/3: already materialized in stream order by the client runtime
-// (insert-at/limit semantics per docs/streams.md) — a plain Vec.
-for item in &state.line_items {
-    render_row(&item.sku, item.qty, item.price_cents);
+// stream/3: a `StreamState<T>` — ordered *and* keyed. Addressed by index for
+// rendering and by item key for identity, and each row is its own handle whose
+// `NodeId` survives repositioning (`docs/rust-reactive-state.md` §3.1).
+let items = state.line_items();
+
+for (item_key, item) in items.iter() {
+    render_row(&item_key, item.sku().value(), item.qty().value());
 }
 
-// stream_async/3: the same Vec, wrapped in the loading|ok|failed AsyncResult.
-match &state.suggestions {
-    AsyncResult::Loading { result, .. } => render_stale_or_spinner(result.as_deref()),
-    AsyncResult::Ok { result, .. } => render_suggestions(result),
-    AsyncResult::Failed { reason, .. } => render_error(reason),
+// The whole list is still one read away when a consumer wants it:
+// `items.value()` yields the same `Vec<CartPageStoreLineItems>` as before.
+
+// stream_async/3: an `AsyncState<Vec<T>>`. `status()` is a value on the node
+// itself; `ok_stream()` is the keyed collection under it, `None` while the
+// result is null.
+let suggestions = state.suggestions();
+
+match (suggestions.ok_stream(), suggestions.status()) {
+    (Some(rows), AsyncStatus::Ok) => render_suggestions(&rows),
+    (rows, AsyncStatus::Loading) => render_stale_or_spinner(rows.as_ref()),
+    (_, AsyncStatus::Failed) => render_error(&suggestions.reason().value()),
 }
 
 // assign_async with an anonymous shape: hoisted struct inside the result.
-if let AsyncResult::Ok { result: summary, .. } = &state.summary {
-    render_totals(summary.count, summary.total_cents);
+if let Some(summary) = state.summary().result() {
+    render_totals(summary.count().value(), summary.total_cents().value());
 }
 ```
 
 ### 3.5 Child stores
 
 ```rust
-// `checkout_panel` is StoreField<State>: server-authored store_id + the
-// child's own fields, flattened. Never construct or parse store ids.
-let panel = &state.checkout_panel;
-render_panel(&panel.state.status, panel.state.total_cents);
+// `checkout_panel()` is a `StoreState<State>`: the child's own `Ext` trait is
+// implemented for it too, so its fields are reachable without unwrapping, and
+// `store_id()` sits beside them. `value()` still yields the flattened
+// `StoreField<State>` for a consumer that wants the whole thing.
+let panel = state.checkout_panel();
+render_panel(&panel.status().value(), panel.total_cents().value());
 
-// Dispatch a child command through the root's channel by echoing the
-// child's store_id. The target store type is inferred from `Pay`'s
-// `Command<CheckoutPanelStore>` impl — no turbofish.
-let reply = mounted
-    .command_on(&panel.store_id, Pay { method: "card".into() })
-    .await?;
+// Dispatch a child command through the root's channel by echoing the child's
+// store_id — read once when the handle was made, so it names *this* store even
+// if the store has since unmounted. Never construct or parse store ids. The
+// target store type is inferred from `Pay`'s `Command<CheckoutPanelStore>`
+// impl — no turbofish.
+let Some(target) = panel.store_id() else { return Ok(()) };  // nothing mounted there
+let reply = mounted.command_on(&target, Pay { method: "card".into() }).await?;
 assert!(reply.ok);
 ```
 
@@ -558,7 +578,8 @@ if !reply.ok { show(reply.message.as_deref().unwrap_or("rejected")); }
 let _: generated::musubi::NoReply = mounted.command(Refresh {}).await?;
 
 // Reply-before-patch (BDR-0009): a resolved reply does NOT mean the
-// corresponding state change has been applied — watch `updates()` for that.
+// corresponding state change has been applied — subscribe to the node that
+// carries it for that.
 // Errors surface as MusubiError::Command / ::NotConnected / ::Timeout
 // (docs/rust-client.md §11).
 ```
@@ -577,8 +598,8 @@ tokio::spawn(async move {
 
 // Child-store event, no extra machinery: same registry, child's store_id.
 use generated::demo::stores::checkout_panel_store::ReceiptReadyPayload;
-let mut receipts =
-    mounted.events::<ReceiptReadyPayload, _>(&state.checkout_panel.store_id);
+let panel_id = state.checkout_panel().store_id().expect("the panel is mounted");
+let mut receipts = mounted.events::<ReceiptReadyPayload, _>(&panel_id);
 ```
 
 Events are transient (BDR-0032): no ack, no replay; a cold client can miss
@@ -587,13 +608,14 @@ mount-time events, and reconnect re-fires them (the server re-runs `mount`).
 ### 3.8 Uploads
 
 ```rust
-// The state slot stays inert: `attachments` deserializes from the wire marker
-// as UploadSlot { name }, and that name is the key to the live handle. The
-// handle carries both planes — the server-driven data plane (snapshot(),
-// updates(), one item per envelope that touched it) and the client-driven
-// control plane (select / start / cancel / reset) — docs/rust-client.md §10.
-let slot_name = &state.attachments.name; // "attachments"
-let attachments = mounted.upload(&StoreId::root(), slot_name);
+// The state slot stays inert: `attachments()` is an `UploadSlotState`, a leaf
+// that never notifies, and it knows **both** halves of the `(store_id, name)`
+// upload key — so the walk from the tree to the live handle is one step with no
+// bare strings. The handle carries both planes — the server-driven data plane
+// (`value()` / `subscribe()`, one item per envelope that touched it) and the
+// client-driven control plane (select / start / cancel / reset) —
+// docs/rust-client.md §10.
+let Some(attachments) = mounted.upload_at(&state.attachments()) else { return Ok(()) };
 
 let entries = attachments
     .select(vec![UploadFile::new("spec.pdf", "application/pdf", bytes)])

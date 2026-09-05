@@ -105,8 +105,11 @@ crate choice (§2.3).
 | `phoenix-channel` | `futures-channel` / `futures-util` | `0.3` | inbox, oneshot replies, `select!`, `BoxFuture` |
 | `phoenix-channel` | `tracing` | `0.1` | protocol-layer diagnostics |
 | `musubi-client` | `phoenix-channel` | path | protocol layer (§3) |
-| `musubi-client` | `serde` (derive), `serde_json` | `1` | wire types, shadow document (§4.2) |
-| `musubi-client` | `json-patch` | `4` | RFC 6902 application (§4.1) |
+| `musubi-client` | `musubi-state` | path | the retained reactive state tree, and the wire vocabulary it names (`docs/rust-reactive-state.md` §1.3) |
+| `musubi-client` | `serde` (derive), `serde_json` | `1` | wire types, envelope decoding |
+| `musubi-state` | `serde` (derive), `serde_json` | `1` | the tree is built from and projected back to `Value` |
+| `musubi-state` | `slotmap` | `1` | the generational node arena — what makes a `State<T>` that outlived its node read as dead |
+| `musubi-state` | `thiserror` | `2` | `TreeError` / `ReadError` |
 | `musubi-client` | `futures-*` | `0.3` | as above |
 | `musubi-client` | `tracing` | `0.1` | `warn!`/`debug!` in §7/§10/§11 |
 | both | `thiserror` | `2` | `Display`/`Error` derives for §11 (idiomatic error types without hand-written impls) |
@@ -114,9 +117,12 @@ crate choice (§2.3).
 | `musubi-client-tokio` | `tokio` | `1` (rt, time, net) | `TokioSpawner`/`TokioTimer` |
 | `musubi-client-tokio` | `tokio-tungstenite` | `0.24` (rustls-tls-webpki-roots) | `TungsteniteConnector` |
 
-`arc-swap` is deliberately **not** a dependency — see §2.4. `musubi-client`'s
-tree contains no runtime, which is what a GUI embedder needs; tokio embedders
-add `musubi-client-tokio`.
+`arc-swap` is deliberately **not** a dependency — see §2.4 — and neither is
+`json-patch`: the pointer walk is the client's own, in `musubi-state`, against
+the retained tree (`docs/rust-reactive-state.md` §1.4). Neither `musubi-client`'s nor
+`musubi-state`'s dependency tree contains a runtime, which is what a GUI
+embedder needs; tokio embedders add `musubi-client-tokio`. Both are enforced in
+CI by `! cargo tree -p <crate> -i tokio`.
 
 ---
 
@@ -243,9 +249,9 @@ means each message is handled to completion before the next is dequeued, so no
 other message can observe a half-applied envelope, and the order the actor sees
 is a single global sequence rather than a per-source race resolved by `select!`
 branch priority. That covers the gaps *between* messages; the one inside a
-single envelope is §4.3's job — the engine stages an envelope and commits it
-only once the state has deserialized, so a rejected envelope leaves nothing
-half-applied either.
+single envelope is the transaction's job — one envelope is one transaction
+against the retained tree, and a rejected one rolls back whole
+(`docs/rust-reactive-state.md` §3.6).
 
 Note what that total order is *not*: it is **inbox** order, not frame order, so
 it does not buy reply-before-patch ordering (BDR-0009), which is **not** a
@@ -254,7 +260,8 @@ task that awaits the push's oneshot, while a `"patch"` push reaches it through
 the per-channel forwarding task; two independently woken tasks feeding one inbox
 means inbox order is executor-scheduling dependent, not frame order. §6.2 and
 `Mounted::command`'s `# Ordering` section are the contract: a resolved reply
-implies nothing about applied state. Read state from `snapshot()`/`updates()`.
+implies nothing about applied state. Read state from `Mounted::state()`, and
+subscribe to the node whose settling you actually care about.
 
 **Head-of-line blocking.** "One message to completion" is also the cost: the
 handler runs *on* the actor task, so an `.await` inside one stalls the whole
@@ -279,14 +286,19 @@ not slow the socket, and does not make the server send less. What that costs
 depends on the kind of subscription, and the two kinds are deliberately
 different:
 
-- **Latest-value** (`updates()`, `status_updates()`). One value, not a queue:
-  every item is a whole root that subsumes the one before it, so a stalled
-  consumer costs one slot and one waker, whatever the envelope rate. Falling
-  behind is not an error, it is the contract — the next poll yields the current
-  value and the skipped ones are gone. Nothing reads intermediates: v1 publishes
-  one whole-root snapshot per envelope and no client-side fold consumes the
-  ones in between.
-- **Queue** (`events()`, upload `updates()`, the actor's own inbox, and the
+- **Callback, no queue at all** (`State::subscribe` and every other handle's
+  `subscribe`). A subscriber runs synchronously at the notification point, on
+  the actor task, and nothing is buffered on its behalf. The contract is
+  therefore *schedule, do not compute*: a callback that blocks is head-of-line
+  blocking (above), and a callback that only posts to its own UI queue costs the
+  actor a function call. This is the shape state delivery takes now
+  (`docs/rust-reactive-state.md` §2.6).
+- **Latest-value** (`Mounted::status()`'s `into_stream()`). One value, not a
+  queue: every item subsumes the one before it, so a stalled consumer costs one
+  slot and one waker, whatever the rate. Falling behind is not an error, it is
+  the contract — the next poll yields the current value and the skipped ones are
+  gone. Nothing reads intermediates.
+- **Queue** (`events()`, `Upload::into_stream()`, the actor's own inbox, and the
   socket actor's outbox).
   `futures_channel::mpsc::unbounded`, because these items are discrete
   occurrences and none of them stands in for another. Here the old cost is
@@ -300,44 +312,50 @@ different:
   is what bounds a command whose frame is still waiting to go out.
 
 The consequence worth stating for consumers of both: an event is delivered with
-no promise about which state its `updates()` neighbour is showing, because that
-one may already have coalesced past the envelope the event rode in on. Read
-state from the state stream, and treat an event as a notification, not a diff.
+no promise about which state a neighbouring status stream is showing, because
+that one may already have coalesced past the envelope the event rode in on. Read
+state from the tree, and treat an event as a notification, not a diff.
 
 State delivery to the embedder is **not** through the actor's inbox. Each
-mounted root owns a latest-value cell per subject (`src/latest.rs`):
+mounted root owns the retained tree its envelopes are applied to, plus one
+latest-value cell for the mount status (`src/latest.rs`):
 
 ```rust
 pub(crate) struct RootCell<St: Store> {
-    state: Latest<Arc<St::State>>,
+    tree: StateTree,
     status: Latest<MountStatus>,
     ...
 }
 ```
 
-Hand-rolled, ~120 lines: a `std::sync::Mutex` over `{value, version, closed,
-wakers}`, a `set` that overwrites and wakes, and a receiver that is a `Stream`
-yielding the current value when its seen version is behind and parking its waker
-otherwise. Not `tokio::sync::watch` — this crate is runtime-free (§2.1) — and
-not `arc-swap`: a read happens once per render and a write once per accepted
-envelope, so the uncontended-mutex cost is irrelevant and it drops a dependency.
+The status cell is hand-rolled, ~120 lines: a `std::sync::Mutex` over
+`{value, version, closed, wakers, callbacks}`, a `set_with` that decides an edge
+and wakes, and a receiver that is a `Stream` yielding the current value when its
+seen version is behind and parking its waker otherwise. Not
+`tokio::sync::watch` — this crate is runtime-free (§2.1) — and not `arc-swap`: a
+read happens once per render and a write once per liveness edge, so the
+uncontended-mutex cost is irrelevant and it drops a dependency.
 
-Three properties fall out of that shape:
+Three properties fall out of that shape, and each has a tree analogue:
 
-- **Coalescing is structural.** An intermediate value is gone the moment the
-  next write lands, so no consumer can observe one, and a consumer that fell
-  behind runs its body once rather than once per skipped envelope.
-- **The first poll replays.** A receiver starts behind the cell, so subscribing
-  is enough to be current; `snapshot()`/`status()` remain for synchronous reads
-  (a first paint), not as a race a caller has to close by subscribing first.
-- **Closing is the terminal signal.** Teardown closes the cell: a receiver still
-  takes a value it had not seen, then the stream ends, while `snapshot()` goes
-  back to `None` and `status()` to `Connecting` — the pre-initial baseline (§7,
-  §9). A reconnect closes nothing and empties nothing.
+- **Coalescing is structural** for the status cell: an intermediate value is
+  gone the moment the next write lands. The tree does not coalesce, it
+  *settles*: a transaction that puts a node's value back where it was notifies
+  nobody at all (`docs/rust-reactive-state.md` §9.2).
+- **The first poll replays** — for the status cell's stream shape only.
+  `subscribe`, on either plane, never fires at registration: the current value
+  is `value()`, and subscribe-then-read can repeat one idempotent assignment but
+  cannot miss an edge.
+- **Closing is the terminal signal.** Teardown closes both: the status stream
+  takes a value it had not seen and then ends, and the tree is emptied and
+  closed, which notifies every node subscriber once before every view on it
+  reads `is_live() == false` (§7, §9). A reconnect closes nothing and empties
+  nothing.
 
-There is **no callback registry**: the only subscription surface is `Stream`s
-(§7). Writes happen on the actor task; embedders that need thread affinity
-(gpui) hop inside their own consuming task (`cx.spawn` + `while let`).
+Writes happen on the actor task, and so do the callbacks they owe — with no lock
+held, so a callback may read, subscribe, or drop its own subscription. Embedders
+that need thread affinity (gpui) schedule from inside the callback rather than
+computing there.
 
 ---
 
@@ -487,92 +505,29 @@ join-ok/close/error (§9).
 
 ## 4. Patch engine
 
-### 4.1 RFC 6902 subset
+> **The data plane is specified in `docs/rust-reactive-state.md`.** An envelope
+> is one **transaction** against a retained reactive state tree; §4.1 below is
+> the map into that document. §4.4 (envelope validation) and §4.5 (version
+> discipline) are specified here and are normative.
 
-Application is delegated to the **`json-patch` crate** (serde ecosystem,
-RFC 6902 + 6901 complete) — no in-house pointer/patch implementation. The
-Musubi layer adds exactly two things on top:
+### 4.1 Where the data plane is specified
 
-- **Op allowlist before applying.** Only `add` / `remove` / `replace` are legal
-  (BDR-0014: pure minimal structural diff — the server never emits
-  `move`/`copy`/`test`, and never falls back to a subtree replace). Any other
-  `op` is a protocol violation ⇒ `PatchError::UnsupportedOp` ⇒ treated as a
-  version-mismatch-class failure (§9). The allowlist is enforced at envelope
-  decode (`PatchOp` is a three-variant enum), so `json_patch::patch` never even
-  sees a disallowed op.
-- **Error mapping.** `json_patch::PatchError` (bad pointer, index out of
-  bounds, traversal into a non-container, ...) maps to `PatchError::Apply` and
-  aborts the envelope; the previous tree must remain intact — see 4.3.
-  `json_patch::patch` is atomic on failure, which is exactly the §4.3
-  requirement.
+| Concern | Where |
+|---|---|
+| Pointer walk (RFC 6902/6901) | The client's own, in `musubi-state` (`docs/rust-reactive-state.md` §1.4). The op allowlist is enforced at envelope decode, so `move`/`copy`/`test` never reach the tree, and it is a version-mismatch-class failure (§9). `TreeError::Pointer` and `TreeError::Index` map onto `PatchError::Apply` (§11). |
+| The document | The tree is authoritative and retained; ops reconcile into it, and the only whole-root deserialize is the drift check on a root `replace ""` (reactive-state §4.4). |
+| Apply and settle | One transaction: `ops` land before `stream_ops`, drift is validated inside the open transaction, and the commit settles, diffs and collects. Rolling back is O(diff), not a whole-tree clone. The 13-step cycle is reactive-state §3.6. |
+| Hydration and the store index | Neither is a phase. A stream slot **is** a materialized collection node, a store node's owner is resolved once at node creation, and the `StoreId -> node` map is maintained incrementally (reactive-state §3.5). Two on-demand projections — hydrated and wire — are what a consumer reads through. |
 
-Pointer unescaping, array-index rules (`-`, `index == len`, leading-zero
-rejection) and sequential left-to-right application are the crate's contract,
-verified end-to-end by the wire fixtures (§12) rather than re-specified here.
+The four wire marker shapes are classified by the same-shape rules, one crate
+down:
 
-### 4.2 Decision: shadow `serde_json::Value` document, re-deserialize per accepted envelope
-
-Two candidate architectures:
-
-| | Shadow-doc (**chosen for v1**) | Typed in-place |
-|---|---|---|
-| Model | Keep the authoritative wire tree as `serde_json::Value`; apply ops to it; then deserialize the (hydrated) value into `Arc<S::State>` | Generate per-store code that resolves a JSON Pointer to a typed field and mutates it |
-| Correctness risk | Low — one pointer implementation, exercised by fixtures | High — every generated struct needs a pointer-walk arm; enum/`Option`/`Vec` boundaries multiply cases; `add` on a struct field is meaningless |
-| Cost per envelope | O(state size) deserialize, regardless of diff size | O(diff size) |
-| Interaction with §5/§7 hydration | Natural: hydrate the `Value` before deserializing | Awkward: streams live outside the typed tree |
-| `Arc` snapshot semantics | Free — each cycle produces a fresh owned `S::State` | Needs interior mutability or full clone anyway |
-
-Choose the shadow document. The tradeoff is explicit and accepted: **a full
-deserialize of the root state on every accepted envelope**, even for a
-one-field `replace`. Musubi pages are page-scoped, human-sized trees and the
-server already re-renders the whole page per cycle; a per-cycle deserialize of
-a few KB is not the bottleneck. The escape hatch, if profiling ever says
-otherwise, is per-store-node memoization: cache `store_id -> Arc<ChildState>`
-and skip re-deserializing subtrees whose `Value` pointer is untouched by this
-envelope's ops (the same invalidation set already computed for snapshot
-invalidation). That optimization is additive and does not change the API.
-
-### 4.3 Application order and atomicity
-
-An envelope is applied in two phases, with the typed deserialize between them.
-Everything that can fail happens before anything moves.
-
-**Stage** — against a working copy, mutating nothing:
-
-1. Validate the envelope (§4.4) and the version (§4.5).
-2. Apply `ops` to a copy of the shadow doc via `json_patch::patch`, which is
-   atomic: on any error the copy is dropped, the previous tree stays
-   authoritative, and the client enters version-mismatch recovery (§9).
-3. Rebuild `store_id -> pointer` off the working copy.
-4. Fold `stream_ops` in array order (§5) over copies of the streams those ops
-   name — only those, and a `reset` copies nothing.
-5. Hydrate the working copy in place (§4.6).
-
-**Deserialize** — the last step that can fail:
-
-6. Deserialize the hydrated tree and publish the new `Arc<S::State>` to the
-   `updates()` senders. A tree that does not match the generated types is
-   codegen drift (§11): the staged work is dropped whole, so the engine is
-   still on the previous version, its shadow doc and streams are untouched, no
-   upload subscriber has heard about the envelope, and recovery (§9) is a
-   restart rather than a repair.
-
-**Commit** — nothing here can fail:
-
-7. Adopt the tree, the index and the stream fold, and set
-   `version = envelope.version`.
-8. Apply `upload_ops` into the root's upload registry, in array order (§10) —
-   the first thing outside the engine to learn the envelope was accepted — then
-   prune stream/upload state for vanished `store_id`s (BDR-0011).
-9. Dispatch `events` (§8) into the `events()` senders — after state
-   publication.
-
-The working copy is not an extra copy: hydration used to allocate one and now
-rewrites this one in place, so a cycle still allocates one tree. What commit
-pays instead is a *replay* — the ops are applied a second time, to the shadow
-doc, because the copy they were validated on has since become the hydrated
-state. That is a delta-sized cost, and the same ops on the same tree cannot
-fail twice.
+| Marker | Shape |
+|---|---|
+| Store node | any object containing `"__musubi_store_id__": ["seg", ...]` (root `[]`) |
+| Stream slot | `{"__musubi_stream__": "<name>"}` — exactly one key |
+| Upload slot | `{"__musubi_upload__": "<name>"}` — exactly one key |
+| Async value | `{"__musubi_async__": true, "status": ..., "result": ..., "reason": ...}` |
 
 ### 4.4 Envelope validation
 
@@ -621,43 +576,11 @@ it off the version it is stuck on.
 
 ### 4.6 Wire-tree markers and the hydration pass
 
-The wire tree carries four marker shapes:
-
-| Marker | Shape |
-|---|---|
-| Store node | any object containing `"__musubi_store_id__": ["seg", ...]` (root `[]`) |
-| Stream slot | `{"__musubi_stream__": "<name>"}` — exactly one key |
-| Upload slot | `{"__musubi_upload__": "<name>"}` — exactly one key |
-| Async value | `{"__musubi_async__": true, "status": ..., "result": ..., "reason": ...}` |
-
-Because Rust is nominal, the generated `State` structs cannot resolve a stream
-marker to a `Vec<Item>` on their own — the marker does not carry a `store_id`,
-and serde derive has no ambient context. Therefore, before deserializing, the
-engine runs one **hydration walk** over the patched shadow doc, tracking the
-nearest enclosing `__musubi_store_id__`, and rewrites:
-
-- `{"__musubi_stream__": name}` → the materialized JSON array for
-  `(store_id, name)` (§5).
-- `{"__musubi_upload__": name}` → **left untouched**; the generated field type
-  is the inert `UploadSlot { name }`, which deserializes from the marker as-is.
-  Live upload state is folded into the registry instead and read through
-  `Mounted::upload(&store_id, name)` (§10).
-- Async nodes are left alone: `AsyncResult<T>` derives `Deserialize` from the
-  wire shape directly (§6.1), so no rewriting is needed. Markers *inside* an
-  async node's `result` are still rewritten by the same walk, which is what
-  makes `stream_async` render as `AsyncResult<Vec<Item>>`.
-
-v1 hydrates one owned copy per cycle, on top of the deserialize copy: the
-working copy §4.3 stages the envelope on is the tree the walk rewrites, so the
-walk itself allocates nothing beyond the arrays it substitutes. The known
-optimization, deferred: implement hydration as a `serde::Deserializer` adapter
-wrapping `&Value` that substitutes stream arrays without a tree copy at all —
-but ~300 lines of `Deserializer` plumbing. Not worth it before there is a
-profile.
-
-The shadow doc itself is **never** hydrated: patch pointers address the wire
-tree, so the wire tree must stay pristine across cycles. Only the working copy
-is rewritten, and it is dropped at the end of the cycle.
+Replaced — see the §4.1 table. The four marker shapes are unchanged (listed
+there); what is gone is the *walk*. A stream slot is a `Collection` node whose
+owner was resolved once at creation, so no marker is ever re-resolved, and the
+two projections that replace the walk — hydrated and wire — are on-demand rather
+than once per envelope (`docs/rust-reactive-state.md` §3.5).
 
 ---
 
@@ -665,14 +588,19 @@ is rewritten, and it is dropped at the end of the cycle.
 
 Per `docs/streams.md` and BDR-0018, the server keeps no ordered key list, makes
 no upsert decision, and does no limit trimming. All of it is the client's job.
-This is the single most behavior-sensitive part of the port; it must match
-`packages/client/src/streams.ts` op-for-op.
 
-State: `HashMap<(StoreId, StreamName), Vec<StreamEntry>>` where
-`StreamEntry { item_key: String, item: Value }`. (`StoreId` is the newtype
-over `Vec<String>` from §7, `Eq + Hash` — hash the tuple directly; the TS
-`json(store_id) + "\0" + name` string key is an implementation detail of a JS
-`Map`, not a wire format.)
+**Where the list lives.** A stream slot **is** a node on the retained tree:
+`NodeKind::Collection { name, owner, items }`, where `items` is the ordered
+`Vec<(item_key, NodeId)>` — every item is a subtree with its own identity, not
+an inline `Value`. `stream_ops` reconcile into it directly, resolved through the
+tree's `(StoreId, stream) -> NodeId` index and applied inside the same
+transaction as `ops`, after them: the first envelope's `replace ""` is what
+creates the slot that the same envelope's inserts fill. There is no separate
+stream store beside the tree. The normative specification of the node — keyed
+item identity, `NodeId` survival across an upsert, the per-transaction
+carry-over table that makes `reset: true` behave as a keyed diff, and the
+ordering rule (a pure reorder notifies the collection, not the items) — is
+`docs/rust-reactive-state.md` §3.1.
 
 Wire ops, each stamped with `store_id` by the page server and flushed
 parent-first by `store_id` length:
@@ -685,15 +613,25 @@ parent-first by `store_id` length:
 
 `ref` is the per-store slot ref; the client ignores it and keys by
 `(store_id, stream)`. Within one store's flush the order is always
-`[reset?] ++ inserts ++ deletes`.
+`[reset?] ++ inserts ++ deletes`. An op naming a slot the tree does not have is
+dropped — every declared stream renders its marker every cycle
+(`docs/streams.md`), so the only window is a store unmounting in the cycle it is
+inserted into, and that store's subtree is gone by the end of the same envelope.
+
+The per-op list semantics below are the behavior-sensitive part of the port:
+they must match `packages/client/src/streams.ts` op-for-op, because both clients
+have to materialize the same list.
 
 Semantics:
 
 - `reset` ⇒ the list becomes empty.
 - `delete` ⇒ retain entries whose `item_key != op.item_key`.
 - `insert` (**upsert-then-position**, in this exact order):
-  1. If an entry with the same `item_key` exists, **remove it first**. The item
-     is repositioned, not updated in place.
+  1. If an entry with the same `item_key` exists, **remove it first**. The list
+     entry is repositioned rather than edited in place; the item's *node* is
+     reused and reconciled into, so a view bound to that row keeps its
+     subscribers and hears only about the fields that actually changed
+     (`docs/rust-reactive-state.md` §3.1).
   2. Resolve the index against the **post-removal** length `len`:
      `at == -1` ⇒ `len` (append); `at <= 0` (0 or any other negative) ⇒ `0`
      (prepend); `at > 0` ⇒ `min(at, len)`.
@@ -706,30 +644,39 @@ Semantics:
   (including `at == -1` and `at > 0`) drop `overflow` from the **front**.
   The server-side convention writes negative limits (`-100`); the client does
   not read that sign.
-- **Owner disappearance**: no `reset` is emitted when a store unmounts. After
-  every envelope, drop every stream key whose `store_id` is absent from the
-  freshly rebuilt store index (BDR-0011 fresh-mount semantics: reappearance
-  starts empty).
-- Async streams: an async wire `result` may itself be a stream marker;
-  materialize to `AsyncResult<Vec<Item>>` by hydrating inside the async node.
+- **Owner disappearance**: no `reset` is emitted when a store unmounts. This is
+  now **structural**: a collection node is a child of its owning store node, so
+  it is freed with that store's subtree and there is no pruning walk left
+  (BDR-0011 fresh-mount semantics: reappearance starts empty). Upload pruning
+  survives, against the tree's live store ids
+  (`docs/rust-reactive-state.md` §3.5).
+- Async streams: an async wire `result` may itself be a stream marker; it
+  becomes a collection node under the async node, which is what makes
+  `stream_async` render as `AsyncResult<Vec<Item>>` and what
+  `AsyncState::ok_stream()` navigates to.
 
-Change notification: a store counts as changed if its indexed node identity
-changed, **or** its `store_id` appears in this envelope's `stream_ops`
-(`touched_store_keys`), **or** it had stream keys before and none after
-(prune), **or** its `store_id` appears in `upload_ops`.
+**Change notification: per node.** Notification is semantic equality over the
+retained tree (`docs/rust-reactive-state.md` §1.2, §9): a node's subscribers
+are called when *that node's* value changed, ancestors follow from their
+children, and untouched siblings hear nothing. Two consequences are worth
+naming, because a whole-root publisher would have to special-case both:
 
-**Not implemented.** There is no per-store subscription: `Mounted::updates`
-publishes one whole-root snapshot per envelope, so an upload-only cycle already
-wakes every root subscriber, and the engine computes no change set. The rule is
-specified here because a per-store snapshot cache would need it. Per-**upload**
-notification *is* implemented: an `Upload`'s `updates()` stream fires for
-exactly the ops that touched it (§10).
+- **An upload cycle wakes no state subscriber.** An upload slot is an inert leaf
+  (§3.4 there), so a 100-chunk upload costs zero state-plane notifications. The
+  upload handle's own subscribers fire on the upload plane.
+- **A stream edit reaches the collection node and nothing else.** A collection's
+  ordered `(item_key, value)` vector **is** its semantic value, so any edit to
+  it — including a pure reorder — is a change to the collection node and to its
+  ancestors. The keyed edits themselves reach an incremental list adapter as the
+  second argument of `StreamState::subscribe`.
 
-Exposure to the app: the hydration pass substitutes the materialized item
-values (in list order) for the stream marker, so the generated field type is a
-plain `Vec<Item>` on the state struct. Item deserialization failures are
-per-stream fatal for the cycle (§11) — the server is authoritative and a
-mismatch means codegen drift.
+Exposure to the app: `StreamState<T>::value()` still yields `Vec<T>`, and the
+snapshot struct a generated bundle emits for a `stream(T)` field is still
+`Vec<T>` — the collection projects back to a JSON array. What is new is that the
+*handle* is keyed: `by_key`, `keys`, `at`, `iter`, and an item's `NodeId`
+surviving a `reset: true` refresh (§3.1 there). Item deserialization failures
+stay per-read (§11) rather than per-cycle, because materialization is now
+per-read.
 
 ---
 
@@ -784,12 +731,17 @@ renders the key (as `null` when not failed). Consumers matching only on the
 payload write `AsyncResult::Ok { result, .. }`.
 
 `__musubi_async__` needs no handling: an internally-tagged enum on `status`
-ignores unknown sibling keys. The detection predicate above is still what the
-*hydration* walk uses to recognize an async node.
+ignores unknown sibling keys. The detection predicate above is what the tree's
+classifier uses to recognize an async node.
 
 `result` is resolved **recursively** through the same marker rules — it can be a
-stream marker, a store node, an array, or a plain object — which is handled
-naturally because hydration runs before deserialization.
+stream marker, a store node, an array, or a plain object — because it is an
+ordinary child node that reconciles on its own. The reactive counterpart of this
+value type is `AsyncState<T>`, whose `status()` is part of the async node's own
+semantics: a `loading -> ok` flip notifies the async node even when the result
+did not move, and an `ok -> loading` flip that preserved the previous payload
+notifies the async node and **not** the result subtree
+(`docs/rust-reactive-state.md` §3.3).
 
 Deliberately no `Default`/`unwrap_or_default` conveniences: `Loading` with
 `result: None` and `Ok` are semantically different states and the app must
@@ -877,8 +829,8 @@ patch it caused and implies nothing about applied state — neither that the pat
 has landed nor that it has not. There is deliberately **no**
 `command_and_wait_for_patch` helper in v1 — a `{:noreply}` command still
 patches out of band and there is no correlation id to wait on, so any such
-helper would be a race dressed as an API. Apps that need "state settled" watch
-the snapshot stream for the condition they care about.
+helper would be a race dressed as an API. Apps that need "state settled" put a
+subscription on the node whose condition they care about.
 
 Bulk rejection of pending commands: `Disconnected` on channel close/error,
 `Unmounted` on teardown, `VersionMismatch` on recovery, and the join failure
@@ -901,7 +853,8 @@ Shape: `{"store_id": [...], "name": "toast", "payload": <wire term>}`.
 - Multiple `events()` streams per key; events with no live stream are silently
   dropped.
 - Dispatched exactly once per event, **after** ops/stream_ops/upload_ops are
-  applied and the state publication in §4.3. Dispatch is a send into each live
+  applied and the state notification (`docs/rust-reactive-state.md` §3.6 steps
+  9 and 11). Dispatch is a send into each live
   stream's sender; closed receivers are pruned on the way. The payload is
   wrapped in an `Arc` for the fan-out and each subscription deserializes its
   `E` from the shared value, so a second subscriber costs a refcount bump
@@ -984,9 +937,9 @@ storage are runtime decisions this crate does not make.
 **Mount.** The registry insert and the join happen first, then the read is
 *spawned*, so a slow store delays the seed and never the revalidation. When the
 read produces an entry whose `buster` matches and whose age is within
-`cache_gc_time`, the actor adopts it with `PatchEngine::seed` — document, index
-and prune, **version stays 0** — publishes it, and resolves every mount waiting
-on the root. The live initial patch is still required to be
+`cache_gc_time`, the actor seeds the root from it — the tree is **built** from
+the cached wire value, in one transaction, **version stays 0** — notifies, and
+resolves every mount waiting on the root. The live initial patch is still required to be
 `base_version: 0, version: 1`, and its whole-root `replace ""` swaps the seed
 out in one op.
 
@@ -1002,16 +955,18 @@ Five things drop a seed rather than showing it:
   followed by a re-mount of the same id under different params would otherwise
   be seeded from the first mount's slot. `ActorMsg::CacheSeed` carries the key
   it was issued for and is dropped when that is no longer the root's.
-- A tree the generated types reject — a shape an older build wrote —
-  is discarded via `PatchEngine::discard_seed`, the slot is evicted, and the
-  mount goes on waiting for the cold path. This is deliberately **not**
-  `MusubiError::Decode`: nothing is diverged, the live patch is still coming.
+- A tree the generated types reject — a shape an older build wrote — fails the
+  drift check *inside* the seeding transaction, so it is **rolled back** rather
+  than undone by a second call; the slot is evicted and the mount goes on
+  waiting for the cold path. This is deliberately **not** `MusubiError::Decode`
+  reaching the embedder: nothing is diverged, the live patch is still coming.
 - Streams are not cached (`stream_ops` are not part of the tree), so a seeded
-  stream slot hydrates to `[]` until the live envelope refills it — exactly what
+  stream slot reads as `[]` until the live envelope refills it — exactly what
   the TypeScript client does, which seeds `root` without seeding `streams`.
 
-**Writes.** After every accepted envelope is published, the root's document is
-queued for its slot under a trailing throttle (`CACHE_WRITE_THROTTLE`, 1s): a
+**Writes.** After every accepted envelope is published, the root's **wire**
+projection (`StateTree::to_wire`, markers intact) is queued for its slot under a
+trailing throttle (`CACHE_WRITE_THROTTLE`, 1s): a
 burst of envelopes costs at most one write per interval, always the latest tree,
 fire-and-forget.
 
@@ -1114,32 +1069,29 @@ pub trait Event<S: Store>: DeserializeOwned + Send + 'static {
 pub enum MountStatus { Connecting, Live, Reconnecting }
 
 impl<St: Store> Mounted<St> {
-    /// `None` until the first publish, and again after teardown. A reconnect
-    /// keeps the last-good tree — see the note below and §9.
-    pub fn snapshot(&self) -> Option<Arc<St::State>>;
-
-    /// The latest state, and every later one the consumer keeps up with —
-    /// latest-value, not a queue (§2.4). The first poll replays `snapshot()`,
-    /// a consumer that fell behind gets the current state and never the ones
-    /// it missed, and the subscription surface is a `Stream`, not a callback:
-    /// dropping the stream unsubscribes.
-    #[must_use]
-    pub fn updates(&self) -> impl Stream<Item = Arc<St::State>> + Send + 'static;
+    /// This root's state, as the root view of its retained reactive tree —
+    /// a handle, not a value, and never an `Option` (the root node always
+    /// exists). `state().revision() == 0` is "nothing has landed yet";
+    /// `!state().is_live()` is "torn down". Navigation is generated
+    /// (`state().title()`), materialization is `value()`, and observation is
+    /// `subscribe(..)`, which hands back a RAII `Subscription`.
+    /// `docs/rust-reactive-state.md` §2.4 is the surface.
+    pub fn state(&self) -> State<St::State>;
 
     /// BDR-0033: `Connecting` until the first *accepted* initial patch (a
     /// cache seed does not count), `Live` after, `Reconnecting` from a socket
     /// drop / heartbeat timeout / version-gap recovery until the rejoin's
     /// fresh initial patch lands. Terminal outcomes (rejected join, unmount,
     /// disconnect) stay on the mount error path — no error arm here.
-    pub fn status(&self) -> MountStatus;
-
-    /// The current status, then every edge the consumer keeps up with —
-    /// writes are edges only, delivery is latest-value. Same contract as
-    /// `updates()`: the first poll replays `status()`, dropping the stream
-    /// unsubscribes, and it ends when the root is unmounted or the connection
-    /// disconnected.
-    #[must_use]
-    pub fn status_updates(&self) -> impl Stream<Item = MountStatus> + Send + 'static;
+    ///
+    /// One property, three actions, exactly as on the tree:
+    /// `status().value() -> MountStatus`,
+    /// `status().subscribe(cb) -> Subscription`, and
+    /// `status().into_stream()` for a consumer whose shape is a loop — the same
+    /// subscription in `await` shape, latest-value, edges only, first poll
+    /// replays. Every BDR-0033 rule is unchanged; only the path to it is
+    /// (`docs/rust-reactive-state.md` §5.4).
+    pub fn status(&self) -> StatusState;
 
     pub async fn command<C: Command<St>>(&self, cmd: C) -> Result<C::Reply>;
 
@@ -1156,8 +1108,15 @@ impl<St: Store> Mounted<St> {
     pub fn events<E, T>(&self, store_id: &StoreId) -> impl Stream<Item = E> + Send + 'static
     where T: Store, E: Event<T>;
 
-    /// The live upload handle for `(store_id, name)` — the name is read off
-    /// the state struct's inert `UploadSlot` field. See §10.
+    /// The live upload handle for a slot on this mount's tree — **the way a
+    /// consumer walks from the state tree to the upload plane.** Both halves of
+    /// the `(store_id, name)` key come from the node, so there is no bare string
+    /// and no hand-written `StoreId`. `None` exactly when the slot node is gone.
+    /// See §10 and `docs/rust-reactive-state.md` §3.4.
+    pub fn upload_at(&self, slot: &UploadSlotState) -> Option<Upload>;
+
+    /// The same handle by raw key: the registry primitive, kept for a
+    /// hand-written embedder addressing a slot it never navigated to.
     pub fn upload(&self, store_id: &StoreId, name: &str) -> Upload;
 
     // No unmount method: unmounting is automatic. Dropping the last clone of
@@ -1168,22 +1127,25 @@ impl<St: Store> Mounted<St> {
 Notes on the shape:
 
 - **Idiom baseline.** Builder for construction (reqwest-style) instead of a
-  positional free function; a crate `Result` alias; `Stream`s instead of
-  callback registration (`Subscription` guards are gone — the stream itself is
-  the RAII guard); `#[must_use]` on streams and command futures; generics
-  ordered so the inferable parameter comes last (call sites never need a bare
-  `_` turbofish except `events::<Payload, _>`). Embedders that need thread
-  affinity (gpui) hop inside their own consuming task (`cx.spawn` +
-  `while let`) — a callback API would force the same hop anyway.
-- **`snapshot()` returns `Option`.** It is `None` before the root's first
-  publish — the accepted initial patch, or a cache seed (§6.4) — and `None`
-  again after teardown, which a still-held handle can observe only via
-  `Connection::disconnect` (§9). A reconnect does **not** empty it: the
-  last-good tree keeps rendering and the rejoin's initial patch swaps it
-  atomically. Callers must handle the `None`; there is no panicking accessor.
-- **`status()` answers "am I current", `snapshot()` answers "have I loaded".**
+  positional free function; a crate `Result` alias; one RAII `Subscription` for
+  every observation on the whole API — tree node, mount status, upload handle —
+  so a view keeps all of them in one `Vec`; `#[must_use]` on subscriptions,
+  streams and command futures; generics ordered so the inferable parameter comes
+  last (call sites never need a bare `_` turbofish except `events::<Payload, _>`).
+  A subscriber callback runs on the actor task with no lock held, so the
+  contract is *schedule, do not compute*; embedders that need thread affinity
+  (gpui) schedule from inside the callback.
+- **`state()` is not an `Option`.** The root node always exists, so the question
+  the old `snapshot() -> Option` answered moved onto the view:
+  `revision() == 0` is "nothing has landed yet" — neither an accepted initial
+  patch nor a cache seed (§6.4) — and `!is_live()` is "torn down", which a
+  still-held handle can observe only via `Connection::disconnect` (§9). A
+  reconnect empties nothing: the last-good tree keeps rendering and the rejoin's
+  initial patch is *reconciled* into it, so an unchanged subtree keeps its
+  identity and notifies nobody.
+- **`status()` answers "am I current", the tree answers "have I loaded".**
   The two are deliberately separate (BDR-0033): a reconnect never clears the
-  snapshot, so an idle disconnect is observable only on the status surface.
+  tree, so an idle disconnect is observable only on the status surface.
   The socket layer underneath exposes the connection-wide analogue
   (`PhoenixSocket::status` / `status_updates`,
   `SocketStatus { Connecting, Connected, Reconnecting, Closed }`); this crate
@@ -1200,8 +1162,8 @@ Notes on the shape:
   `pub struct Params {}`. That matters because params are **not** optional
   data: `ChatRoom.Stores.ChatRoomStore` declares
   `attr(:room_id, String.t(), required: true)` and its `mount/2` does
-  `Map.fetch!(params, "room_id")`, so a `json!({})` mount used to fail only at
-  the server. `mount` still validates that the value serialized to a JSON
+  `Map.fetch!(params, "room_id")`, so an untyped `json!({})` mount would fail
+  only at the server. `mount` still validates that the value serialized to a JSON
   object, because `Store` is unsealed and `Params` is only bound by
   `Serialize`. The TS target has no params typing
   (`StoreDef<Module, Shape, Commands, Events>`); that parity gap is recorded in
@@ -1209,20 +1171,23 @@ Notes on the shape:
 - **No `type Commands` / `type Events` on `Store`.** Nothing consumes a sum
   enum; dispatch is per-payload-type via `Command<S>` / `Event<S>`.
 - **No proxy, no dynamic field access, no `keyOf`.** Nominal Rust replaces the
-  TS proxy layer: `snapshot.header.title` is a struct field. Reserved runtime
+  TS proxy layer: `state.header().title()` is a generated accessor, and
+  `.value()` is the one explicit materialization point. Reserved runtime
   member names (`dispatchCommand`, `subscribe`, `handleEvent`, `snapshot`)
   therefore have no collision risk on the state struct, and a declared state
   field cannot be named `__musubi_store_id__` in the first place —
   `Musubi.DSL.Field.validate_reserved!/1` (`lib/musubi/dsl/field.ex`) already
   raises `ArgumentError` at `state do` expansion time for any name starting with
   `__musubi_`. No new codegen guard is needed.
-- **Child store dispatch.** A `Module.state()` field renders as
+- **Child store dispatch.** A `Module.state()` field's snapshot type is still
   `musubi::StoreField<ChildState>` — `{ store_id, #[serde(flatten)] state }`
-  (`docs/rust-codegen.md` §4.5) — so
-  `mounted.command_on(&snap.checkout_panel.store_id, Pay { .. })` is the
-  idiomatic child-command call and `snap.checkout_panel.state.total` reads the
-  child's fields. Store ids are **server-authored**; the client echoes them
-  verbatim and never constructs or parses them.
+  (`docs/rust-codegen.md` §4.5) — and its *handle* is `StoreState<ChildState>`,
+  so `mounted.command_on(&panel_id, Pay { .. })` — with `panel_id` from
+  `state.checkout_panel().store_id()`, an `Option<StoreId>` that is `None` only
+  when nothing is mounted under that handle — is the idiomatic child-command
+  call, and `state.checkout_panel().fields().total()` navigates into the child.
+  Store ids are **server-authored**; the client echoes them verbatim and never
+  constructs or parses them.
 - **Duplicate mounts.** Two `mount::<St>("cart:page", ..)` calls for the same
   `(module, id)` alias one root: the second bumps a refcount and returns a
   second `Mounted` handle over the same channel. The registry insert happens
@@ -1254,20 +1219,28 @@ Notes on the shape:
   no such double-mount, and the TS window is `0` anyway. Refcounted aliasing is
   kept (`Mounted` is `Clone`; the last drop leaves the channel); a configurable
   grace can be added later if a real embedder needs it.
-- **Streams as views.** Materialized streams appear as ordinary `Vec<Item>`
-  fields on the snapshot (§4.6), so there is no separate stream API surface.
+- **Streams are keyed views.** A stream field's snapshot type is still
+  `Vec<Item>`, but its handle is `StreamState<Item>`: `by_key`, `keys`, `at`,
+  `iter`, and a `subscribe` whose callback is handed this transaction's keyed
+  edits (`docs/rust-reactive-state.md` §6.3).
 - **No UI binding layer.** There is no Rust equivalent of `@musubi/react`. A UI
-  integrates against `snapshot()` and `updates()` directly, which is what makes
-  the surface portable across GUI frameworks.
-- **The patch engine is a supported entry point, not an implementation leak.**
-  `PatchEngine`, `PatchEnvelope`, `PatchOp`, `StreamOp`, `UploadOp`, `PushEvent`
-  and `Uploads` are `pub` so an embedder can fold Musubi envelopes without a
-  `Connection` at all — replaying a recorded session, driving a test fixture, or
-  running the protocol over a transport this crate does not own. The TypeScript
-  package sets the precedent: `packages/client/src/index.ts` exports
-  `applyPatch`, `applyStreamOps` and `applyUploadOps` beside `connect`, for the
-  same reason. Semver applies to them like anything else here; they are not
-  `#[doc(hidden)]`.
+  integrates against `state()` and per-node subscriptions directly, which is
+  what makes the surface portable across GUI frameworks. The one adapter that
+  exists, `musubi-gpui`, depends on `musubi-state` alone and never sees an
+  envelope, a socket or a `Mounted`.
+- **The patch engine is not a public entry point.** `PatchEngine`,
+  `PatchEnvelope`, `PatchOp`, `StreamOp`, `UploadOp`, `PushEvent` and `Uploads`
+  are `pub(crate)`. Promising them would drag the tree's whole **write** half
+  into the public API (`StateTree::apply`/`begin`/`close`, `Transaction`, `Notify`,
+  `ChangeSet`, `NodeKind`, `Node`, `SemanticValue`, `TreeError`) — the half most
+  likely to be overturned by implementation — for a capability with no known
+  caller, and AGENTS.md's rule is that there is no promise without a second
+  caller. The TypeScript precedent does not carry over: `applyPatch`,
+  `applyStreamOps` and `applyUploadOps` are pure functions with no identity, no
+  subscribers and no lifetime, so their promise *is* their signature. The Rust
+  equivalent of "read state without wiring it yourself" is `Mounted::state()`,
+  and the write half is `#[doc(hidden)]` in `musubi-state`
+  (`docs/rust-reactive-state.md` §5.5).
 - **`BinaryPush` is re-exported as a test-harness affordance.** The seams
   (`Connector`, `Socket`, `Spawner`, `Timer`, `Frame`, `TransportError`) are
   re-exported so an embedder implements them against `musubi_client` alone
@@ -1335,7 +1308,7 @@ Points worth stating because they are easy to get wrong:
 - The bundle emits `impl ::musubi_client::generated::Store for CartStore`. The
   traits are **not** sealed — a sealed trait could not be implemented from a
   file generated into a consumer crate.
-- `stream(T)` renders as `Vec<T>`, not a marker type: hydration (§4.6)
+- `stream(T)` renders as `Vec<T>` on the snapshot struct, not a marker type: the tree's hydrated projection
   substitutes the array before serde runs. There is no `StreamField`.
 - Uploads render as the inert `UploadSlot` only; the `UploadHandle` family is
   hand-written in `musubi-client` and keyed by `(store_id, name)`, so codegen
@@ -1347,7 +1320,7 @@ There is **no** application-level resync command. Loss recovery *is* the
 reconnect path.
 
 **Transport drop / server-initiated close, with live consumers:**
-keep the last-good tree, index, streams, and last published snapshot rendering;
+keep the last-good tree rendering, whole — nodes, identities, subscribers;
 set `version = 0`; clear the pending-initial-patch waiter; reject pending
 commands with `Disconnected`; and **keep the channel registered so the socket
 layer rejoins it**. On rejoin the server re-runs `mount` (fresh page server,
@@ -1382,20 +1355,21 @@ reached `Live` stays `Connecting` through socket churn; terminal outcomes stay
 on the mount error path. The status is a client-local projection of the
 signals in this section — no wire message carries it, and it never modifies
 the recovery behavior it reports on. One gap follows from having no terminal
-variant: after `Connection::disconnect` the teardown resets each root's cell to
-the pre-initial baseline, so a `Mounted` still held across it reports
-`snapshot() == None` and `status() == Connecting` forever, indistinguishable
-from a root that has not connected *yet* — the ended `updates()` /
-`status_updates()` streams are the terminal signal, and the handle should be
-dropped with the connection.
+variant: after `Connection::disconnect` the teardown resets each root's status
+cell to the pre-initial baseline, so a `Mounted` still held across it reports
+`status().value() == Connecting` forever, indistinguishable from a root that has
+not connected *yet*. The tree is the terminal signal on the state side —
+teardown closes it, so every view reads `is_live() == false` and no later
+transaction can reopen it — as is the ended `status().into_stream()`; the handle
+should be dropped with the connection.
 
 Consequences the embedder must be told about, in rustdoc: reconnect re-runs
 server `mount`, so mount-time push events re-fire and stream contents are
 rebuilt from whatever `mount` re-seeds (`stream(..., reset: true)` /
 `stream_async(..., reset: true)`, BDR-0022). Uploads in flight are lost —
 uploads are not resumable. The reconnect window itself is renderable state:
-`status()`/`status_updates()` report it while `snapshot()` keeps serving the
-last-good tree.
+`status().value()` / `status().subscribe(..)` report it while the tree keeps
+serving the last-good rendering.
 
 ---
 
@@ -1416,28 +1390,37 @@ dependencies point one way — control plane → data plane → vocabulary — s
 ### 10.1 Data plane
 
 `crates/musubi-client/src/uploads/registry.rs`, over the wire types in
-`uploads/ops.rs`. `PatchEngine` folds `upload_ops` into a
+`uploads/ops.rs`. The patch engine folds `upload_ops` into a
 per-root registry (`Uploads`) keyed by `(StoreId, upload_name)` — uploads are
 singletons per store, so that pair is the identity (BDR-0028). The pair is
 hashed directly; the TS `json(store_id) + "\0" + name` string key is an
 implementation detail of a JS `Map`, not a wire format.
 
-The state slot stays inert: hydration leaves `{"__musubi_upload__": name}`
-alone and the generated field type is still `UploadSlot { name: String }`,
-which is what an app reads the handle's key off. Live upload state is reached
-through the handle, never through the state struct:
+The slot on the tree stays inert: it is `NodeKind::UploadSlot { name, owner }`,
+its snapshot type is still `UploadSlot { name: String }`, and because the server
+re-renders the same marker every cycle it **never notifies**. Live upload state
+is reached through the handle, never through the state value, and the walk from
+one plane to the other is one step:
 
 ```rust
-let avatar = cart.upload(&StoreId::root(), &cart.snapshot()?.avatar.name);
+let avatar = cart.upload_at(&cart.state().avatar()).expect("the root is mounted");
 
-let handle = avatar.snapshot();        // UploadHandle, always available
-let mut updates = avatar.updates();    // one item per envelope that touched it
+let handle = avatar.value();                                    // UploadHandle, always available
+let _bar = avatar.subscribe(|handle| set_bar(handle.progress()));
+let mut stream = avatar.clone().into_stream();                  // or the loop shape
 ```
 
-`Upload` is a cheap `Clone` over the live cell, and `snapshot()`/`updates()`
-mirror the `Mounted` surface. A handle is created on first access — before any
-op it reads as idle with the framework defaults — and the same key always
-resolves to the same handle, so it can be taken as soon as the marker appears.
+Both halves of the `(store_id, name)` key come off the slot node — the owner is
+the nearest enclosing store, resolved once when the node was created — so a slot
+declared inside a child store cannot be looked up against `StoreId::root()` by
+accident (`docs/rust-reactive-state.md` §3.4).
+
+`Upload` is a cheap `Clone` over the live cell, and `value()`/`subscribe()`
+mirror every other handle on this API; `into_stream()` is the same subscription
+in `await` shape, and it is a **queue**, not a latest-value cell. A handle is
+created on first access — before any op it reads as idle with the framework
+defaults — and the same key always resolves to the same handle, so it can be
+taken as soon as the marker appears.
 
 Op application (`UploadHandle`, mirroring `applyOps`):
 
@@ -1456,11 +1439,12 @@ failed included — rounded half-up, `0` with no entries. Entries keep insertion
 order (a `Vec`, not a `HashMap`), which is what the TS `Map` iteration order
 gives.
 
-Each touched handle publishes exactly **one** snapshot per envelope, not one
-per op, and an envelope that changes nothing publishes nothing. Handles whose
-store leaves the freshly rebuilt index are pruned alongside streams, which ends
-their `updates()` streams (BDR-0011 fresh-mount semantics; uploads are not
-resumable per BDR-0003). Unmounting the root clears the whole registry.
+Each touched handle publishes exactly **one** value per envelope, not one per
+op, and an envelope that changes nothing publishes nothing. Handles whose store
+has left the tree are pruned against `StateTree::store_ids()`, which ends their
+subscriptions (BDR-0011 fresh-mount semantics; uploads are not resumable per
+BDR-0003). Streams need no equivalent — a collection node is freed with the
+store subtree that owns it. Unmounting the root clears the whole registry.
 
 Both are **recorded**, not merely emptied, exactly as `Mounted::events()`
 records its own closure: a subscription taken *after* a prune or a teardown
@@ -1801,13 +1785,16 @@ No live-server tests in v1. Three layers:
      exactly what a lost push looks like on the wire. Its `expected_state` is
      pinned to the state before the gap, because the client must reject the
      gapped envelope and keep its last good document.
-   - **The replay hydrates before comparing.** `expected_state` is
-     pre-hydration, the snapshot is post-hydration, and the only difference is
-     the stream slots. The suite therefore substitutes each marker with the
-     array that scenario's `stream_ops` materialize to, hand-derived from
-     `packages/client/src/streams.ts` — the behavioural reference — rather than
-     from `streams.rs`, so the two are still being compared and not merely
-     restated. Upload slots are compared as the inert markers they stay.
+   - **The replay hydrates before comparing.** `expected_state` is the
+     server's pre-hydration wire root; what the client reads back through
+     `mounted.state().value::<Value>()` is the tree's hydrated projection, and
+     the only difference is the stream slots. The suite therefore substitutes
+     each marker with the array that scenario's `stream_ops` materialize to,
+     hand-derived from `packages/client/src/streams.ts` — the behavioural
+     reference — rather than from this crate's own reconciliation, so the two are
+     still being compared and not merely restated. Upload slots are compared as
+     the inert markers they stay. A fixture store declares
+     `State = serde_json::Value`, so that `value()` is a total function there.
    - **Two documented asymmetries**, both about frames that are not
      server-authored state:
      - `command_errors` contains one `command` frame with **no `name`**, pushed
@@ -1832,16 +1819,22 @@ No live-server tests in v1. Three layers:
 2. **Pure-unit golden tests**, table-driven, mirroring
    `test/musubi/codegen/type_script/type_renderer_test.exs` in style:
    - Patch layer: op allowlist rejection (`move`/`copy`/`test` ⇒
-     `UnsupportedOp`), `json_patch` error mapping, atomicity on mid-envelope
-     failure. (Pointer semantics themselves are the `json-patch` crate's
-     responsibility — covered indirectly by the wire fixtures.)
-   - Stream materialization: the full `at` × `limit` matrix, including the
-     upsert-then-position ordering, `at == 0` trims from the end vs everything
-     else trims from the front, `limit == 0`, and `limit == null`.
+     `UnsupportedOp`) in `src/envelope.rs`, `TreeError` mapping and atomicity on
+     mid-envelope failure in `src/engine.rs`. Pointer semantics themselves —
+     token unescaping, the array-index rules — are `musubi-state`'s own unit
+     tests, on top of what the wire fixtures exercise.
+   - Stream materialization, now keyed collection reconciliation: the full
+     `at` × `limit` matrix, including the upsert-then-position ordering,
+     `at == 0` trims from the end vs everything else trims from the front,
+     `limit == 0`, and `limit == null` — plus item identity surviving a
+     `reset: true` refresh. In `musubi-state`.
    - `AsyncResult` deserialization incl. `Opaque` reasons and nested markers.
-   - Hydration: markers at every nesting depth, inside arrays, inside async
-     results, and marker-lookalikes (an object with `__musubi_stream__` **plus**
-     another key is *not* a stream slot).
+   - The two projections (hydrated and wire): markers at every nesting depth,
+     inside arrays, inside async results, and marker-lookalikes (an object with
+     `__musubi_stream__` **plus** another key is *not* a stream slot). In
+     `musubi-state`.
+   - Semantic equality and notification: every row of
+     `docs/rust-reactive-state.md` §9. In `musubi-state`.
 3. **Protocol tests over a scripted transport.** A `MockSocket` implementing
    `Socket` plus a `ManualTimer` implementing `Timer` — both in the shared rig
    at `crates/phoenix-channel/tests/common/mod.rs`, which the `musubi-client`
@@ -1873,7 +1866,7 @@ CI):
 | test (MSRV) | the same on toolchain `1.85` — this is the check §1.4 refers to |
 | format | `cargo fmt --all --check` |
 | lint | `cargo clippy --workspace --all-targets -- -D warnings` |
-| runtime-free core | `cargo check -p musubi-client` + `cargo tree -p musubi-client -i tokio` matching nothing (the gpui embedder\'s configuration) |
+| runtime-free core | `cargo check` + `cargo tree -i tokio` matching nothing, for **both** `musubi-client` and `musubi-state` (the gpui embedder's configuration) |
 | codegen smoke test | `mix test --only rust` after the cargo tests, on both toolchain legs — the `docs/rust-codegen.md` §6.5 `cargo check` over the rendered probe bundle, which needs both the BEAM and a Rust toolchain and therefore lives here rather than in the Elixir job |
 | fixture drift | `mix musubi.capture_wire`, then `git add --intent-to-add` + `git diff --exit-code` over `crates/musubi-client/tests/fixtures` — a step of the **Elixir** `test` job, not this one, since it needs the BEAM. The `--intent-to-add` is what makes a brand-new scenario's untracked file count as drift. `mix test` asserts the same gate |
 

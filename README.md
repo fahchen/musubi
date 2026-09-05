@@ -115,17 +115,19 @@ musubi-client-tokio = { path = "../deps/musubi/crates/musubi-client-tokio" }
 The Rust client is a peer of the TypeScript one, not a subset:
 `Connection::mount::<St>` takes the store's generated `Params` struct (one
 field per `attr/3`, so a required mount param cannot be forgotten at the call
-site), `Mounted` exposes `snapshot()`/`updates()`, typed `command(...)`
-dispatch and typed `events(...)` streams, uploads run through
-`Mounted::upload` in both channel and external (direct-to-cloud) mode, an
-opt-in stale-while-revalidate cache hangs off the builder
-(`ConnectionBuilder::cache`), and per-root liveness is observable via
-`Mounted::status()`/`status_updates()`.
+site), `Mounted::state()` hands back a typed view on a **retained reactive
+state tree** — one transaction per envelope, per-node subscriptions, RAII
+tokens — alongside typed `command(...)` dispatch and typed `events(...)`
+streams, uploads run through `Mounted::upload_at` in both channel and external
+(direct-to-cloud) mode, an opt-in stale-while-revalidate cache hangs off the
+builder (`ConnectionBuilder::cache`), and per-root liveness is observable via
+`Mounted::status()`, whose handle carries `.value()` / `.subscribe()`.
 
 `musubi-client` pulls in no async runtime, so a non-tokio embedder such as a
 gpui desktop app skips `musubi-client-tokio` and supplies its own `Spawner`,
-`Timer`, and `Connector`. See [Rust Client](docs/rust-client.md),
-[Rust Codegen](docs/rust-codegen.md), and
+`Timer`, and `Connector`. See
+[Rust Reactive State](docs/rust-reactive-state.md),
+[Rust Client](docs/rust-client.md), [Rust Codegen](docs/rust-codegen.md), and
 [Rust Codegen Example](docs/rust-codegen-example.md).
 
 ## Minimal Example

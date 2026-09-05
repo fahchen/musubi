@@ -216,9 +216,11 @@ Rules:
   snapshots (the BDR-0015 obligation restated as a status-surface contract):
   the status exists to *annotate* stale rendering, never to blank it
 - the Rust client surfaces the same signal per mounted root instead:
-  `Mounted::status()` / `status_updates()` with
+  `Mounted::status()` hands back a handle carrying `.value()` and
+  `.subscribe(cb)` — the same two capabilities as `connection.status()` /
+  `onStatusChange(cb)`, under one name — with
   `MountStatus { Connecting, Live, Reconnecting }` (`docs/rust-client.md`
-  §7, §9)
+  §7, §9; `docs/rust-reactive-state.md` §5.4)
 
 ### Duplicate `(module, id)`
 

@@ -6,8 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 The Elixir package (`musubi`), the JS packages (`@musubi/client`,
-`@musubi/react`) and the Rust crates (`musubi-client`, `musubi-client-tokio`,
-`phoenix-channel`) share this changelog. Per-package version numbers are
+`@musubi/react`) and the Rust crates (`musubi-state`, `musubi-client`,
+`musubi-client-tokio`, `musubi-gpui`, `phoenix-channel`) share this changelog. Per-package version numbers are
 not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
@@ -157,6 +157,65 @@ not in lockstep yet; entries note which surface they affect.
   `transport.rs` — to be copied verbatim into other embedders. Relaunching the
   app renders identity and presence instantly from the last session under a
   "joining" pill, and the live initial patch swaps the seed out atomically.
+- **`musubi-state` (new, Rust)** — **A retained reactive state tree**, and the
+  Rust client's data plane from here on. One mounted root is one `StateTree`: a
+  long-lived arena of nodes whose `NodeId`s outlive every envelope, so a patch
+  is only *input* and whether anyone is notified is decided by comparing each
+  node's semantic value from before the whole transaction with the one it
+  settles on. One server message is one transaction, journalled and therefore
+  atomic in O(diff) rather than O(tree); the `Notify` it hands back owes its
+  subscribers, and dropping it is what runs them — with the tree lock already
+  released, so a callback may read, subscribe, or open its own transaction.
+  `State<T>` is a typed view rooted at one node: `value()` materializes exactly
+  the subtree it is rooted at, `subscribe()` returns one RAII `Subscription`,
+  and any subtree is a full reactive state passable to a component that knows
+  nothing about the root. Four navigation views specialize it —
+  `StreamState<T>` (ordered **and** keyed, so a row keeps its node and its
+  subscribers across repositioning, and a transaction's keyed edits reach the
+  callback beside the change), `StoreState<S>` (reconciled by
+  `__musubi_store_id__` rather than by position, so a child store that moves
+  keeps its `NodeId`, its subtree and its subscribers), `AsyncState<T>` (status
+  is the node's own semantics, so an `ok -> loading` reconnect flip wakes the
+  async node and not one row under it) and `UploadSlotState` (an inert leaf that
+  knows both halves of its `(store_id, name)` upload key). Navigation is
+  infallible by contract: `x.prop()` costs nothing, reads nothing and cannot
+  fail, and a key the render does not carry yields a handle that reads
+  `is_live() == false` / `try_value() == Err(Gone)`. No network, no UI, no
+  runtime — `serde`, `serde_json`, `slotmap`, `thiserror` and nothing else, with
+  a CI gate asserting `cargo tree -i tokio` matches nothing. `publish = false`.
+  `docs/rust-reactive-state.md` is the normative design.
+- **`musubi-gpui` (new, Rust)** — **The gpui adapter**, two capabilities and
+  deliberately nothing else. `observe` / `observe_with` / `to_view` make the
+  `!Send` hop once, in one place: a subscription callback is
+  `Fn(Change) + Send + Sync` and a gpui entity is thread-affine, so every
+  observation would otherwise repeat the same carry-to-the-foreground,
+  update-the-entity, `cx.notify()`, branch-on-the-entity-being-gone glue — once
+  per view per field under per-node subscription. `to_view` is generic over the
+  notified *value* and never over the handle, which is what lets `musubi-client`'s
+  own out-of-tree handles (`StatusState`, `Upload`) use the identical call site
+  from the far side of a crate boundary this adapter never crosses. `drive_list`
+  translates a transaction's keyed `CollectionEdit`s into `ListState::splice`, so
+  one new message invalidates one row range instead of wiping every cached row
+  height with `reset(count)`. No widgets, no theme, no rendering. Depends on
+  `musubi-state` and gpui and **never** on `musubi-client`, and carries its own
+  `[workspace]` table so gpui — and the tokio it drags in transitively — stays
+  out of the root lockfile and out of the runtime-free gates. `publish = false`.
+- **`musubi` / `musubi-client` (Rust)** — **Generated navigation.** Beside every
+  generated shape struct the bundle now emits a `<Name>Ext` trait implemented for
+  `State<Shape>` (and, for a store's own shape, for `StoreState<Shape>` too), one
+  accessor per declared field, each handing back a **handle** rather than a
+  value: `State<T>` for a plain field, `StreamState<T>` for `stream/3`,
+  `AsyncState<T>` for `Musubi.AsyncResult.of(T)` — plus `ok_stream()` where the
+  manifest knows the result is a stream — `StoreState<S>` for `Module.state()`
+  and `UploadSlotState` for a declared upload. An extension trait rather than an
+  inherent impl because `State<T>` is defined in another crate and there is no
+  orphan-rule escape hatch for inherent impls; a bundle-level `pub mod nav`
+  re-exports every trait, so a consumer writes `use generated::nav::*;` once per
+  file. Accessors are infallible (`self.child("<wire key>")`), so
+  `state.current_user().name()` is legal on a root that has not been patched yet
+  and the check moves to the read. Snapshot types are unchanged — every existing
+  `value()`-shaped consumer keeps compiling. `docs/rust-codegen.md` §"Runtime
+  contract the navigation emission depends on" is the seam.
 
 ### Fixed
 
@@ -198,23 +257,52 @@ not in lockstep yet; entries note which surface they affect.
 
 ### Changed
 
-- **`musubi-client` (Rust)** — **`Mounted::updates` and
-  `Mounted::status_updates` deliver the latest value instead of a queue.** Both
-  streams carry whole-root values that subsume the one before them, so they are
-  now backed by a small runtime-free latest-value cell rather than an unbounded
-  channel. Three visible consequences: a consumer that falls behind gets the
-  **current** state (or status) on its next poll and never the intermediates it
-  missed, so a stalled consumer can no longer grow the client's memory and no
-  longer runs its body once per skipped envelope; the **first poll replays**
-  what `snapshot()` / `status()` hold, which retires the
-  subscribe-before-you-read idiom those methods used to require; and teardown
-  still ends the stream after handing over a last unseen value. The signatures
-  are unchanged (`impl Stream<Item = Arc<St::State>>`,
-  `impl Stream<Item = MountStatus>`), so this is a semantic break in a
-  pre-release surface, not a compile break. `events()` and `Upload::updates()`
-  are unaffected — discrete items, still unbounded queues — and one event now
-  fans out as a shared `Arc<Value>` rather than a deep payload clone per
-  subscriber. `docs/rust-client.md` §2.4 has the full contract.
+- **`musubi-client` (Rust)** — **`Mounted::snapshot()`, `Mounted::updates()` and
+  `Mounted::status_updates()` are removed; `Mounted::state()` replaces all
+  three.** This is a forced migration, not a deprecation, and it is what buys
+  the retained tree: keeping them would mean keeping a whole-root
+  `Latest<Arc<St::State>>` cell beside the tree, and with it the per-envelope
+  whole-root hydration, deserialization and clone the tree exists to delete —
+  paid on every envelope, by every mount, whether or not anything read it.
+  `state()` hands back a `State<St::State>` on the retained tree
+  (`musubi-state`), so a read costs the subtree it reads and a subscription
+  wakes only when *that* node's semantic value changed. The five removals map
+  one-to-one: `snapshot()` becomes `state().value()` (and
+  `snapshot().is_none()` becomes `state().revision() == 0`, with
+  `!state().is_live()` for a torn-down tree); `updates()` becomes
+  `state().subscribe(..)` on whichever node the consumer actually renders;
+  `status_updates()` becomes `status().subscribe(..)`, with
+  `status().into_stream()` for a consumer whose shape is a loop; and
+  `Upload::snapshot()` / `Upload::updates()` become `value()` / `subscribe()` /
+  `into_stream()` on the same handle. That last pair is a rename, not a
+  semantic change. What is left is one convention across the whole API:
+  `x.prop()` gives a **handle**, `handle.value()` gives a **value**,
+  `handle.subscribe(cb)` gives a **subscription**, and `drop(subscription)` is
+  the only way to unsubscribe — with `Subscription` the receipt everywhere, tree
+  and non-tree alike, so one `Vec<Subscription>` holds every observation a view
+  has. `PatchEngine`, `PatchEnvelope`, `PatchOp`, `StreamOp`, `UploadOp`,
+  `PushEvent` and `Uploads` come off the crate's public surface at the same
+  time; `StoreId`, `UploadSlot`, `StoreField`, `AsyncResult`, `AsyncError` and
+  `AsyncErrorKind` moved to `musubi-state` and are re-exported verbatim from
+  `musubi_client::generated`, so no bundle path changes. `json-patch` is gone
+  from the dependency tree — the pointer walk is owned by `musubi-state`, because
+  `json_patch::patch` needs a `serde_json::Value` document and there is no longer
+  one to give it. `docs/rust-reactive-state.md` §5.3 is the migration table.
+- **`musubi-client` (Rust)** — **The mount status delivers the latest value
+  instead of a queue.** `MountStatus` is a client-local liveness projection no
+  wire message carries, so it does not live on the retained tree; what is left
+  of `latest.rs` is one small runtime-free latest-value cell behind
+  `Mounted::status() -> StatusState`, rather than an unbounded channel. Three
+  visible consequences: a consumer that falls behind gets the **current** status
+  on its next poll and never the intermediates it missed, so a stalled consumer
+  can no longer grow the client's memory and no longer runs its body once per
+  skipped envelope; the **first poll of `into_stream()` replays** what `value()`
+  holds, which retires the subscribe-before-you-read idiom the old pair
+  required; and teardown still ends the stream after handing over a last unseen
+  value. `events()` is unaffected — discrete occurrences, no current value to
+  read, still an unbounded queue per subscription — and one event now fans out
+  as a shared `Arc<Value>` rather than a deep payload clone per subscriber.
+  `docs/rust-client.md` §2.4 has the full contract.
 - **`musubi`** — **Internal: the codegen manifest is now target-neutral.**
   `Musubi.Plugin.TypeScript` became `Musubi.Plugin.Codegen`,
   `Musubi.Codegen.TypeScript.Manifest` became `Musubi.Codegen.Manifest`, and

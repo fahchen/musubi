@@ -101,14 +101,30 @@ gpui entity;它永远看不到信封、socket 或 `Mounted`。正是这一点把
 `UploadSlot`(声明一个 upload 时渲染出的那个 `{ name }` 快照结构体)按同样方式
 处理:它是 `NodeKind::UploadSlot` 的投影值,随该节点种类下沉到 `musubi-state`,
 再从 `musubi_client::generated::UploadSlot` 原样重导出(§2.4)。
+
+**偏离(落地时扩大的下沉面)。** 同一条理由多带走了四个值类型:`StoreField<S>`、
+`AsyncResult<T>`、`AsyncError` 与 `AsyncErrorKind`(后三者见 §3.3 当初写的“不
+下沉”)。理由是机械的、而且是当初漏算的:§2.4 签下了
+`StoreState::<S>::value() -> StoreField<S>` 与
+`AsyncState::<T>::value() -> AsyncResult<T>`,而句柄住在 `musubi-state` 里——
+一个句柄没法命名一个住在依赖它的 crate 里的返回类型,否则就是环。四者一律从
+`musubi_client::generated` 原样重导出,`docs/rust-codegen.md` §4.5 的规范清单
+逐字不变,没有任何消费方路径改动。它们落在 `crates/musubi-state/src/wire.rs`,
+和 §1.3.1 第 5 条的纪律一起:本 crate 不给它们添加任何固有方法或本地 trait
+impl,拆分成本因此仍是“一次移动加一组重导出”。
 `PatchEnvelope`、`UploadOp` 和 `PushEvent` 留在 `musubi-client`:它们属于信封
 封装以及上传平面和事件平面,而树对这些一概不提。(§5.5 把这条承诺收窄了一档:
 `StoreId` 的重导出照旧,`PatchOp` 与 `StreamOp` 的重导出随 `PatchEnvelope` 一起
-降为 `pub(crate)` 的内部路径,因为迁移之后已经没有公开签名提到它们。)
+降为 `pub(crate)` 的内部路径,因为没有任何公开签名提到它们。)
 
 **`musubi-state` 的依赖。** `serde` + `serde_json`(树从 `Value` 构建、也投影回
-`Value`,且 `NodeKind::Number` 就是一个 `serde_json::Number`)以及 `slotmap`。
-仅此而已——没有 `futures`,没有 `tracing`,没有运行时。
+`Value`,且 `NodeKind::Number` 就是一个 `serde_json::Number`)、`slotmap`,以及
+`thiserror`——`TreeError` 与 `ReadError` 是本文签下的两个公开错误枚举,而
+`musubi-client` 的既有错误分类学全程用 `thiserror` 写成,手写两份 `Display` 只是
+为了让依赖清单短一行,并不换来任何东西。仅此而已——没有 `futures`,没有
+`tracing`,没有运行时。
+
+`tracing` 的缺席有一处代价,在 §3.2 记账。
 
 *诠释。* handoff 把 `musubi-state` 称作“零依赖”;这里读作“无网络、无 UI、无
 运行时”,因为同一份 handoff 在自己的类型定义里就写了 `serde_json::Number` 和
@@ -412,6 +428,11 @@ impl StateTree {
     /// Node count. Tests and diagnostics.
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
+
+    /// Whether `close` has ended this tree. `pub(crate)`: §5.5's read half does
+    /// not carry it, and a consumer asks `State::is_live`, which folds it
+    /// together with "the node is still there".
+    pub(crate) fn is_closed(&self) -> bool;
 }
 ```
 
@@ -584,8 +605,7 @@ impl<T> State<T> {
     pub fn tree(&self) -> &StateTree;
 
     /// The node's revision. `0` means no transaction has ever touched it —
-    /// which for a root is exactly "the initial patch has not landed", the
-    /// replacement for `snapshot().is_none()` (§5.3).
+    /// which for a root is exactly "the initial patch has not landed" (§5.3).
     pub fn revision(&self) -> u64;
 
     /// Whether the node is still in an open tree. `false` once the node was
@@ -596,8 +616,16 @@ impl<T> State<T> {
     /// navigation both use; no data moves.
     pub fn cast<U>(&self) -> State<U>;
 
-    /// The child at `key`, when this node is an object or a store node.
-    /// The primitive every generated field accessor is built from.
+    /// The child at `key` — the primitive every generated field accessor is
+    /// built from, and **infallible**, as the handle law below requires:
+    /// `x.prop()` costs nothing, reads no value and cannot fail. A key this
+    /// node does not hold yields a handle rooted at a null `NodeId`, which
+    /// reads `is_live() == false` and `try_value() == Err(ReadError::Gone)`.
+    pub fn child<U>(&self, key: &str) -> State<U>;
+
+    /// `child`, with an absent key reported instead of handed back as a dead
+    /// handle — for the places where absence is a branch rather than a state
+    /// (`AsyncState::result`).
     pub fn field<U>(&self, key: &str) -> Option<State<U>>;
 
     /// Subscribe. RAII: dropping the returned guard unsubscribes.
@@ -668,21 +696,19 @@ pub enum ReadError {
 | 观察变化 | `handle.subscribe(cb)` —— 唯一的订阅入口,回执是 `Subscription` |
 | 取消观察 | `drop(subscription)` —— 没有 `unsubscribe()`(§2.5) |
 
-**这条规则是有代价地贯彻的,不是对现状的描述。** 树上那四个视图本来就是这个
-形状(§3.4 新增的 `UploadSlotState` 是第五个,天生如此);树外的两个面不是,
-本设计把它们改成这个形状:
+**这条规则在树外的两个面上也照样成立,尽管它们不是节点。** 树上那五个视图天生
+就是这个形状;树外的两个是被这样签下来的:
 
-| | 之前 | 之后 |
+| 面 | 属性访问器 | 句柄上的三个动作 |
 |---|---|---|
-| 连接状态 | `Mounted::status() -> MountStatus` 加 `Mounted::status_updates() -> impl Stream` | `Mounted::status() -> StatusState`,其上 `.value()` / `.subscribe()` / `.into_stream()`(§5.4) |
-| 上传 | `Upload::snapshot() -> UploadHandle` 加 `Upload::updates() -> impl Stream` | 同一个 `Upload` 句柄,`.value()` / `.subscribe()` / `.into_stream()`(§6.4) |
+| 连接状态 | `Mounted::status() -> StatusState` | `.value()` / `.subscribe()` / `.into_stream()`(§5.4) |
+| 上传 | `Mounted::upload_at(&slot) -> Option<Upload>` | `.value()` / `.subscribe()` / `.into_stream()`(§6.4) |
 
-两处删掉的东西性质不同,分别点名:`status`/`status_updates` 是**同一个属性的两个
-方法名**——一个读、一个订阅,而“读”这个动作还占用了属性本身的名字,于是
-`status()` 给值还是给句柄,取决于你记不记得另一个名字存在;`snapshot`/`updates`
-是**同一对动作的第三、第四个动词**——树上叫 `value`/`subscribe`,这里叫
-`snapshot`/`updates`,同一个概念在一个 crate 里有两套词。统一之后,`Mounted` 上
-**再没有第二种读法**:`state()` 与 `status()` 两个属性访问器,加上按槽位取句柄的
+规则的力度在于它排除了两种形状。一是**读占用属性本身的名字、订阅另起一个平行
+方法名**:那样 `status()` 给的是值还是句柄,取决于读者记不记得另一个名字存在。
+二是**同一对动作在一个 crate 里有第二套动词**:树上叫 `value`/`subscribe`,树外
+另起一套,读者就必须先知道自己站在哪个平面。两种都不存在——`Mounted` 上
+**没有第二种读法**:`state()` 与 `status()` 两个属性访问器,加上按槽位取句柄的
 `upload_at(&slot)`(§3.4),交出的都是句柄,后面接的都是同一套 `.value()` /
 `.subscribe()`。
 
@@ -711,8 +737,8 @@ pub enum ReadError {
 
 **`into_stream()` 只有树外有,方向正好相反。** 树上不给:`musubi-state` 没有异步
 表面(§1.3),而在一个节点上凭空造一条流只有两种做法——每节点一个队列(无界,
-正是 §5.3 删掉的那样东西),或每节点一个 latest cell(每信封每节点一次物化,比
-v1 更差)。要 `Future`/`Stream` 的消费方自己接一根:§6.1 那十行 `oneshot` 就是,
+正是 §5.2 排除掉的那样东西),或每节点一个 latest cell(每信封每节点一次物化,
+比整根 cell 更差)。要 `Future`/`Stream` 的消费方自己接一根:§6.1 那十行 `oneshot` 就是,
 想要流就换 mpsc。树外那两个 cell **本来就是流**,`into_stream()` 不是新机制,而是
 把既有的那条留在句柄上——一个“活在 async 块里、要 `await` 一个条件”的消费方
 (§6.5.1 等 `Live` 的那一处)要的正是流形态,而不是回调。**两种形态,同一个属性:
@@ -806,9 +832,9 @@ revision,值由回调自己重读”,它成立的前提是**重读补得回来**
 **统一的另一半:回执也只有一个类型。** 七个句柄的 `subscribe` 全部返回同一个
 `Subscription`(§2.5),树外那两个也是。这不是命名上的整齐,而是这条统一**真正
 买到的东西**:一个视图可以把它全部的观察装进一个 `Vec<Subscription>`,一起活、
-一起死、一起被 `#[must_use]` 盯着。§6.5.2 那个 gpui 视图今天要三个字段才能做这
-件事(`_subs: Vec<Subscription>`、`_status_updates: Task<()>`、`_upload_updates:
-Option<Task<()>>`),统一之后是一个。
+一起死、一起被 `#[must_use]` 盯着。§6.5.2 那个 gpui 视图因此只有一个这样的字段
+——状态、连接状态、上传三条观察装在同一个 `Vec` 里,而不是各自一个
+`Task<()>`。
 
 **回到所有者更早的那个问题:“能不能不要 `get` 函数,直接就是访问那个
 property?”**(那时读值方法还叫 `get()`;下一节讲它为什么改叫 `value()`。)
@@ -818,8 +844,7 @@ property?”**(那时读值方法还叫 `get()`;下一节讲它为什么改叫 `
 身份(`NodeId`)、有版本(`revision()`)、可以存进结构体、可以被单独订阅、可以
 传给一个不知道 root 存在的组件。这比“一个字段”能做的事多得多,而写法一样短。
 所有者的诉求在这一层是**完全落地**的:整个 API 面上,任何可观察的属性都是
-`x.prop()`,后面既不接一个平行的第二方法名(`status_updates`),也不接一个“这个
-面自己的动词”(`snapshot`)。
+`x.prop()`,后面既没有平行的第二方法名,也没有“这个面自己的动词”。
 
 另一半是:那个属性的**值**要落到手里,需要一个显式的点,而在 Rust 里那个点只能
 是一次方法调用。这不是可以再压缩的仪式,而是一条语言约束与一条设计性质的交汇
@@ -864,11 +889,9 @@ property?”**(那时读值方法还叫 `get()`;下一节讲它为什么改叫 `
 意见。意见是“`get` 没说清楚”,本设计接受它,并且把修正范围从一个方法扩大到三
 类角色——这就是本节开头那张术语表存在的原因。
 
-*代价,如实列。* 全部六处读值器一起改名(`State`、`StreamState`、`StoreState`、
-`AsyncState`、`StatusState`、`Upload`;`UploadSlotState` 是新增的第七处,天生就叫
-`value()`),`try_get()` 随之成为 `try_value()`。这是一次纯机械改名,没有语义
-变化,而且它发生在这套表面**尚未有任何外部消费方**的时刻(§5.2:整套东西在同一
-个 PR 内落地)——迁移成本恰好是它最低的那一刻。
+*适用范围,如实列。* 七个句柄用同一个读值器名(`State`、`StreamState`、
+`StoreState`、`AsyncState`、`UploadSlotState`、`StatusState`、`Upload`),
+`try_value()` 是它的不 panic 变体。整个句柄家族没有第二种拼法。
 
 #### 为什么读要写成 `value()`,而不是直接访问一个属性
 
@@ -954,7 +977,7 @@ user.name;
    不相等,于是断言报的是“值不对”,而真相是“节点没了”。`try_value()` 与
    `is_live()` 今天把这两件事分得干干净净,这层糖会把它们混回去;在测试里,这
    比 panic 更糟。
-3. **它买到的东西接近于零。** §5.3 迁移表里那约 25 处断言写成
+3. **它买到的东西接近于零。** `tests/connection.rs` 里那约 25 处断言写成
    `cart.state().title().value()` 就已经落地了;糖省下八个字符,代价是让“这里
    发生了一次物化”在最该显眼的两个地方(日志与断言)变得不显眼。
 
@@ -1042,6 +1065,12 @@ impl<T> StreamState<T> {
 }
 
 /// A mounted child store. `store_id()` is what `Mounted::command_on` takes.
+///
+/// **偏离。** 它的签名是 `-> Option<StoreId>`,不是 `-> StoreId`。id 在句柄创建
+/// 时读一次、此后不再重读(它是身份,不是属性);而导航既然不可能失败,就存在
+/// “句柄底下从来没有过 store 节点”这一状态,那时没有任何诚实的 `StoreId` 可以
+/// 交出——`StoreId::root()` 恰恰是 §3.4 要删掉的那种“悄悄打错目标”。`None` 与
+/// 邻居 `UploadSlotState::key()` 同形、同理由。
 pub struct StoreState<S> { ... }
 
 impl<S> StoreState<S> {
@@ -1384,12 +1413,14 @@ key,delete 绝不会排在 insert 之前。因此结转表针对的是 `reset` �
 `CollectionEdit::Moved { item_key, from, to }`,其余给 `Inserted`/`Removed`,
 reset 给 `Reset`。这就是支撑 `musubi-gpui` 的两项能力中的第二项(§5.1)。
 
-**一处行为变化,在此点明。** 今天 `StreamStore` 以 `(store_id, name)` 为键,活在
-树*之外*,所以针对一个标记缺失的流的 op 照样会被折叠进去,只是永远不会被渲染。
-在保留树下没有地方安放它,因此这种 op 会被丢弃并打一条 `debug!`。这不可观测:
-Musubi 会拒绝缺少流占位的渲染(`docs/streams.md`),所以每一个声明过的流在每次
-渲染里都有标记;唯一剩下的窗口——一个 store 在插入的同一周期内卸载——今天的
-`prune_to_index` 也会在同一个信封末尾把它丢掉。两个客户端依然一致。
+**一条 op 找不到槽位就被丢弃。** 解析走的是树的 `(store_id, stream) -> NodeId`
+索引;索引里没有,或者指向一个已经不在场的节点,这条 op 什么也不做。**不记录
+日志**:`musubi-state` 没有 `tracing` 依赖(§1.3),为一行日志请回一条依赖会给
+crate 头一条“无运行时”承诺开一个例外(与 §3.2 那处偏离同一条理由)。这不可
+观测:Musubi 会拒绝缺少流占位的渲染(`docs/streams.md`),所以每一个声明过的流
+在每次渲染里都有标记;唯一剩下的窗口——一个 store 在插入的同一周期内卸载——
+其子树连同它的 `Collection` 子节点在同一个信封末尾一并释放(§3.2)。两个客户端
+依然一致。
 
 ### 3.2 子 store
 
@@ -1400,15 +1431,27 @@ Musubi 会拒绝缺少流占位的渲染(`docs/streams.md`),所以每一个声�
 机制上:树维护一张 `HashMap<StoreId, NodeId>`,在 `Store` 节点创建或释放时更新。
 调和一个携带 `__musubi_store_id__: X` 的传入值时,先查 `X`;命中则把既有节点
 重新挂到新的父节点下并调和进去,未命中则新建一个。store id 由服务端编写、在一个
-root 内唯一,所以查找不可能有歧义;出现重复即是服务端 bug,会以 `warn!` 记录,
-第二次出现按新节点处理。
+root 内唯一,所以查找不可能有歧义;出现重复即是服务端 bug,第二次出现按新节点
+处理。
+
+**偏离(记录方式,不是行为)。** 原文写的是“会以 `warn!` 记录”。`musubi-state`
+没有 `tracing` 依赖(§1.3),而为了一行日志请回一条依赖,换来的是 crate 头一条
+“无运行时”承诺的一个例外。所以第二次出现是**结构性**地处理的:同一个 op 内已经
+安置过的 store id 不会被再次收养,于是第二个键拿到一个新节点,而不是让一个节点
+挂在两个父节点下——后者会破坏 `detach` 存在的意义(“没有节点能从两个父节点到
+达”),并让随后的一次 `remove` 释放另一个键仍指向的节点。服务端侧
+`spec/domains/runtime/features/render-contract.feature` 对这种渲染直接 raise,
+所以对着一个正确的服务端这条路走不到;走到了,树也不会自伤。
 
 如果传入的树里不再有某个 store 节点的 id,该节点连同整棵子树一并释放——这就是
 从结构上实现 BDR-0011 的全新挂载语义:该 store 的 `Collection` 子节点随它而去,
 所以一个重新出现的 store 从空开始,不需要任何剪枝遍历。
 
 `StoreState<S>::store_id()` 是 `Mounted::command_on` 取得该 id 的方式,和今天
-`snapshot.checkout_panel.store_id` 的作用完全一样。
+`snapshot.checkout_panel.store_id` 的作用完全一样。它在句柄创建时读一次并留住:
+一个跨越了自身 store 卸载的句柄因此仍然报出**它自己**的 id,`command_on` 于是对着
+一个服务端已经没有的 store 失败——这是响亮的结果;重读节点则会让它悄悄改口成根
+store 的 id。返回类型是 `Option<StoreId>`,理由见 §2.4 的偏离说明。
 
 ### 3.3 异步节点
 
@@ -1432,10 +1475,13 @@ root 内唯一,所以查找不可能有歧义;出现重复即是服务端 bug,�
 重绘(它现在把列表变暗);订阅了单个条目的行视图完全不重绘。今天两者都会重绘,
 因为整个 root 只有一次通知。
 
-`AsyncResult<T>`、`AsyncError` 和 `AsyncErrorKind` **不**迁移——它们留在
-`musubi_client::generated`,规范的 prelude 重导出清单(`docs/rust-codegen.md`
-§4.5)已经点名了它们。`musubi-state` 只带 `AsyncStatus`,那是树判定等价所需的
-全部。
+**偏离。** 本节原先写的是“`AsyncResult<T>`、`AsyncError` 和 `AsyncErrorKind`
+**不**下沉”。落地时它们下沉了,和 `StoreField<S>` 一道,理由在 §1.3 记账:§2.4
+签下 `AsyncState::<T>::value() -> AsyncResult<T>`,而 `AsyncState` 住在
+`musubi-state` 里——留在上游就是一个环。三者从 `musubi_client::generated` 原样
+重导出,规范的 prelude 清单(`docs/rust-codegen.md` §4.5)逐字不变,没有任何
+消费方路径改动。树判定等价用的仍然只有 `AsyncStatus`;搬过来的是三个纯值类型,
+不是语义。
 
 ### 3.4 上传槽位
 
@@ -1446,9 +1492,8 @@ root 内唯一,所以查找不可能有歧义;出现重复即是服务端 bug,�
 
 活的上传状态原地不动:`upload_ops` 折叠进 root 的 `Uploads` 注册表,以
 `(store_id, name)` 为键。那个平面——数据与控制、预检、分块二进制传输、外部
-`Uploader`——本设计一概不动;句柄上那两个方法名并入 §2.4 的统一约定
-(`snapshot()`/`updates()` 变成 `value()`/`subscribe()`,流形态作为
-`into_stream()` 保留),语义一个字不改(§6.4)。
+`Uploader`——与树正交;句柄上的三个动作按 §2.4 的统一约定命名
+(`value()`/`subscribe()`,流形态是 `into_stream()`),见 §6.4。
 
 #### 从状态树到上传句柄:一步,没有裸字符串
 
@@ -1526,7 +1571,7 @@ let upload = chat.upload_at(&state.attachment());            // Option<Upload>
 `hydrate.rs`、`index.rs` 和 `streams.rs` 从 `musubi-client` 中删除。它们承担的
 每一项职责都有去处:
 
-| 今天的职责 | 归宿 |
+| 那三个模块承担的职责 | 归宿 |
 |---|---|
 | 在 serde 之前把 `{"__musubi_stream__": name}` 替换成物化后的数组 | `NodeKind::Collection` **就是**那个物化列表。`to_hydrated` 把它投影为 JSON 数组;不存在这一趟遍历。 |
 | 跟踪最近的外围 `__musubi_store_id__`,以便解析一个标记 | 在 `Collection` 节点创建时解析**一次**,保存在 `NodeKind::Collection::owner` 中。标记永不重解析。 |
@@ -1576,7 +1621,7 @@ let upload = chat.upload_at(&state.attachment());            // Option<Upload>
 | 10 | `sink.set_status(MountStatus::Live)` | 不会 | 不变 |
 | 11 | 分发 `envelope.events` | 不会 | 不变——在状态之后,§4.3 第 9 步的要求 |
 | 12 | 解决待定的 mount,冲刷排队的分发 | 不会 | 不变 |
-| 13 | `cache.on_publish(key, tree.to_wire(root))` | 不会 | 形态不变(§7) |
+| 13 | `cache.on_publish(key, \|\| tree.to_wire(root))` | 不会 | 形态不变(§7)。投影**惰性**:整根 `to_wire` 是一次全树物化,没有配置缓存的连接(默认)一次也不该付,所以传进去的是 thunk,拿出来的是 owned `Value`——协调器不再 `clone` 一个它本来就该拥有的树 |
 
 第 1、3 或 4 步失败会 drop 掉 `Transaction`,把树精确回滚到原状,第 5 步及其后
 一概不运行:版本不前进,没有上传订阅者听说过这个信封,没有状态订阅者被通知,
@@ -1676,8 +1721,12 @@ impl CartStateExt for State<CartState> { ... }
   如此。
 - **一个 store 的形状有两份 impl。** `XExt` 同时为 `State<X>` *和*
   `StoreState<X>` 实现,于是 `snap.checkout_panel().total()` 可以直接读,而
-  `snap.checkout_panel().store_id()` 就在旁边。第二份 impl 是四行经由
-  `StoreState::fields` 的转发。
+  `snap.checkout_panel().store_id()` 就在旁边。第二份 impl 是经由
+  `StoreState::fields` 的转发,而且是**具名调用** trait 方法
+  (`XExt::total(&self.fields())`)而不是 `self.fields().total()`:一个声明字段
+  完全可能叫 `child`、`value`、`at`、`node`——`State<T>` 自己的固有方法名——而固有
+  方法在方法解析里无条件胜出,于是点号写法会调到原语上并因元数不符而编译失败。
+  具名调用把这一整类命名碰撞在转发方向上消掉。
 
 命名与冲突:`<ItemName>Ext` 与条目本身一道,在任何被提升的类型分配之前,就在每个
 Rust 模块的名字表中占位(§3.5),因此被提升的类型永远不可能遮蔽一个 `Ext`
@@ -1777,6 +1826,19 @@ panic。理由就是上面的分层:生成访问器能触及的任何 `T`,都在
 方的帧或任务,绝不是连接。`try_value()` 就在它旁边,供手工导航的嵌入方使用,也
 供任何跨越一次形状变更的重连仍持有 `State<T>` 的人使用。
 
+**panic 的预算只属于 `value()`,不属于导航。** `x.prop()` 不可能失败(§2.4 的
+词表),所以生成的访问器链落地为 `self.child("<wire key>")`,而不是一个
+`.expect(..)`:一个还没被打过补丁的 root、一个被拆除后清空的 root,都是
+`is_live()`/`try_value()` 该回答的状态,不是消费方在导航路上该撞的墙。这也正是
+`examples/chat_room/desktop` 得以删掉那个手写 `tree()` 漏斗的原因——检查回到了
+它该在的地方:读的那一行。
+
+**订阅者的 panic 只赔上它自己那一次通知。** 上面这句“绝不是连接”对读是真的,
+对订阅回调本来不是:`Notify` 的 `Drop` 跑在 actor 任务上(§3.6 第 9 步),一个
+回调 unwind 会跳过同一事务里其后的每一个回调、并把连接一起带走。所以每个回调都
+被 `catch_unwind` 单独裹住:panic hook 已经报告过它,丢掉的只有它自己那一次通知,
+其余订阅者照常收到。这是让那句话成立的实现,不是对它的放宽。
+
 ---
 
 ## 5. 沿用自所有者的决定
@@ -1813,7 +1875,7 @@ unpublished-ABI dependency in the workspace for no API benefit.”
 
 - **薄。** 一个返回 `Subscription` 的 `observe(state, entity, cx)`,三个导航
   视图(`StreamState`、`StoreState`、`AsyncState`)各有同样的一份,一个把那次
-  跳转单独拿出来的 `to_view(cx, apply)`,再加一个基于 `collection_edits` 的列表
+  跳转单独拿出来的 `to_view(window, cx, apply)`,再加一个基于 `collection_edits` 的列表
   驱动器。别无他物。没有控件,没有主题,没有渲染。`UploadSlotState` **不**要这
   一份:它的订阅永不触发(§3.4),给它一个 `observe` 就是给一个永远不会响的
   东西发一张令牌。
@@ -1841,104 +1903,88 @@ unpublished-ABI dependency in the workspace for no API benefit.”
 /// Generic over the notified **value**, never over the handle — which is
 /// exactly what lets it serve `musubi-client`'s `StatusState` and `Upload`
 /// (§2.4) without this crate depending on `musubi-client`.
-pub fn to_view<E, V>(
+pub fn to_view<E, V, A>(
+    window: &Window,
     cx: &mut Context<V>,
-    apply: impl Fn(&mut V, E, &mut Window, &mut Context<V>) + Send + Sync + 'static,
-) -> impl Fn(E) + Send + Sync + 'static
+    apply: A,
+) -> impl Fn(E) + Send + Sync + 'static + use<E, V, A>
 where
     E: Send + 'static,
-    V: 'static;
+    V: 'static,
+    A: Fn(&mut V, E, &mut Window, &mut Context<V>) + Send + Sync + 'static;
 ```
+
+**两处偏离,都是 gpui 0.2.2 的事实,不是口味。**
+
+1. **多了一个 `&Window` 参数**,`to_view` 与 `observe_with` 各一个。`apply` 收的是
+   `&mut Window`,而在 0.2.2 里,从一次后台通知走到 `&mut Window` 的唯一路径是
+   `Context::spawn_in(window, ..)` → `AsyncWindowContext` → `WeakEntity::update_in`
+   ——`AsyncWindowContext::new_context` 是 `pub(crate)`,`Context<V>` 自己也不带
+   window 句柄。所以 window 成了参数,位置就放在 gpui 自己放它的地方(紧挨 `cx`
+   之前),而 §6.5.2 的每一个调用点本来就有 `window` 在作用域里。`observe` 与
+   `drive_list` 的函数体不需要 window,签名一字未改。
+   (`apply` 写成具名类型参数而不是 `impl Trait`,只因为 edition 2024 的
+   `use<..>` ——用来阻止返回的闭包捕获 `window` 与 `cx` 的生命周期——必须点名
+   作用域里的每一个类型参数。调用点不变。)
+2. **跳转是一条 channel,不是一个被捕获的 context。** 本节与 §6.3 的草图是把
+   `cx.to_async()` 克隆进回调;这在 0.2.2 上编译不过:`AsyncApp` 持有一个
+   `rc::Weak<AppCell>` 和一个由显式标记字段钉成 `!Send` 的 `ForegroundExecutor`,
+   一个 `Send + Sync` 的闭包拿不住它。所以跨线程走的是**值**:返回的闭包持有一个
+   `UnboundedSender<E>`(对 `E: Send` 是 `Send + Sync`),这里 spawn 的一个前台
+   任务把接收端抽干,并在 entity 自己的线程上跑 `apply`。顺序是 channel 的顺序,
+   因此就是事务产生它们的顺序;队列无界,因为丢掉一次状态通知会让视图失同步,
+   而抽干它的任务由重绘用的同一个执行器调度——积压是一帧忙,不是泄漏。RAII 生命
+   周期不变:闭包一 drop,发送端就没了,接收端随之终止,任务结束。
 
 `observe` 与 `observe_with` 建在它之上:前者是“apply 只做一次 `cx.notify()`”的
 特例,后者在它外面再包一层,把句柄本身喂给回调体。调用点因此对树上树下是同一个
 形状——`state.subscribe(to_view(..))` 与 `chat.status().subscribe(to_view(..))`
 逐字对应(§6.5.2)。
 
-### 5.2 落地方式
+### 5.2 没有第二条读路径
 
-**本设计在当前 PR/分支(`design/rust-compiler`)上落地,叠在已交付的 v1 数据
-平面之上。** 不开后续分支:v1 的公开表面是被移除而不是被扩展(§5.3),在一个 PR
-里交付一套下一个 PR 就删掉的表面,只会平白制造一次谁也得不到好处的迁移负担。
-§8 的迁移计划是本分支内的一串提交,不是一串发布。
+**`Mounted::state() -> State<St::State>` 是读状态的唯一入口。** 没有整根快照
+方法,也没有整根更新流。
 
-### 5.3 强制迁移(forced migration):`snapshot()` 与 `updates()` 被移除
+两者都不存在,理由是同一条:任何一个都要求一个整根的 `Latest<Arc<St::State>>`
+cell,也就是每信封一次整根反序列化——本设计要消除的正是这笔代价,把它作为
+“调用方可以选择去付”的糖留着,等于把它原样养着。在树之上也没有廉价的整根更新
+流实现:那是每信封一次完整物化外加一个队列,等于让第二套数据平面与树并排运行。
 
-**`Mounted::snapshot()` 和 `Mounted::updates()` 被删除,不作为语法糖保留。**
-`Mounted::state() -> State<St::State>` 取代两者。
+同一条纪律作用在连接状态与上传上:各只有一个名字交出句柄,读、看、流三种形态
+都长在句柄上(§5.4、§6.4),而不是并列的三个方法。
 
-保留它们就意味着保留整根的 `Latest<Arc<St::State>>` cell,也就意味着保留每信封
-一次的整根反序列化——正是本设计要消除的那笔代价——只为让调用方可以选择去付
-它。在树之上没有廉价的 `updates()` 实现:那就是每信封一次完整物化外加一个队列,
-等于让整个 v1 与整个 v2 并排运行。
+### 5.3 `Mounted` 的表面
 
-`Mounted` 的新表面:
-
-| 方法 | 去留 |
+| 方法 | 交出什么 |
 |---|---|
-| `snapshot()` | **移除** |
-| `updates()` | **移除** |
-| `state() -> State<St::State>` | **新增** |
-| `status() -> MountStatus` | **改签名** → `status() -> StatusState`;当前值成为 `status().value()`(§2.4、§5.4) |
-| `status_updates()` | **移除** —— 并入上面那个句柄:`status().subscribe(..)`,要流就 `status().into_stream()` |
-| `command()`、`command_on()` | 保留,不变;组合用法见 §6.1 |
-| `events()` | 保留,不变;与节点订阅的关系、以及它为什么不参加统一见 §6.2 |
-| `upload(&store_id, name)` | 保留,不变;降为原语——从状态树出发的正规写法是下面那个(§3.4) |
-| `upload_at(&slot) -> Option<Upload>` | **新增** —— 从 `UploadSlotState` 一步取得上传句柄,两半键都来自节点(§3.4);它交出的句柄上两个方法改名(§6.4),两平面的边界同处 |
-| `Clone`、`Drop` 即卸载 | 保留,不变 |
+| `state() -> State<St::State>` | 保留树的根视图。不是 `Option`——root 节点在 `mount` 返回时就存在 |
+| `status() -> StatusState` | BDR-0033 的存活性句柄;当前值是 `status().value()`(§2.4、§5.4) |
+| `command()`、`command_on()` | 命令;它怎么与树组合见 §6.1 |
+| `events()` | 事件平面;它为什么不参加 §2.4 的统一见 §6.2 |
+| `upload(&store_id, name)` | 上传注册表的原语——从状态树出发的正规写法是下面那个(§3.4) |
+| `upload_at(&slot) -> Option<Upload>` | 从 `UploadSlotState` 一步取得上传句柄,两半键都来自节点(§3.4);两平面的边界见 §6.4 |
+| `Clone`、`Drop` 即卸载 | 挂载生命周期,本设计不触碰 |
 
-`snapshot()`/`updates()` 是被**删除**,`status()`/`status_updates()` 是被**合并**
-——两件不同的事。前者删除,是因为在树之上重建整根快照就是把 v1 原样养着(下文);
-后者合并,是因为同一个属性不该有两个方法名(§2.4)。合并不丢任何能力:两项能力
-原地保留在句柄上,只是从两个名字变成一个名字加两个动作。
+状态、存活性、上传各只有一个名字,名字之下是 §2.4 的统一约定:读是 `value()`,
+看是 `subscribe()`,要循环形态是 `into_stream()`。
 
-`state()` **不是** `Option`。root 节点永远存在,所以过去由 `snapshot() -> Option`
-回答的那个问题挪到了视图上:
+`state()` 不是 `Option`,所以两个生命周期问题由视图自己回答:
 
-| v1 读法 | v2 读法 |
+| 问题 | 读法 |
 |---|---|
-| `snapshot()` 为 `None`(什么都还没落地) | `state().revision() == 0` |
-| `snapshot()` 为 `Some(s)`;读 `s.title` | `state().title().value()` |
-| `snapshot()` 为 `Some(s)`;整体读取 | `state().value()` / `state().try_value()` |
-| `disconnect()` 之后 `snapshot()` 为 `None` | `!state().is_live()`——树已被关闭 |
-| `updates()` 产出一个完整 root | 在消费方真正关心其变化的那个节点上放一个 `Subscription` |
-| `status()` 读当前值 | `status().value()` |
-| `status_updates()` 的循环 | `status().subscribe(..)`;要保留循环形态就 `status().into_stream()`,那条流逐字不变 |
+| 还什么都没落地 | `state().revision() == 0` |
+| 读一个字段 | `state().title().value()` |
+| 整体读取 | `state().value()` / `state().try_value()` |
+| `disconnect()` 之后树已被关闭 | `!state().is_live()` |
 
-必须迁移的消费方,以及各自的去向:
+消费方要观察变化时,`Subscription` 装在它真正关心的那个节点上,而不是装在
+root 上等一份整根。
 
-| 消费方 | 今天 | 变为 |
-|---|---|---|
-| `examples/chat_room/desktop/src/app.rs`——`_updates` 的 `cx.spawn` 循环(`app.rs:338`) | `while let Some(snapshot) = updates.next().await { view.adopt(..); cx.notify() }` | 经由 `musubi-gpui` 的 `observe` 取得的 `Vec<Subscription>`,每个与视图相关的节点一个 |
-| 同上——`snapshot: Option<Arc<State>>` 字段(`app.rs:215`、`:404`) | 一个被每个渲染器重复读取的字段 | `state: State<State>`,外加列表据以渲染的派生 `StreamState<MessageState>` |
-| 同上——`adopt()`(`app.rs:379`) | 重新同步名字草稿并调用 `ListState::reset(count)` | 一分为二:名字草稿变成 `current_user.name` 上的一个订阅;列表变成基于 `ChangeSet::collection_edits` 的 `musubi-gpui` 列表驱动器。迁移前后的完整代码见 §6.3 |
-| 同上——`_status_updates` 的 `cx.spawn` 循环(`app.rs:305`、`:319`) | `let mut statuses = mounted.status_updates(); while let Some(status) = statuses.next().await { .. }`,外加一个 `Task<()>` 字段 | `mounted.status().subscribe(musubi_gpui::to_view(..))`,令牌进那一个 `Vec<Subscription>`;`Task<()>` 字段消失(§2.4、§6.5.2) |
-| 同上——`connection_state()`(`app.rs:931`) | 读 `self.status` | **不变**——它读的是视图自己的字段,而字段由上面那条订阅写 |
-| 同上——`watch_upload`(`app.rs:464`) | 先 `chat.upload(&StoreId::root(), &slot.name)`,再 `upload.updates()`,再 `upload.snapshot()` | `chat.upload_at(&state.attachment())` 一步取句柄(§3.4),再 `upload.subscribe(..)`,再 `upload.value()`;订阅先于读的顺序与理由不变(§6.4);`Task<()>` 字段变成 `Option<Subscription>` |
-| 同上——六个 `#[gpui::test]` 无头测试(`app.rs:1716`+) | 通过 `chat.poster()` / `chat.messages()` / `debug_bounds(..)` 和脚本化的 wire 帧断言 | **断言值不变**;访问器的实现位移,`messages()` 的产出从切片变成集合视图,行数读法随之改名(§6.3) |
-| `crates/musubi-client/tests/connection.rs`——约 25 处 `snapshot().expect(..).title` | `cart.snapshot().expect(..).title` | `cart.state().title().value()` |
-| 同上——`assert_eq!(cart.snapshot().as_deref(), Some(&expected))` | 整根比较 | `assert_eq!(cart.state().try_value().unwrap(), expected)` |
-| 同上——`disconnect()` 之后的 `assert!(cart.snapshot().is_none())`(`:470`) | 拆除检查 | `assert!(!cart.state().is_live())` |
-| 同上——`let mut updates = cart.updates(); drain(..)`(`:422`、`:461`、`:663`、`:866`、`:1216`) | 排空一条 latest-value 流 | 一个测试辅助函数 `revisions(&state)`,它装上一个 `Subscription`,把每个 `Change` 推进一个共享的 `Vec` |
-| 同上——`updates_open_with_the_current_state_and_coalesce_to_the_latest_one`(`:862`) | 规范性的 latest-value 测试 | 拆成两个:“每个发生变化的事务调用一次”,以及 §9.2 的规则“把值改回去的事务谁也不通知” |
-| 同上——BDR-0033 状态套件(`:622`–`:853`,外加 `:423`、`:968`) | 11 处 `cart.status()`,7 处 `cart.status_updates()` | 逐一改成 `cart.status().value()` 与 `cart.status().into_stream()`。**断言与语义一个字不改**,变的只是取得那条流/那个值多了一跳属性访问 |
-| `crates/musubi-client/tests/fixtures.rs`——`assert_state`(`:651`) | `mounted.snapshot()` 对 `hydrated(fixture)` | `mounted.state().value::<Value>()` 对 `hydrated(fixture)`——一个函数,不动任何 fixture 文件 |
-| `crates/musubi-client/tests/patch_engine.rs`、`tests/generated.rs` | `engine.apply(&envelope) -> Value` | `engine.apply(&envelope) -> Notify`;状态读取变成 `engine.tree().root::<Value>().value()`。随后这两个文件整体下沉为 in-crate 单元测试,因为 `PatchEngine` 不再公开(§5.5) |
-| `docs/rust-client.md` §2.4、§4.2、§4.3、§4.6、§5、§7、§9(`:331`、`:335`、`:1138`、`:1184`、`:1378`–`:1397`) | 数据平面的规范,外加把 `status()`/`snapshot()` 并称的那几句 | 缩减为指向本文的指针,幸存的部分(收件箱顺序、背压、`events`/上传的队列 vs latest 之选)原地保留;`status()` 的每一处改写为句柄形态,BDR-0033 的规则一条不动 |
-| `docs/rust-codegen.md` §3.2、§4.5 | 映射表与 prelude 清单 | 加一列(§4.3),加七个名字(§4.1) |
-| `docs/rust-gpui-example.md` §4.2、§4.3、§6(`:412`、`:439`、`:616`、`:851`、`:977`) | `updates()` 循环、`ListState::reset`、`status_updates` 驱动的连接指示灯 | `musubi-gpui` 的那些形态;连接指示灯改由 `status().subscribe(to_view(..))` 驱动,`_status_updates: Task<()>` 字段并入 `Vec<Subscription>`(§6.5.2) |
-| `docs/rust-codegen-example.md`(`:481`、`:502`、`:592`) | `snapshot()` / `updates()` 片段 | `state()` 加访问器片段 |
-| `crates/musubi-client/README.md`(`:23`、`:67`)、`crates/musubi-client-tokio/README.md` 与 `src/lib.rs` 文档 | `let state = cart.snapshot();` | `let state = cart.state();` |
-| `crates/musubi-client/src/latest.rs` 模块文档、`src/uploads/registry.rs` 的 `Upload` 文档(`:766`) | 点名 `Mounted::updates`/`status_updates`、“读是 `snapshot`,看是 `updates`” | 点名 `StatusState`/`Upload` 句柄与 §2.4 的统一约定(读是 `value`,看是 `subscribe`,要循环是 `into_stream`);`Latest`/`Updates` 那套理由文档原样保留 |
-| `AGENTS.md`(`:97`) | “asserts the root's snapshot equals `expected_state`” | “asserts the root's `state().value()` equals `expected_state`” |
-| `README.md`(`:123`) | “per-root liveness is observable via `Mounted::status()`/`status_updates()`” | “…via `Mounted::status()`,其上 `.value()`/`.subscribe()`” |
-| `docs/client-contract.md`(`:218`) | 点名 Rust 的状态表面 | **改**——它点名的 `status()`/`status_updates()` 变成 `status()` 加句柄上的 `.value()`/`.subscribe()`;TS 那边的 `connection.status()` / `onStatusChange(cb)` 是同样两项能力,措辞相应对齐(§5.4) |
-| `spec/decisions/BDR-0033` | 状态表面 | **不变** |
+### 5.4 `latest.rs`:一个 cell,装的是 status
 
-### 5.4 `latest.rs`:state 离开,status 留下并退到句柄之后
-
-`RootCell` 今天持有两个 `Latest` cell。**state cell 被删除;status cell 留下,
-语义一个字不改,只是退到一个句柄后面(§2.4)。**
+**`RootCell` 持有一个 `Latest` cell,装 `MountStatus`。** 状态不在 cell 里——
+它在树上(§5.2);cell 则退在一个句柄后面(§2.4)。
 
 `MountStatus` 不是状态。它是一个客户端本地的存活性投影——没有任何 wire 消息
 携带它,服务端不参与,wire 树里也没有任何节点能装它(BDR-0033、
@@ -1947,18 +1993,12 @@ where
 以免 `St::State` 不得不声明它;还要从漂移校验里排除。为了省掉一个小小的 cell 而
 付出三处排除,是笔亏本买卖。
 
-因此那个 cell 的语义**一个字不改**:latest-value,只发边沿,首次 poll 重放,
-关闭是终态,以及同一条“跨越 disconnect 持有的句柄会永远读到 `Connecting`”的
-说明。该模块保留它的 `Latest`/`Updates` 类型、它的测试和它的理由文档;消失的只是
-第二次实例化,新增的只是一份并排的回调清单(下文实现映射第 1 条)。
+因此那个 cell 的语义是:latest-value,只发边沿,首次 poll 重放,关闭是终态,
+以及“跨越 disconnect 持有的句柄会永远读到 `Connecting`”。该模块持有
+`Latest`/`Updates` 两个类型、它们的测试和它们的理由文档,外加一份与 sender/waker
+并排的回调清单(下文实现第 1 条)。
 
-**变的是够到它的路径:两个方法合并成一个属性**(§2.4 的统一约定)。
-
-| | 之前 | 之后 |
-|---|---|---|
-| 读当前值 | `mounted.status() -> MountStatus` | `mounted.status().value() -> MountStatus` |
-| 装一条观察 | `mounted.status_updates() -> impl Stream` | `mounted.status().subscribe(cb) -> Subscription` |
-| 要循环形态 | 同上 | `mounted.status().into_stream() -> impl Stream`,那条流逐字不变 |
+**够到它的路径是一个属性,不是两个方法**(§2.4 的统一约定)。
 
 **正面回答所有者在 `chat.status().into_stream()` 这一行上的批注:“这个是获取
 handle 吗?”——不是。** 句柄是 `status()` 返回的那个 `StatusState`;
@@ -2027,10 +2067,10 @@ impl StatusState {
 }
 ```
 
-**实现映射,三条,写清楚免得落地时各写各的。**
+**实现,三条。**
 
-1. **`Latest<T>` 并排长出一份回调清单,`Updates<T>` 一动不动。** cell 今天持有一
-   组 sender/waker;统一之后它旁边多一组 `Arc<dyn Fn(MountStatus) + Send + Sync>`。
+1. **`Latest<T>` 的回调清单与 `Updates<T>` 并排。** cell 持有一组 sender/waker,
+   旁边是一组 `Arc<dyn Fn(MountStatus) + Send + Sync>`。
    `set_with` 判定出一条边之后,**在 cell 锁下克隆欠下的回调,释放锁之后才逐个
    调用**——与树的 `Notify` 逐字同一条纪律(§2.6)。因此“API 里只有恰好一处在锁
    下运行调用方代码”仍然成立,而回调里调 `value()`、`subscribe()`、乃至 drop 自己
@@ -2057,10 +2097,10 @@ impl StatusState {
 
 **跨 crate 的等价物。** TypeScript 侧是 `connection.status()` 加
 `connection.onStatusChange(cb)`(`docs/client-contract.md`“Connection status”)
-——同样两项能力,两个名字。Rust 侧统一之后是同样两项能力,只有一个名字:
+——同样两项能力,两个名字。Rust 侧是同样两项能力,只有一个名字:
 `status()` 交出属性,`.value()` 与 `.subscribe()` 是它上面的两个动作。
 
-改动后的 `RootCell`:
+`RootCell`:
 
 ```rust
 pub(crate) struct RootCell<St: Store> {
@@ -2072,19 +2112,17 @@ pub(crate) struct RootCell<St: Store> {
 }
 ```
 
-`RootSink::clear` 变成:`tree.close()`(并 drop 返回的 `Notify`,它告诉每个
-订阅者 root 已经没了),然后是原封不动的事件注册表关闭、`status.close()` 和
+`RootSink::clear` 是:`tree.close()`(并 drop 返回的 `Notify`,它告诉每个
+订阅者 root 已经没了),然后是事件注册表关闭、`status.close()` 和
 `uploads.clear()`。
 
-### 5.5 `PatchEngine` 不再是受支持的公开入口
+### 5.5 `PatchEngine` 不是受支持的公开入口
 
-**决定(所有者):不公开。** `docs/rust-client.md` §7 有一段声明,说“补丁引擎是
-一个受支持的入口,不是实现泄漏”,并把 `PatchEngine`、`PatchEnvelope`、
-`PatchOp`、`StreamOp`、`UploadOp`、`PushEvent` 与 `Uploads` 列为公开。**这段声明
-在本设计落地时一并撤销。**
+**决定(所有者):不公开。** `PatchEngine`、`PatchEnvelope`、`PatchOp`、
+`StreamOp`、`UploadOp`、`PushEvent` 与 `Uploads` 都不在公开面上;
+`docs/rust-client.md` §7 相应地不为它们作任何承诺。
 
-*为什么。* 在 v1 里那句承诺很便宜:`PatchEngine` 就是“把一个信封折进一个
-`Value`”,公开它等于公开一个函数形状。迁移之后,同一句承诺会把整套树的**写半边**
+*为什么。* 公开 `PatchEngine` 会把整套树的**写半边**
 拖进公开面——`StateTree::apply`/`begin`/`close`、`Transaction`、`Notify`、
 `ChangeSet`、`CollectionEdit`、`NodeKind`、`NodeId`、`Node`、`SemanticValue`、
 `TreeError`——也就是本文最容易在实现中被推翻的那一半(结转表、日志与回滚、
@@ -2097,34 +2135,30 @@ pub(crate) struct RootCell<St: Store> {
 |---|---|
 | `State<T>`、`StreamState`、`StoreState`、`AsyncState`、`UploadSlotState`、`UploadSlot`、`Subscription`、`Change`、`CollectionEdit`、`ReadError`、`NodeId` | **公开**——这就是新的消费方表面,由 `Mounted::state()` 交出 |
 | `StateTree` 的只读方法(`root`、`node`、`to_hydrated`、`store_ids`、`len`) | **公开**——`State::tree()` 返回它,类型链必须能被命名 |
-| `StateTree::apply`/`begin`/`close`、`Transaction`、`Notify`、`ChangeSet`、`NodeKind`、`Node`、`SemanticValue`、`TreeError`、`Unsubscribe`、`SubscriberId` | **不公开**——`musubi-client` 之外没有调用方。消费方要的那点变更信息经 `StreamState::subscribe` 的第二个参数以 `&[CollectionEdit]` 送到手上(§6.3),不必看见 `ChangeSet` 本身;`Unsubscribe`/`SubscriberId` 同理是跨 crate 实现 `Subscription` 的 cell 变体所需(§2.5),消费方只见 `Subscription` |
-| `PatchEngine`、`PatchEnvelope`、`PatchOp`、`StreamOp`、`UploadOp`、`PushEvent`、`Uploads` | **从 `crates/musubi-client/src/lib.rs` 的 `pub use` 撤下**,降为 `pub(crate)` |
+| `StateTree::apply`/`begin`/`close`/`is_closed`、`Transaction`、`Notify`、`ChangeSet`、`NodeKind`、`Node`、`SemanticValue`、`TreeError`、`Unsubscribe`、`SubscriberId` | **不公开**——`musubi-client` 之外没有调用方。消费方要的那点变更信息经 `StreamState::subscribe` 的第二个参数以 `&[CollectionEdit]` 送到手上(§6.3),不必看见 `ChangeSet` 本身;`Unsubscribe`/`SubscriberId` 同理是跨 crate 实现 `Subscription` 的 cell 变体所需(§2.5),消费方只见 `Subscription` |
+| `PatchEngine`、`PatchEnvelope`、`PatchOp`、`StreamOp`、`UploadOp`、`PushEvent`、`Uploads` | **不公开**——不在 `crates/musubi-client/src/lib.rs` 的 `pub use` 里,一律 `pub(crate)` |
 
 `StoreId` 与 `UploadSlot` 不受影响:它们仍从 `musubi_client::generated` 重导出,
-因为生成 bundle 的 prelude 清单点名了它们(`docs/rust-codegen.md` §4.5)。`PatchOp` 与 `StreamOp` 的
-重导出随 `PatchEnvelope` 一起降为内部路径——撤下信封之后,已经没有任何公开签名
-提到它们。这把 §1.3 的重导出承诺收窄了一档,而不是推翻:变化的是**哪些**路径需要
-继续解析,不是它们解析到哪里。
+因为生成 bundle 的 prelude 清单点名了它们(`docs/rust-codegen.md` §4.5)。`PatchOp` 与 `StreamOp`
+与 `PatchEnvelope` 一样是内部路径——没有任何公开签名提到它们。这把 §1.3 的重导出
+承诺收窄了一档,而不是推翻:收窄的是**哪些**路径需要继续解析,不是它们解析到
+哪里。
 
 *强制手段是不发布,不是可见性。* `musubi-state` 是 `publish = false`,消费方够得
 到的只有 `musubi_client` 与生成 bundle 的 prelude 点名的那些名字。写半边在
 `musubi-state` 里仍是 `pub`(跨 crate 调用需要),但不被重导出、不被文档点名,
 并带 `#[doc(hidden)]`。
 
-*三个现存依赖的去向。* 这三处是**集成测试驱动公开面**的典型:它们从
-`tests/` 目录写起,于是被测的东西被迫 `pub`——而不是先有需求再有公开面。
+*引擎的测试是 in-crate 的,不是集成测试。* 信封解码与 op 白名单在
+`src/envelope.rs` 的 `#[cfg(test)] mod tests`,版本纪律与原子性在 `src/engine.rs`
+的同名模块,水合与变更集在 `musubi-state` 的投影测试与事务测试,“一个背后没有
+连接的 handle 不能传输”在 `src/uploads/registry.rs`。**公开面不由 `tests/` 目录
+决定**:一个从 `tests/` 写起的用例会逼着被测的东西 `pub`,那是先有测试位置再有
+公开面,顺序反了。`tests/` 里留下的是真正跨公开面的东西——脚本化 socket 的
+连接套件、fixture 回放、上传传输。
 
-| 依赖 | 今天 | 去向 |
-|---|---|---|
-| `crates/musubi-client/tests/patch_engine.rs`(约 600 行) | `PatchEnvelope::decode` + `PatchEngine::apply`,覆盖信封解码与 op 白名单、版本纪律与原子性、水合、变更集 | 拆三份下沉:解码与白名单进 `src/envelope.rs` 的 `#[cfg(test)] mod tests`;版本纪律与原子性进 `src/engine.rs` 的同名模块;水合与变更集进 `musubi-state` 的投影测试与事务测试(§8 第 1 步本来就在收这批) |
-| `crates/musubi-client/tests/generated.rs`(约 320 行) | `PatchEngine` 折信封,再断言 `AsyncResult` 的 wire 形状与三个 trait | 绝大多数用例根本不需要引擎——它们测的是 serde 形状,直接断言即可;少数需要喂状态的,改经 `tests/connection.rs` 既有的脚本化 socket harness 与 `Mounted::state()` |
-| `crates/musubi-client/tests/uploads.rs:236`——`PatchEngine::new()` + `engine.uploads()` | “一个背后没有连接的 handle 不能传输” | `src/uploads/registry.rs` 的 in-crate 单元测试;`Uploads` 随之撤下 |
-
-覆盖率不下降是这次收窄的前提:每一个用例都要有落点,一个都不删。这与 §8 第 1 步
-的做法一致——从 `hydrate.rs`/`index.rs`/`streams.rs` 删掉的单元测试先移植再删代码。
-
-*为什么 TypeScript 的先例不再构成约束。* `packages/client/src/index.ts` 导出
-`applyPatch`、`applyStreamOps` 与 `applyUploadOps`,v1 拿它当过论据。它们是三个
+*为什么 TypeScript 的先例不构成约束。* `packages/client/src/index.ts` 导出
+`applyPatch`、`applyStreamOps` 与 `applyUploadOps`。它们是三个
 **纯函数**:文档进,文档出,没有身份,没有订阅者,没有事务,没有生命周期,承诺
 就等于签名本身。Rust 侧与它们等价的东西**不是** `PatchEngine`,而是
 `musubi-state` 的树——一个有 `NodeId` 身份、有 RAII 订阅、有跨信封存活期的保留
@@ -2133,37 +2167,34 @@ pub(crate) struct RootCell<St: Store> {
 半边就是 Rust 版的“不必自己接线也能读到状态”,而它的形状恰好比一个手工折信封的
 循环更好用。
 
-落地这条决定的那一步写在 §8 第 6 步。
-
 ---
 
 ## 6. 进阶面的 API:command、event、stream、upload
 
 前五节定义的是状态平面。四个进阶面里,只有**一个**在状态树上:stream。另外三个
-——command、event、upload——的**语义**一个字都不改,变的是它们与树的**组合
-方式**:过去是“做一件事,然后轮询整根快照看它落地了没有”,现在是“做一件事,
-然后由那件事真正会改动的那个节点通知你”。其中 upload 的**两个方法名**并入 §2.4
-的统一约定(`snapshot()`/`updates()` 成为 `value()`/`subscribe()`,流形态作为
-`into_stream()` 保留),外加一条从树上一步走到它的桥(`Mounted::upload_at`,
-§3.4);command 与 event 连名字都不动,理由分别在 §6.1 与 §6.2。
+——command、event、upload——不在树上,它们与树的**组合方式**是同一条:做一件
+事,然后由那件事真正会改动的那个节点通知你,而不是轮询一份整根。upload 的句柄
+遵守 §2.4 的统一约定(读 `value()`、看 `subscribe()`、要循环
+`into_stream()`),并有一条从树上一步走到它的桥(`Mounted::upload_at`,§3.4);
+command 与 event 为什么各自长成现在的样子,分别在 §6.1 与 §6.2。
 
 本节的形状以 §4.2 的 `CartState` 为准(`title`、`lines`、`messages`、`feed`、
 `checkout_panel`、`avatar`),因为它一个形状就覆盖了四个面;示例另外用到四个
 显然的标量字段——`total: i64`、`discount: i64`、`last_coupon_status`、
-`avatar_url: String`——它们不改变任何论证,只是让示例读起来像真的。§6.3 的迁移
-前后代码换成 `examples/chat_room/desktop`,因为那是仓库里真实的流消费方。
+`avatar_url: String`——它们不改变任何论证,只是让示例读起来像真的。§6.3 的对照
+代码换成 `examples/chat_room/desktop`,因为那是仓库里真实的流消费方。
 
 **§6.1–§6.4 逐面拆开;§6.5 把它们合回一个程序**,同一个业务场景写两遍——一遍
 纯 client(tokio,无头),一遍 gpui——形状全部取自 `examples/chat_room` 的真实
 store。想先看“组合起来长什么样”的读者可以直接跳到 §6.5,四个面在那里各自带回
 本节的锚点。
 
-| 面 | 在树上吗 | 表面变化 | 结果怎么被观察到 |
+| 面 | 在树上吗 | 表面 | 结果怎么被观察到 |
 |---|---|---|---|
-| command | 否——控制面 | 无 | 订阅这条命令会改动的那个节点(§6.1) |
-| event | 否——独立注册表 | 无 | 事件流本身;与节点订阅正交,不参加 §2.4 的统一(§6.2) |
-| stream | **是** | `StreamState<T>`(新)+ `CollectionEdit` | 集合级订阅与行级订阅,两层(§6.3) |
-| upload | 槽位在树上,但是惰性叶 | 槽位访问器返回 `UploadSlotState`,`Mounted::upload_at` 一步桥到句柄;句柄上两个方法改名为 `value()`/`subscribe()`,流形态是 `into_stream()` | `Upload::subscribe(..)`,或 `.into_stream()`;与树互不通知(§6.4) |
+| command | 否——控制面 | `command()` / `command_on()` | 订阅这条命令会改动的那个节点(§6.1) |
+| event | 否——独立注册表 | `events::<E, T>(&store_id)` | 事件流本身;与节点订阅正交,不参加 §2.4 的统一(§6.2) |
+| stream | **是** | `StreamState<T>` + `CollectionEdit` | 集合级订阅与行级订阅,两层(§6.3) |
+| upload | 槽位在树上,但是惰性叶 | 槽位访问器返回 `UploadSlotState`,`Mounted::upload_at` 一步桥到句柄;句柄上是 `value()`/`subscribe()`,流形态是 `into_stream()` | `Upload::subscribe(..)`,或 `.into_stream()`;与树互不通知(§6.4) |
 
 四个面,一眼看全:
 
@@ -2198,9 +2229,8 @@ let _pill = cart.status().subscribe(|status| set_pill(status));
 
 ### 6.1 command:发起在控制面,落地在树上
 
-**`Mounted::command` 与 `command_on` 不变**(§5.3 表)。命令不是状态:它没有节点,
-没有 revision,发一条命令本身不会通知任何订阅者。改变的是它的另一半——**怎么知道
-它落地了**。
+**命令是控制面,不是状态**(§5.3)。它没有节点、没有 revision,发一条命令本身
+不会通知任何订阅者。有内容的是它的另一半——**怎么知道它落地了**。
 
 BDR-0009 是这里的全部张力:**回复不受补丁门控**。`reply.ok == true` 只说明服务端
 受理了这条命令,不说明由它引发的状态变化已经到达客户端。v1 里唯一的观察手段是
@@ -2290,7 +2320,9 @@ entity,所以调用点是两个参数。)*
 
 ```rust
 let panel = state.checkout_panel();                   // StoreState<PanelState>
-cart.command_on(&panel.store_id(), Pay { method: "card".into() }).await?;
+let target = panel.store_id().expect("the panel is mounted");
+
+cart.command_on(&target, Pay { method: "card".into() }).await?;
 ```
 
 `panel` 是一个绑定 `NodeId` 的视图,而 store 节点按 `store_id` 调和(§3.2),所以
@@ -2314,7 +2346,7 @@ cart.command_on(&panel.store_id(), Pay { method: "card".into() }).await?;
 
 ### 6.2 event:与树正交的第二条平面
 
-**`Mounted::events::<E, T>(&store_id)` 不变**(§5.3、§7 存活表)。事件不是状态:
+**`Mounted::events::<E, T>(&store_id)` 是事件平面的唯一入口**(§5.3、§7)。事件不是状态:
 它不在树上,没有节点,没有 revision,不出现在 `ChangeSet` 里,也永远不会让任何
 节点订阅者被唤醒——即使它和一批补丁搭在同一个信封里到达。
 
@@ -2344,7 +2376,8 @@ cx.spawn(async move |this, cx| {
 .detach();
 
 // 子 store 的事件:同一个注册表,换一个 store_id——它同样来自节点视图。
-let mut receipts = cart.events::<ReceiptReadyPayload, _>(&state.checkout_panel().store_id());
+let panel = state.checkout_panel().store_id().expect("the panel is mounted");
+let mut receipts = cart.events::<ReceiptReadyPayload, _>(&panel);
 ```
 
 两条平面的差别,逐条:
@@ -2517,9 +2550,9 @@ pub fn drive_list<T, V: 'static>(
 重绘的收益一分不少,只有“不重算行高”这一项拿不到。降级路径是干净的,这也是
 §5.1 说能力(1)自己就足以支撑那个 crate 的意思。
 
-#### 迁移前后:`examples/chat_room/desktop`
+#### 对照:`examples/chat_room/desktop`
 
-今天(`app.rs:215`、`:338`、`:379`、`:656`、`:1013`):
+整根快照之下,这个视图长这样:
 
 ```rust
 struct ChatWindow {
@@ -2556,7 +2589,7 @@ fn messages(&self) -> &[MessageState] {
 }
 ```
 
-迁移后:
+保留树之下,同一个视图:
 
 ```rust
 use generated::nav::*;
@@ -2573,7 +2606,7 @@ struct ChatWindow {
 }
 
 impl ChatWindow {
-    fn new(chat: Mounted<ChatRoomStore>, cx: &mut Context<Self>) -> Self {
+    fn new(chat: Mounted<ChatRoomStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = chat.state();
         let feed = state.messages();
 
@@ -2582,13 +2615,13 @@ impl ChatWindow {
             //    “用户正在打字时被一个无关信封刷掉”的窗口也就没了。
             //    (`observe_with` 是 `observe` 的带回调变体;`observe` 本身
             //     只做一次 `cx.notify()`。)
-            musubi_gpui::observe_with(&state.current_user().name(), cx, |view, name, window, cx| {
+            musubi_gpui::observe_with(&state.current_user().name(), window, cx, |view, name, window, cx| {
                 view.set_draft(&name.value(), window, cx);
             }),
             // 2. 加载态:订阅异步节点本身。`loading <-> ok` 翻转只动它(§3.3),
             //    所以重连时列表变暗**不会**重绘任何一行;同一个回调顺便在结果
             //    出现或消失时重挂列表驱动器。
-            musubi_gpui::observe_with(&feed, cx, |view, _feed, _window, cx| {
+            musubi_gpui::observe_with(&feed, window, cx, |view, _feed, _window, cx| {
                 view.rebind_rows(cx);
                 cx.notify();
             }),
@@ -2639,7 +2672,7 @@ impl ChatWindow {
 
 清账,逐项:
 
-| | 今天 | 迁移后 |
+| | 整根快照之下 | 保留树之下 |
 |---|---|---|
 | 一个只动 `online_users` 的信封 | 整根反序列化 + `adopt` + 整窗重绘 | 只通知 `online_users` 的订阅者;列表、输入框、气泡一个都不动 |
 | 一条新消息到达 | 整根反序列化 + `ListState::reset(count)`,丢掉 100 行的行高缓存 | 一次 `splice(0..0, 1)`,99 行的行高缓存保留 |
@@ -2648,10 +2681,10 @@ impl ChatWindow {
 | 一个纯上传进度的信封 | 整根反序列化 + 整窗重绘 | 状态平面零唤醒(§6.4) |
 | 名字草稿 | 每个信封比对一次字符串 | 只有 `current_user.name` 真的变了才回调 |
 
-六个无头 `#[gpui::test]` 的**断言值**一个不变(§5.3 表):poster、行数、
-`debug_bounds(..)` 全部照旧,脚本化的 wire 帧也照旧。变的只有读法——
-`chat.messages().len()` 写成 `chat.message_count()`,因为访问器不再返回一片借自
-快照的切片。它们从来不经由 `Mounted` 读状态,这正是它们能当验收关卡的原因。
+六个无头 `#[gpui::test]` 是这套读法的验收关卡(§5.3):poster、行数、
+`debug_bounds(..)` 与脚本化的 wire 帧断言,全部经由视图访问器读取,从不经由
+`Mounted` 读状态——这正是它们能当关卡的原因。行数读作 `chat.message_count()`,
+因为访问器交出的是一个集合视图,不是一片借自快照的切片。
 
 ### 6.4 upload:两个平面并存,互不通知
 
@@ -2692,16 +2725,16 @@ while let Some(handle) = progress.next().await {
 let _url = state.avatar_url().subscribe(|_| redraw_avatar());
 ```
 
-**表面对照,以及它没有改动的东西:**
+**上传平面的表面:**
 
-| | 之前 | 之后 |
-|---|---|---|
-| 取得句柄 | `Mounted::upload(&store_id, &slot.value().name)` —— 先物化槽位,再手写另一半键 | `Mounted::upload_at(&slot) -> Option<Upload>` —— 一步,两半键都来自节点(§3.4) |
-| 读当前值 | `Upload::snapshot() -> UploadHandle` | `Upload::value() -> UploadHandle` |
-| 装一条观察 | `Upload::updates() -> impl Stream` | `Upload::subscribe(cb) -> Subscription` |
-| 要循环形态 | 同上 | `Upload::into_stream(self) -> impl Stream`,**那条流逐字不变** |
-| `select`/`start`/取消/预检/外部 `Uploader` | | 不动 |
-| `UploadHandle` 这个值类型 | | 不动——字段、`progress()`、`PartialEq`,以及“每次给出的是一份克隆而不是一个会在读者手里变的可变对象”这条与 TypeScript 客户端的差异,全部照旧 |
+| | |
+|---|---|
+| 取得句柄 | `Mounted::upload_at(&slot) -> Option<Upload>` —— 一步,两半键都来自节点(§3.4);`Mounted::upload(&store_id, name)` 是它下面的原语 |
+| 读当前值 | `Upload::value() -> UploadHandle` |
+| 装一条观察 | `Upload::subscribe(cb) -> Subscription` |
+| 要循环形态 | `Upload::into_stream(self) -> impl Stream` —— 同一条订阅的 `await` 形态 |
+| `select`/`start`/取消/预检/外部 `Uploader` | 控制面,与树正交(`docs/rust-client.md` §10) |
+| `UploadHandle` 这个值类型 | 字段、`progress()`、`PartialEq`,以及“每次给出的是一份克隆而不是一个会在读者手里变的可变对象”这条与 TypeScript 客户端的差异 |
 
 **同样正面回答一次:`into_stream()` 不是在取句柄。** 句柄是
 `Mounted::upload_at(&slot)` 返回的那个 `Upload`;`into_stream()` 拿走它(或者拿走
@@ -2904,8 +2937,8 @@ async fn main() -> anyhow::Result<()> {
 
             // 上面那条命令不必等,因为它不读树。下面要读了,所以先等一次
             // `Live`:`mount` 返回时首个补丁还没落地(`MountStatus::Connecting`)。
-            // 这就是 v1 “等第一份 snapshot” 的那次等待,判据从 `Option` 换成了
-            // 状态;等价写法是等 `state.revision() != 0`(§5.3)。**订阅本身
+            // 这是在等第一份补丁落地,判据是连接状态;等价写法是等
+            // `state.revision() != 0`(§5.3)。**订阅本身
             // 从不需要等**:节点视图现在就能装,补丁落地时它自然响。
             //
             // 这里要的是“await 一个条件”,所以把同一个属性的订阅换成**流形态**
@@ -3126,7 +3159,7 @@ impl ChatWindow {
         // ── 2. 树上的订阅:每个视图关心什么,就订什么 ────────────────────
         let subs = vec![
             // 名字草稿:订阅那一个叶子。别的字段变化不再碰输入框。
-            musubi_gpui::observe_with(&state.current_user().name(), cx, |view, name, window, cx| {
+            musubi_gpui::observe_with(&state.current_user().name(), window, cx, |view, name, window, cx| {
                 view.set_draft(&name.value(), window, cx);
             }),
             // 4. 回执:另一个叶子。命令处理器里不做任何 UI 更新,这里做。
@@ -3136,7 +3169,7 @@ impl ChatWindow {
             // 2. 加载态:订阅异步节点本身。`ok <-> loading` 只动它(§3.3),
             //    所以重连时列表变暗**不重绘任何一行**;同一个回调顺便在集合
             //    出现或消失时重挂列表驱动器。
-            musubi_gpui::observe_with(&feed, cx, |view, _feed, _window, cx| {
+            musubi_gpui::observe_with(&feed, window, cx, |view, _feed, _window, cx| {
                 view.rebind_rows(cx);
                 cx.notify();
             }),
@@ -3147,7 +3180,7 @@ impl ChatWindow {
             // 要送到视图上”,不认识任何句柄类型,于是树外的句柄也用得上它。
             // 它顺便负责在 `Live` 之后装上上传的那条订阅:槽位名字要从树上读,
             // 而 `mount` 返回时首个补丁还没落地(§6.5.1 里是同一次等待)。
-            chat.status().subscribe(musubi_gpui::to_view(cx, |view, status, _window, cx| {
+            chat.status().subscribe(musubi_gpui::to_view(window, cx, |view, status, _window, cx| {
                 view.status = status;
                 view.watch_upload(cx);       // 幂等:`upload.is_some()` 即返回
                 cx.notify();
@@ -3273,151 +3306,35 @@ impl ChatWindow {
 | 重连与恢复(BDR-0015)、`soft_reset`、版本纪律 | `src/actor.rs`、`src/engine.rs`、`docs/rust-client.md` §9 | `soft_reset` 依然只忘记版本、保留树,这正是让最后一份良好渲染活着穿过一次 rejoin 的东西。rejoin 的 `replace ""` 现在是把树*调和*一遍,而不是替换一个 `Value`——这是严格的改进,因为未变的子树保住身份,谁也不通知。 |
 | 命令、`command_on`、回复类型化、“回复不受补丁门控”契约 | `src/mounted.rs`、`docs/rust-client.md` §6.2 | 不动。`StoreState::store_id()` 取代 `snapshot.panel.store_id` 成为指定目标的方式;组合用法见 §6.1。 |
 | 推送事件(BDR-0032)、`events()` 的无界队列、按 `(store_id, name)` 的分发 | `src/mounted.rs` | 不动,包括“在状态发布之后”的顺序(§3.6 第 11 步);与节点订阅的关系见 §6.2。 |
-| 上传,两个平面:`upload_ops` 折叠、`UploadHandle` 这个值类型、预检、分块二进制传输、外部 `Uploader`、`select`/`start`、`Mounted::upload(&store_id, name)` 这个原语 | `src/uploads/*`、`docs/rust-client.md` §10 | 上传槽位是惰性叶子(§3.4)。语义改动只有一处:剪枝改读 `tree.store_ids()` 而不是索引。句柄上 `snapshot()`/`updates()` 两个**名字**并入 §2.4 的统一约定(`value()`/`subscribe()`,流形态为 `into_stream()`),这是改名不是改语义;新增的 `Mounted::upload_at(&slot)` 是同一个注册表查询的一个**更短的入口**,不是第二套机制(§3.4);两平面的边界见 §6.4。 |
-| `MountStatus` 的每一条语义、`Latest`/`Updates` cell、BDR-0033 | `src/latest.rs`、`src/mounted.rs` | 值、cell、边沿语义、首次 poll 重放、`disconnect()` 之后永远 `Connecting`——全部不变。变的只有够到它的路径:两个方法合并为 `status() -> StatusState`(§2.4、§5.4)。 |
+| 上传,两个平面:`upload_ops` 折叠、`UploadHandle` 这个值类型、预检、分块二进制传输、外部 `Uploader`、`select`/`start`、`Mounted::upload(&store_id, name)` 这个原语 | `src/uploads/*`、`docs/rust-client.md` §10 | 上传槽位是惰性叶子(§3.4)。语义改动只有一处:剪枝改读 `tree.store_ids()` 而不是索引。句柄上的三个动作按 §2.4 的统一约定命名(`value()`/`subscribe()`,流形态为 `into_stream()`);`Mounted::upload_at(&slot)` 是同一个注册表查询的一个**更短的入口**,不是第二套机制(§3.4);两平面的边界见 §6.4。 |
+| `MountStatus` 的每一条语义、`Latest`/`Updates` cell、BDR-0033 | `src/latest.rs`、`src/mounted.rs` | 值、cell、边沿语义、首次 poll 重放、`disconnect()` 之后永远 `Connecting`——全部由本设计之外的规则决定。够到它的路径是一个属性:`status() -> StatusState`(§2.4、§5.4)。 |
 | 挂载缓存(stale-while-revalidate)、`CacheStore`、`CacheEntry`、`cache_key`、GC、写节流 | `src/cache.rs`、`src/cache_coordinator.rs`、`docs/rust-client.md` §6.4 | **`CacheEntry::data` 是 wire 树,并且继续是 wire 树。** 写入把过去传 `engine.document()` 的地方改传 `tree.to_wire(root)`——替换掉 `on_publish` 本来就在做的那次 `Value` 克隆。种子(seed)把缓存的 `Value` 传进 `PatchEngine::seed`,后者现在**从它构建保留树**,而不是把它当作影子文档采纳;被种下的流槽位在实时信封重新填满它之前仍然渲染为 `[]`,因为缓存的树里没有 `stream_ops`。校验不通过的种子照旧被丢弃,照旧留下一个冷挂载,被种下的 root 照旧不进入 `Live`。 |
-| wire fixture 与捕获任务 | `test/support/wire_capture/*`、`crates/musubi-client/tests/fixtures/*.json` | **没有 fixture 文件变动。** `expected_state` 是服务端水合前的 wire root,而回放的比较无论如何都是针对它水合后的形态(§8)。 |
+| wire fixture 与捕获任务 | `test/support/wire_capture/*`、`crates/musubi-client/tests/fixtures/*.json` | **fixture 文件不受本设计影响**,而回放是树与 wire 表示等价的关卡——见 §8。 |
 | 错误分类学 | `src/error.rs`、§11 | `TreeError` 映射到既有的变体上(§2.3);`MusubiError::Decode` 保持它的含义和触发条件,只是从周期的第 6 步移到第 4 步。 |
 | Builder、配置键、`mix compile.musubi_rust` 编译器契约、模块树、提升、命名 | `src/connection.rs`、`lib/musubi/codegen/*`、`docs/rust-codegen.md` §1–§3.6、§4.1–§4.4、§4.6–§4.7 | §4.1。 |
 | Elixir 服务端、TypeScript 客户端、`@musubi/react` | `lib/`、`packages/` 下的一切 | wire 契约不动。 |
 
 ---
 
-## 8. 迁移计划
+## 8. wire fixture:树与 wire 表示等价的关卡
 
-有序。每一步都让所有关卡保持绿色——`cargo fmt --all --check`、
-`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`,
-以及 `mix precommit`。这些是一个 PR 内部的提交边界(§5.2),不是发布边界;如果
-严格执行 AGENTS.md 的“没有调用方就不写代码”规则,第 1 步和第 2 步应一并落地,
-因为第 1 步唯一的调用方是它自己的测试。
+21 份 wire fixture 的回放(`crates/musubi-client/tests/fixtures.rs`)是本设计的
+外部验收关卡。它值得说精确,因为它是唯一一处“客户端算出来的东西”被拿去对
+“服务端写下来的东西”的地方。
 
-1. **`crates/musubi-state`,独立落地,自带测试。** arena、`NodeKind`、
-   `SemanticValue` 与等价判定、pointer 解析、object/array/store/collection 的
-   调和、日志及其回滚、结转表、事务的结算/比对、`ChangeSet` 与
-   `CollectionEdit`、`Notify`、`State<T>` 与四个视图 newtype(`StreamState`、
-   `StoreState`、`AsyncState`、`UploadSlotState`)、`Subscription` 的 RAII
-   (含它的两个变体、`Unsubscribe` 与 `SubscriberId`,§2.5——cell 变体在这一步
-   没有实现方,它的测试用一个 in-crate 的假 cell)、两个投影。第 2 步中从
-   `hydrate.rs`、`index.rs` 和 `streams.rs` 删掉的单元
-   测试先移植到这里,成为投影测试和键控集合测试,好让它们钉住的行为一刻也不
-   失去覆盖。workspace 保持绿色:没有别的东西依赖它。
-
-2. **`PatchEngine` 换掉内脏。** `musubi-client` 依赖 `musubi-state`,并移除
-   `json-patch`。影子 `Value`、`StoreIndex`、`StreamStore`、`StreamsView` 和
-   水合遍历被删除;`PatchEngine` 改为持有一个 `StateTree`。它的**公开形状保持
-   不变**:`apply(&envelope) -> Result<Value>` 仍返回水合后的 root(来自
-   `to_hydrated`),`document()` 仍返回 wire 树(来自 `to_wire`),
-   `seed`/`discard_seed`/`soft_reset`/`version`/`uploads` 一概不变。
-   *引擎之上的一切都不动*,所以整套既有测试——包括全部 21 份 wire fixture 和
-   每一个 `connection.rs` 测试——**原样通过**。这一步在任何消费方依赖树之前就
-   证明了树与 wire 等价,也是最便宜地抓出差异的地方。
-
-3. **`RootCell` 长出树。** `RootSink::publish` 变成 `validate` + `tree`;actor 的
-   `patch()`/`publish()` 采纳 §3.6 的顺序。`Mounted::state()` 与
-   `snapshot()`/`updates()` **并存**加入——这是两套表面同时存在的唯一时刻,
-   好让后续步骤逐个迁移消费方。`PatchEngine::prepare`/`commit` 在这里删除,
-   因为 actor 不再需要它们。
-
-4. **消费方迁移,每个一次提交。**
-   1. `tests/fixtures.rs`——`assert_state` 切换到 `state().value::<Value>()`。
-      一个函数。
-   2. `tests/patch_engine.rs` 和 `tests/generated.rs`——改为经 `engine.tree()`
-      读取。这一步只搬读取表达式,不搬文件位置;文件的最终去向在第 6 步
-      (§5.5),两步分开是为了让“树读数正确”与“公开面收窄”各自可以被单独
-      回滚。
-   3. `tests/connection.rs`——§5.3 表中约 40 处,外加要拆分的两个 `updates()`
-      测试。
-
-5. **删除 v1 表面,并统一树外的两个句柄面(§2.4)。** 删除:
-   `Mounted::snapshot()`、`Mounted::updates()`、`Latest<Arc<St::State>>` cell、
-   `RootSink::publish`。`latest.rs` 保留 status cell 和它的测试。同一步里,
-   `Latest<T>` 与 `UploadCell` 各长出一份回调清单并实现 `Unsubscribe`
-   (§5.4、§6.4);`Mounted::status()` 改为交出 `StatusState`,
-   `Mounted::status_updates()` 移除;`Upload::snapshot`/`updates` 更名为
-   `value`/`subscribe`,流形态以 `into_stream(self)` 保留(签名从 `&self` 改为
-   `self`,句柄 `Clone`,§2.4)。消费方随之改:`tests/connection.rs` 的 BDR-0033
-   套件 11 处 `cart.status()` 变 `cart.status().value()`、7 处
-   `cart.status_updates()` 变 `cart.status().into_stream()`,**断言逐字不变**;
-   `src/uploads/*` 与 `src/engine.rs` 里既有的 `updates()` 用例只改调用形态
-   (需要保留句柄的加一次 `clone()`),新增两个用例钉住回调形态——“订阅在 drop
-   之后至多多收一次”与“回调不在注册时触发”。这一步与前四步正交(它不碰树),
-   放在这里只是因为 §2.4 的对照表要在消费方迁移(第 9、10 步)之前成立。
-
-   同一步落地 `Mounted::upload_at(&slot) -> Option<Upload>`(§3.4):四行,查一次
-   `UploadSlotState::key()` 再转发给既有的 `upload(&store_id, name)`;
-   `upload()` 本身不动。它放这里是因为消费方(第 9 步、§6.5)要用,而它依赖的
-   `UploadSlotState` 在第 1 步就有了。
-
-   *读值器的改名(`get()`/`try_get()` → `value()`/`try_value()`)不在这一步。*
-   它属于第 1 步:那七处读值器里有五处生在 `musubi-state` 里,从第一行代码起就
-   叫 `value()`,根本没有旧名可改;树外那两处在本步随统一一并落地。写下这条只是
-   为了让“为什么迁移计划里找不到一次全局改名”有个答案——**因为这套表面在同一个
-   PR 内首次出现(§5.2),改名发生在它诞生之前。**
-
-6. **收窄公开面(§5.5)。** `PatchEngine`、`PatchEnvelope`、`PatchOp`、
-   `StreamOp`、`UploadOp`、`PushEvent`、`Uploads` 从
-   `crates/musubi-client/src/lib.rs` 的 `pub use` 撤下并降为 `pub(crate)`;树的
-   写半边(`StateTree::apply`/`begin`/`close`、`Transaction`、`Notify`、
-   `NodeKind`、`Node`、`SemanticValue`、`TreeError`)不被重导出,并在
-   `musubi-state` 里标 `#[doc(hidden)]`。三个集成测试按 §5.5 的表下沉:
-   `tests/patch_engine.rs` 拆进 `src/envelope.rs`、`src/engine.rs` 与
-   `musubi-state`,`tests/generated.rs` 去掉引擎依赖(需要喂状态的少数用例改经
-   `connection.rs` 的 socket harness),`tests/uploads.rs:236` 那一处进
-   `src/uploads/registry.rs`。**一个用例都不删。** 同一次提交里撤销
-   `docs/rust-client.md` §7 那段“补丁引擎是受支持的入口”的声明——代码与承诺
-   一起走,免得留下一份指向已消失符号的文档。
-
-7. **代码生成产出导航表面。** `Musubi.Codegen.Rust` 长出 `Ext` trait、`nav`
-   模块和七个 prelude 名字(§4.1);`Musubi.Codegen.Rust.TypeRenderer` 长出
-   §4.3 的导航列——其中 upload 槽位那一行发射的是 `UploadSlotState` 而不是
-   `State<musubi::UploadSlot>`,快照列(`musubi::UploadSlot`)一个字不动。
-   `mix compile.musubi_rust --check` 重新生成
-   `priv/codegen/rust/musubi.rs` 和 `examples/chat_room/desktop/src/generated.rs`。
-   Elixir 侧的测试(`test/musubi/codegen/rust_test.exs`、类型渲染器的表格测试、
-   编译冒烟测试)为每一个新行增加用例。
-
-8. **`crates/musubi-gpui`** 落地,排除在 workspace 之外,带上 `observe`、
-   `to_view`(§5.1)和列表驱动器(§6.3)。
-
-9. **`examples/chat_room/desktop` 同时采纳两者。** `_updates` 循环变成订阅;
-   `_status_updates` 那条 `cx.spawn` 循环变成
-   `chat.status().subscribe(musubi_gpui::to_view(..))`,`Task<()>` 字段并入那一个
-   `Vec<Subscription>`;`watch_upload` 从
-   `upload(&StoreId::root(), &slot.name)`+`updates()`+`snapshot()` 改为
-   `upload_at(&state.attachment())`+`subscribe()`+`value()`,顺序不变;
-   `ListState::reset` 变成一次拼接。迁移前后的
-   目标形态见 §6.3,四个面合起来的完整视图见 §6.5.2。六个无头
-   `#[gpui::test]` 是验收关卡,它们的**断言不变**——它们本来就是通过视图访问器
-   和 `debug_bounds` 读取,而不是通过 `Mounted`。
-
-10. **文档。** `docs/rust-client.md` §2.4/§4/§5/§7/§9 缩减并交叉链接(§7 的那段
-    声明已在第 6 步撤销),`docs/rust-codegen.md` §3.2/§4.5 修订,以及
-    `docs/rust-gpui-example.md`、`docs/rust-codegen-example.md`、
-    `docs/client-contract.md` 那条点名 Rust status 表面的项、根 `README.md`、
-    两个 crate 的 README、`AGENTS.md`。status 与 upload 的措辞按 §2.4 的统一
-    约定改写——**改的是名字与写法,BDR-0033 与上传两平面的每一条规则原样保留。**
-
-**wire fixture 全程如何保持通过。** 它们是整个计划围绕的不变式,值得说精确:
-
-- fixture 的 **JSON 文件在任何一步都不变**。`expected_state` 是服务端自己的 wire
-  root(`Musubi.Page.Server.State.previous_wire_root`),由 Elixir 测试套件编写,
-  而 `mix musubi.capture_wire` + `git diff --exit-code` 依然是捕获侧的漂移
-  关卡。
-- 第 1–3 步期间回放**完全不动**:第 2 步保持了 `PatchEngine` 的公开形状,第 3 步
-  `snapshot()` 仍然存在,所以 `assert_state` 里 `mounted.snapshot()` 对
-  `hydrated(fixture)` 的比较按原样运行。
-- 在第 4.1 步它只变一个表达式:`mounted.state().value::<Value>()`。fixture 的
-  store 声明 `St::State = serde_json::Value`(`fixture_stores!` 宏),所以
-  `value()` 在那里是全函数——没有生成结构体,没有漂移分层,没有 panic 路径。比较目标仍是
-  同一个 `hydrated(fixture)` 辅助函数。
-- 让这次通过不至于自证循环的东西不变:文档是服务端的,客户端必须只靠 fixture
-  投递的内容把它算出来。如今算到它还额外证明了 `to_hydrated` 精确复现水合遍历的
-  输出,并且——通过第 2 步保留下来的 `document()`——证明 `to_wire` 精确复现
-  影子文档。
-- 逐帧断言(出站帧、命令回复、事件流、无尾随帧检查)与这些毫无关系,一点也不
-  变。
-
----
+- **fixture 的 JSON 文件由服务端一侧产生。** `expected_state` 是服务端自己的
+  wire root(`Musubi.Page.Server.State.previous_wire_root`),由 Elixir 测试套件
+  编写;`mix musubi.capture_wire` + `git add --intent-to-add` +
+  `git diff --exit-code` 是捕获侧的漂移关卡。客户端从不写它们。
+- **比较的对象是水合后的形态。** 回放把信封逐条喂进树,再拿
+  `mounted.state().value::<Value>()` 对 `hydrated(fixture)`。fixture 的 store
+  声明 `St::State = serde_json::Value`(`fixture_stores!` 宏),所以 `value()`
+  在那里是全函数——没有生成结构体,没有漂移分层,没有 panic 路径。
+- **它不自证循环。** 那份文档是服务端的,客户端必须只靠 fixture 投递的内容把它
+  算出来。算到它因此同时证明了 `to_hydrated` 精确复现服务端的水合语义;而
+  `to_wire`(挂载缓存写入所用的那个投影,§7)由缓存回合的用例钉住。
+- **逐帧断言与状态平面无关。** 出站帧、命令回复、事件流、无尾随帧检查,一条也
+  不经过树。
 
 ## 9. 语义附录
 
@@ -3699,8 +3616,8 @@ impl<T: DeserializeOwned> State<T> {
 | 整根(`state().value()`) | ~900 | 这正是 v1 每信封都在做、本设计要消除的那件事。留给 fixture 回放(每份 fixture 一次)和 `try_value()` 的整体断言 |
 
 **倾向:先落 (a)。** 三条理由:(1) (b) 是一次**纯内部替换**——`try_value` 的签名、
-`ReadError`、每一个调用点都不变——所以它可以在任何时候落地,没有迁移,没有
-semver 后果,推迟它不欠债;(2) (a) 的代价与“读得太粗”高度相关,而“读得太粗”有
+`ReadError`、每一个调用点都不变——所以它可以在任何时候落地,调用方无需改动,
+没有 semver 后果,推迟它不欠债;(2) (a) 的代价与“读得太粗”高度相关,而“读得太粗”有
 一个更便宜的修法(按节点读),先上 (b) 会把这个更该做的修正掩盖掉;(3)
 `docs/rust-client.md` §4.6 已经推迟过这条管道一次,当时的理由今天依然成立。
 
@@ -3714,6 +3631,14 @@ semver 后果,推迟它不欠债;(2) (a) 的代价与“读得太粗”高度相
 通知跳转需要 gpui 0.2.2 的跨线程 entity 更新路径(`AsyncApp` /
 `WeakEntity::update`),列表驱动器(§6.3)需要 0.2.2 在 `reset(count)` 之外暴露
 的某种增量 `ListState` 更新。这两条都是本文在没有拿到该 crate 源码的情况下作出的
-能力断言;如果 0.2.2 只提供 `reset`,列表驱动器就降级为 `reset`,§5.1 的能力(2)
-也就从当下的论据变成前瞻性的论据——而能力(1)自己仍足以支撑这个 crate,行级
-订阅带来的按行重绘也一分不少(§6.3)。
+能力断言。
+
+**两条都已核实,结论一正一偏。**
+
+- **`ListState::splice` 存在。** 列表驱动器因此是增量的,§5.1 的能力(2)是当下的
+  论据而不是前瞻性的;`reset` 降级路径只作为 `#[non_exhaustive]` 那一支活着
+  (`CollectionEdit::Reset` 本来就要它)。
+- **跨线程 entity 更新路径存在,但形状不是本文画的那个。** `AsyncApp` 是 `!Send`
+  的,所以跳转落地为一条 channel 加一个前台抽取任务,`to_view`/`observe_with` 也
+  因此各多收一个 `&Window`。行为、顺序与 RAII 生命周期都不变;完整记账见 §5.1 的
+  “两处偏离”。

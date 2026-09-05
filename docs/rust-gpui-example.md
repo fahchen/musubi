@@ -403,14 +403,14 @@ server.
 | # | Component | Musubi feature | gpui construct |
 | :-- | :-- | :-- | :-- |
 | 1 | `ChatWindow` root view | root store mount (join = mount) | `Entity<ChatWindow>` + `impl Render` |
-| 2 | Message list | `stream_async :messages` → materialized `Vec<MessageState>` | `gpui::list` + `ListState` |
+| 2 | Message list | `stream_async :messages` → `AsyncState<Vec<MessageState>>` + `ok_stream()` | `gpui::list` + `ListState`, spliced by `musubi_gpui::drive_list` |
 | 3 | History loading / failed states | `AsyncResult` `loading \| ok \| failed` | `match` on the generated enum |
 | 4 | Composer + send | `send_message` command, reply `{queued}` | `gpui-component` `Input` + `cx.spawn` |
 | 5 | Delivery receipt | `last_send_status` tagged union (`start_async`/`handle_async`) | `match` on `ChatRoomStoreLastSendStatus` |
 | 6 | Identity + rename | `set_name` command, reply `{ok, name}` | `Input` + `Button` |
 | 7 | Online panel | `assign_async :online_users` + PubSub | `AsyncResult` `match` + plain column |
-| 8 | Connection pill | `Mounted::status_updates` (BDR-0033) over reconnect (BDR-0015) | `MountStatus` field fed by the stream |
-| 9 | Attach button + progress | `upload :attachment` in channel mode, `attach` command | `Button` + `App::prompt_for_paths` + `Upload::updates` |
+| 8 | Connection pill | `Mounted::status()` (BDR-0033) over reconnect (BDR-0015) | `MountStatus` field fed by one `Subscription` |
+| 9 | Attach button + progress | `upload :attachment` in channel mode, `attach` command | `Button` + `App::prompt_for_paths` + `Upload::subscribe` |
 | 10 | Instant relaunch | SWR mount cache (`docs/rust-client.md` §6.4): `ConnectionBuilder::cache` over a durable `CacheStore` | `cache_store.rs` — one JSON file under `$HOME`, whole-map writes, corrupt-file tolerant |
 | 11 | Attachment chip on a row | the consumed entry, as plain state on `MessageState` | column inside the bubble |
 
@@ -423,25 +423,34 @@ window-first startup in §5.3 made impossible):
 use generated::chat_room::stores::chat_room_store::{self as store, ChatRoomStore};
 
 struct ChatWindow {
-    url: SharedString,                      // for the "connecting to ..." line
-    mount_error: Option<SharedString>,      // a rejected join is a rendered panel
-    snapshot: Option<Arc<store::State>>,    // last good; never cleared on reconnect
-    status: MountStatus,                    // the crate's liveness stream (BDR-0033)
+    url: SharedString,                       // for the "connecting to ..." line
+    mount_error: Option<SharedString>,       // a rejected join is a rendered panel
+    state: Option<State<store::State>>,      // the retained tree's root, as a handle
+    feed: Option<AsyncState<Vec<MessageState>>>, // the `stream_async` node itself
+    rows: Option<StreamState<MessageState>>, // its `ok_stream()`, while there is one
+    status: MountStatus,                     // the crate's liveness cell (BDR-0033)
     mounted: Option<Mounted<ChatRoomStore>>, // None until the join succeeds
     feedback: SharedString,
-    busy: Option<Pending>,                  // one command at a time; names which
-    composer: Entity<InputState>,           // gpui-component
+    busy: Option<Pending>,                   // one command at a time; names which
+    composer: Entity<InputState>,            // gpui-component
     name_input: Entity<InputState>,
-    messages: ListState,                    // gpui::list row-height cache (§4.2)
-    upload: Option<Upload>,                 // control plane, taken on first snapshot (§4.6)
-    attachment: Option<UploadHandle>,       // last value of the upload's updates stream
-    _updates: Task<()>,                     // held: dropping cancels the subscription
-    _status_updates: Option<Task<()>>,      // held: the status_updates loop (§4.7)
-    _upload_updates: Option<Task<()>>,      // held: the upload's updates loop
-    _in_flight: Option<Task<()>>,           // held: one command at a time
-    _subscriptions: Vec<Subscription>,      // held: Enter-to-submit on both inputs
+    list: ListState,                         // gpui::list row-height cache (§4.2)
+    attachment: Option<UploadHandle>,        // last value the upload plane published
+    _subs: Vec<Subscription>,                // held: every observation, tree and not
+    _list_driver: Option<Subscription>,      // held: the keyed splice driver (§4.2)
+    _upload_sub: Option<Subscription>,       // held: the upload plane's observation
+    _in_flight: Option<Task<()>>,            // held: one command at a time
 }
 ```
+
+**One `Vec<Subscription>` for everything.** The tree handles, the out-of-tree
+`StatusState` and the `Upload` plane all hand back the same RAII token
+(`docs/rust-reactive-state.md` §2.4), so there is no `_status_updates: Task<()>`
+beside a `_updates: Task<()>` beside a `_upload_updates: Task<()>` any more —
+one field holds them all, and dropping the view drops the lot. `state` is not an
+`Option<Arc<State>>` snapshot: it is a **view** on the retained tree, so a read
+costs the subtree it reads and a subscription wakes only when *that* node's
+semantic value changed.
 
 `mounted` is an `Option` because the window opens before the join resolves:
 commands are refused until it is `Some`, and `mount_error` is what the message
@@ -455,11 +464,12 @@ update loop would keep a `Mounted` alive past the view.
 
 ### 4.2 Message list — `gpui::list`
 
-The stream materializes to an ordinary `Vec<MessageState>` on the snapshot
-(`docs/rust-client.md` §4.6), so the list is a plain slice render:
+The stream node is a **keyed collection** (`docs/rust-reactive-state.md` §3.1),
+reached as `AsyncState::ok_stream()`. Rows are addressed by index for rendering
+and by item key for identity, and each row is its own `State<MessageState>`:
 
 ```rust
-list(self.messages.clone(), move |ix, _window, _cx| message_row(&state, ix, dimmed)).flex_1()
+list(self.list.clone(), move |ix, _window, _cx| message_row(&rows, ix, dimmed)).flex_1()
 ```
 
 Two ordering facts carry over from the server: the store inserts with
@@ -469,9 +479,17 @@ scroll-to-bottom bookkeeping), matching the browser client.
 
 Rows are message bubbles whose bodies wrap, so there is no single height to
 measure once and `uniform_list` does not apply; `gpui::list` virtualizes over
-variable heights instead. The price is one piece of view state: `ListState`
-caches a height per row, so the view has to call `reset(count)` whenever the
-stream's length changes.
+variable heights instead. `ListState` caches a height per row — and the cache is
+**kept**: `musubi_gpui::drive_list` translates the transaction's keyed edits
+(`Inserted` / `Removed` / `Moved` / `Reset`) into `ListState::splice`, so one new
+message invalidates one row range instead of wiping every cached height with
+`reset(count)`.
+
+```rust
+// Installed and removed only when the collection node itself appears or goes
+// away; ordinary row traffic never reaches this line.
+self._list_driver = rows.as_ref().map(|rows| musubi_gpui::drive_list(rows, &self.list, cx));
+```
 
 ### 4.3 Async states
 
@@ -481,22 +499,27 @@ window opens showing "Loading history", then flips to a populated list, on
 every start and every reconnect.
 
 ```rust
-match &snapshot.messages {
-    AsyncResult::Loading { result, .. } => /* skeleton, or stale rows if result is Some */,
-    AsyncResult::Ok { result, .. }      => /* the virtualized list */,
-    AsyncResult::Failed { reason, .. }  => /* "Could not load history" + reason */,
+// `ok_stream()` answers "is there a payload at all"; `status()` answers "is it
+// stale". They are separate questions on separate handles, and neither
+// materializes anything.
+match (self.rows.as_ref(), feed.status()) {
+    (Some(rows), AsyncStatus::Ok)      => /* the virtualized list */,
+    (Some(rows), AsyncStatus::Loading) => /* the same rows, dimmed */,
+    (None, AsyncStatus::Loading)       => /* skeleton */,
+    (_, AsyncStatus::Failed)           => /* "Could not load history" + reason */,
 }
 ```
 
-Field names are the wire names `result` / `reason`, and **every** variant
-carries both (`docs/rust-client.md` §6.1) — hence the `..` on the `Ok` arm.
-`reason` is `Option<AsyncError>`, where `AsyncError` is
-`Structured { kind, value } | Opaque(Value)`.
+The whole-value form is still there — `feed.value()` yields the three-variant
+`AsyncResult<Vec<MessageState>>`, field names the wire names `result` / `reason`,
+every variant carrying both (`docs/rust-client.md` §6.1) — but a view that only
+needs "loading or not" should not deserialize a hundred rows to find out, so the
+render reads `status()` and leaves the rows to `drive_list`.
 
-The `Loading { result: Some(_) }` arm matters: on reconnect the async value goes
-back to `loading` while still carrying the previous payload, and rendering the
-stale rows dimmed instead of blanking the list is the behavior a native client
-should model.
+The stale-while-loading arm matters, and it is now free: a reconnect flips
+`ok -> loading` on the **async node only** (§3.3), so the header repaints, the
+list dims, and not one row view is woken. `reason()` is a handle like everything
+else; `try_value()` is the checked read for a node that may have gone.
 
 ### 4.4 Composer, and the BDR-0009 demonstration
 
@@ -537,12 +560,18 @@ landed it was not needed**. The widget is `gpui_component::input::Input` over an
 ```rust
 use store::ChatRoomStoreLastSendStatus as SendStatus;
 
-match &snapshot.last_send_status {
-    SendStatus::Idle => "idle".into(),
-    SendStatus::Ok { id } => format!("ok ({id})").into(),
-    SendStatus::Failed { reason } => format!("failed ({reason})").into(),
+// One leaf handle, one checked read: the node is a tagged union, so it is a
+// leaf that changes as a whole (`docs/rust-reactive-state.md` §4.3).
+match state.last_send_status().try_value() {
+    Err(_) | Ok(SendStatus::Idle) => "idle".into(),
+    Ok(SendStatus::Ok { id }) => format!("ok ({id})").into(),
+    Ok(SendStatus::Failed { reason }) => format!("failed ({reason})").into(),
 }
 ```
+
+Its subscription is one line in the same `Vec` — `musubi_gpui::observe(&state.last_send_status(), cx)` —
+and it wakes on this node alone: a message arriving does not repaint the receipt,
+and a receipt does not repaint the list.
 
 The last command reply, when there is one, takes precedence over this line —
 the same `feedback || renderSendStatus(...)` the browser client uses.
@@ -565,16 +594,32 @@ marker into the render output, and the live handle is driven by a separate
 fields, two update loops:
 
 ```rust
-upload: Option<Upload>,           // the control plane: select / start / cancel
-attachment: Option<UploadHandle>, // the last value its own updates stream gave
+attachment: Option<UploadHandle>, // the last value the upload plane published
+_upload_sub: Option<Subscription>, // its observation, RAII like every other
 ```
 
-`watch_upload` takes the handle the first time a snapshot names the slot
-(`mounted.upload(&StoreId::root(), &state.attachment.name)`) and spawns a second
-foreground loop over `Upload::updates()`. Progress therefore repaints the
-composer dock *without* the message list re-rendering: an upload op marks no
-`socket.assigns` key changed, so it produces an envelope with an empty `ops`
-array.
+`watch_upload` walks from the tree to the plane in one step —
+`mounted.upload_at(&state.attachment())`, where `attachment()` is the generated
+`UploadSlotState` accessor and the slot node knows **both** halves of the
+`(store_id, name)` key (§3.4), so no `StoreId::root()` is spelled by hand. The
+handle it returns is observed through the same `to_view` hop and the same
+`Subscription` the tree handles use:
+
+```rust
+let forward = musubi_gpui::to_view(window, cx, |view, handle, _window, cx| {
+    view.attachment = Some(handle);
+    cx.notify();
+});
+
+self._upload_sub = Some(upload.subscribe(move |handle| forward(handle.clone())));
+```
+
+Subscribe first, read second: this plane is a queue of per-envelope handles
+rather than a latest-value cell, so it does not replay, and the order costs at
+worst one repeated assignment. Progress therefore repaints the composer dock
+*without* the message list re-rendering: an upload op marks no `socket.assigns`
+key changed, so it produces an envelope with an empty `ops` array — and even a
+non-empty one would only wake the nodes it changed.
 
 The transfer itself is three awaits, in order — `select` (preflight; the server
 signs one token per accepted entry), `start` (join `musubi_upload:<ref>`, push
@@ -608,21 +653,33 @@ every real chunk crashed its sub-channel and the entry came back as
 
 ### 4.7 Connection pill
 
-`Mounted::snapshot()` returns `None` before the initial patch and **is never
-cleared afterwards** — not by a reconnect either (`crates/musubi-client/src/mounted.rs`
-clears the cell only on teardown, deliberately, because BDR-0015 requires the
-client to keep rendering the last good tree). The `Option` says "have I ever
-loaded"; "am I current" is the crate's own status surface (BDR-0033):
-`Mounted::status()` / `Mounted::status_updates()` with
-`MountStatus { Connecting, Live, Reconnecting }`.
+`Mounted::state()` is not an `Option` — the root node exists from the moment the
+tree does — so "have I ever loaded" is `revision() > 0` and "was this torn down"
+is `is_live()` (`docs/rust-reactive-state.md` §5.3). Neither is cleared by a
+reconnect: the tree keeps the last good rendering, deliberately, because
+BDR-0015 requires the client to keep painting it. "Am I current" is a different
+question on a different handle, and always was: the crate's own status surface
+(BDR-0033), `Mounted::status() -> StatusState` with
+`MountStatus { Connecting, Live, Reconnecting }`, read with `.value()` and
+observed with `.subscribe(..)` — the same two verbs the tree uses.
 
-The pill renders that stream directly. A socket that drops while the app is
-idle flips it to "reconnecting" with no command involved (within one heartbeat
-interval when the death is silent), and the rejoin's fresh initial patch flips
-it back to "live". The v1 `stale`-flag workaround — set by the first command
-that failed with `NotConnected` / `Disconnected` / `Transport` — is gone; a
-command that fails on a dead socket now merely coincides with a pill that has
-already flipped.
+The pill renders that handle directly, through one `Subscription` in the same
+`Vec` as the tree's:
+
+```rust
+mounted.status().subscribe(musubi_gpui::to_view(window, cx, |view, status, window, cx| {
+    view.status = status;
+    view.watch_upload(window, cx);
+    cx.notify();
+}));
+```
+
+A socket that drops while the app is idle flips it to "reconnecting" with no
+command involved (within one heartbeat interval when the death is silent), and
+the rejoin's fresh initial patch flips it back to "live". There is no
+`stale` flag anywhere in the app: a command that fails with `NotConnected` /
+`Disconnected` / `Transport` on a dead socket merely coincides with a pill that
+has already flipped.
 
 **As landed** the pill is `mount_error` → offline (a rejected join is terminal
 and never enters the status stream), `mounted.is_none()` → connecting (no
@@ -713,37 +770,47 @@ copy, so it lives in its own file with comments.
 
 ### 5.3 Socket thread → UI thread
 
-Snapshot sends happen on the actor task, which is not the gpui main thread.
-`Entity<T>` and `Context<T>` are `!Send`, so nothing may cross directly. The
-crossing is a `Stream` consumed by a foreground `cx.spawn`, which is the exact
-pattern `Context::spawn` is shaped for (it hands out a `WeakEntity<Self>` plus a
-holdable `AsyncApp`):
+Notifications are delivered on the actor task, which is not the gpui main
+thread. `Entity<T>` and `Context<T>` are `!Send`, so nothing may cross directly.
+The crossing is **`musubi-gpui`'s job**, not the example's: `observe`,
+`observe_with` and the bare `to_view` each take a callback body written against
+the view and hand back the `Send + Sync` closure every `subscribe` in the API
+asks for (`docs/rust-reactive-state.md` §5.1).
 
 ```rust
 // inside cx.new(|cx| { ... }) for ChatWindow
-let mut updates = mounted.updates();
-let task = cx.spawn(async move |this, cx| {
-    while let Some(snapshot) = updates.next().await {
-        let alive = this.update(cx, |view, cx| {
-            view.snapshot = Some(snapshot);
-            cx.notify();                    // the only re-render trigger in gpui
-        });
-        if alive.is_err() { break; }        // window closed
-    }
-});
-// A second, identical loop consumes mounted.status_updates() into
-// view.status — that stream is what drives the connection pill (§4.7).
+self._subs = vec![
+    // Redraw on change — the common case, and the whole of it.
+    musubi_gpui::observe(&state.online_users(), cx),
+    musubi_gpui::observe(&state.last_send_status(), cx),
+    // Read the new value out of the handle the body is fed.
+    musubi_gpui::observe_with(&state.current_user().name(), window, cx,
+        |view, name, window, cx| {
+            // May run once after the token is dropped — hence the checked read.
+            if let Ok(name) = name.try_value() {
+                view.set_draft(name.into(), window, cx);
+            }
+        }),
+    // The bare hop, for the handle that is not a tree node at all (§4.7).
+    mounted.status().subscribe(musubi_gpui::to_view(window, cx,
+        |view, status, _window, cx| { view.status = status; cx.notify(); })),
+];
 ```
 
 Rules this encodes, all of which are load-bearing:
 
-- Never hold `Entity<T>` in a background future; hold the `WeakEntity` +
-  `AsyncApp` that `Context::spawn` provides.
-- `this.update(...)` is fallible — a closed window is a normal exit, not an error.
-- `cx.notify()` is what schedules a repaint. Mutating `view` without it renders
-  nothing.
-- The returned `Task<()>` is stored in the view (`_updates`); dropping it
-  cancels the loop, which is the desired teardown when the window closes.
+- Never hold `Entity<T>` in a background future; the adapter holds the
+  `WeakEntity` + `AsyncApp` that `Context::spawn_in` provides, once, and the
+  value crosses over a channel it drains on the foreground (§5.1's second
+  recorded deviation).
+- A released entity is a normal exit, not an error: the drain loop ends.
+- `cx.notify()` is what schedules a repaint — `observe`'s body **is** that call.
+- The returned `Subscription` is stored in the view (`_subs`); dropping it
+  unsubscribes *and* ends the hop's task, which is the desired teardown when the
+  window closes. One token, one observation, one `Vec`.
+- What arrives in `observe_with` is the **handle**, not a value: `Change` carries
+  no old/new pair by design, so the body reads the settled state rather than an
+  intermediate one, and materializes only if it asks.
 
 **As landed the order is inverted:** `main.rs` builds the `Connection` and
 opens the window unconditionally, and the mount runs inside `ChatWindow::new`
@@ -760,8 +827,8 @@ mirrors `main.tsx`'s "Connect failed" panel without mirroring its top-level
 `attr(:room_id, String.t(), required: true)` and its `mount/2` does
 `Map.fetch!(params, "room_id")`. That attr is generated as a plain field on the
 store's `Params` struct (`docs/rust-client.md` §7), so the required param
-cannot be forgotten at the call site — omitting it no longer waits for a
-server-side rejection, it fails to compile:
+cannot be forgotten at the call site — omitting it fails to compile rather than
+waiting for a server-side rejection:
 
 ```rust
 let mounted = connection
@@ -848,7 +915,7 @@ versions"), so the README should say the example is pinned to
 
 Stop `mix server` and watch the message list stay rendered (BDR-0015: keep
 last-good, no resync) while the pill flips to "reconnecting" on its own —
-`Mounted::status_updates()` reports the drop the moment the client notices it,
+`Mounted::status()` reports the drop the moment the client notices it,
 within one heartbeat interval when the socket dies silently (§4.7, BDR-0033).
 A **Send** during the window still fails with `Disconnected` on the feedback
 line, coinciding with the pill rather than causing it. Restart the server,
@@ -974,7 +1041,7 @@ deliberately routes around both.
 
 1. ~~**Mid-reconnect mount status.**~~ Resolved by BDR-0033: `musubi-client`
    exposes `MountStatus { Connecting, Live, Reconnecting }` via
-   `Mounted::status()` / `Mounted::status_updates()` (fed by the socket
+   `Mounted::status()` (fed by the socket
    layer's own liveness signal; `phoenix-channel` gained the connection-wide
    `PhoenixSocket::status_updates()` watch), the TS client the per-connection
    `connection.status()` / `onStatusChange()` analogue, and the pill renders
