@@ -1,0 +1,3 @@
+# This crate is detached from the root workspace, so the root ignore rule
+# (`/target/`, anchored) does not reach its build directory.
+/target/
