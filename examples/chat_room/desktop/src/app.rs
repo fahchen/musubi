@@ -8,22 +8,32 @@
 //! | Component | Musubi feature |
 //! | :-- | :-- |
 //! | [`ChatWindow`] | root store mount — join *is* mount |
-//! | Message list | `stream_async :messages`, materialized to a `Vec` |
-//! | Loading / failed panels | `AsyncResult` `loading \| ok \| failed` |
+//! | Message list | `stream_async :messages`, a keyed [`StreamState`] |
+//! | Loading / failed panels | [`AsyncState`] `loading \| ok \| failed` |
 //! | Composer | `send_message`, reply `{queued: true}` |
 //! | Delivery receipt | `last_send_status`, a three-arm tagged union |
 //! | Identity + rename | `set_name`, reply `{ok, name}` |
 //! | Online panel | `assign_async :online_users` + PubSub |
 //! | Attach button | `upload :attachment` in channel mode + `attach` |
-//! | Connection pill | `Mounted::status_updates` (BDR-0033) |
+//! | Connection pill | `Mounted::status` (BDR-0033) |
 //! | Instant relaunch | SWR mount cache (§6.4) over `cache_store::FileCacheStore` |
 //!
-//! The one rule the whole file is organized around: **state renders from
-//! [`Mounted::updates`], never from a command reply.** A reply is not gated on
-//! the patch it caused and carries no ordering relationship to it — BDR-0009
+//! The one rule the whole file is organized around: **state renders from the
+//! retained tree, never from a command reply.** A reply is not gated on the
+//! patch it caused and carries no ordering relationship to it — BDR-0009
 //! orders the *server's* frames, not the client's inbox — so replies only ever
-//! write the one-line `feedback` string; every field the user reads comes off
-//! the snapshot.
+//! write the one-line `feedback` string; every field the user reads is read
+//! back through a handle.
+//!
+//! # How the window is wired (`docs/rust-reactive-state.md` §6.5.2)
+//!
+//! There is no whole-root snapshot and no envelope loop. [`Mounted::state`]
+//! hands out a [`State`] rooted at the tree, the window subscribes to the four
+//! nodes it actually renders, and `musubi-gpui` makes the `!Send` hop from the
+//! actor task to this entity. An envelope that moves only `online_users`
+//! notifies only the presence subscriber; a new row is one
+//! `ListState::splice` instead of a `reset` that throws every cached row
+//! height away.
 //!
 //! # Parity with `ui/`
 //!
@@ -36,14 +46,12 @@
 //! disconnect flips it without a command.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use futures::StreamExt;
 use gpui::{
     AnyElement, AppContext, AsyncWindowContext, Context, Div, Entity, FontWeight,
     InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement, PathPromptOptions,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div,
-    linear_color_stop, linear_gradient, list, px, relative,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription as InputSubscription,
+    Task, Window, div, linear_color_stop, linear_gradient, list, px, relative,
 };
 // `when` — the conditional-builder combinator gpui blanket-implements for
 // every element.
@@ -52,16 +60,21 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Disableable, Sizable};
 use musubi_client::{
-    Connection, MountStatus, Mounted, MusubiError, Upload, UploadAccept, UploadEntry, UploadFile,
-    UploadHandle,
+    AsyncStatus, Connection, MountStatus, Mounted, MusubiError, Upload, UploadAccept, UploadEntry,
+    UploadFile, UploadHandle,
 };
 
 use crate::generated::chat_room::stores::chat_room_store::{
     Attach, AttachReply, ChatRoomStore, ChatRoomStoreLastSendStatus as SendStatus, Params,
-    SendMessage, SetName, State,
+    SendMessage, SetName, State as ChatState,
 };
 use crate::generated::chat_room::{AttachmentState, MessageState, OnlineUser};
-use crate::generated::musubi::{AsyncError, AsyncResult, Command, StoreId};
+// `State` is the reactive *view*; `ChatState` above is the store's rendered
+// shape, which is what a `value()` on that view hands back.
+use crate::generated::musubi::{AsyncError, AsyncState, Command, State, StreamState, Subscription};
+// One glob per consumer file brings every generated accessor into scope
+// (`docs/rust-reactive-state.md` §4.2).
+use crate::generated::nav::*;
 use crate::theme::{
     BORDER_CARD, BORDER_SOFT, BORDER_STRONG, BUBBLE, CANVAS, CARD, DOCK, EMPTY, EYEBROW,
     FONT_FAMILY, GOLD, INK, MUTED, ON_TEAL_MUTED, PAPER, RADIUS, ROW, RUST, SAND, SAND_WASH, STAT,
@@ -190,13 +203,20 @@ pub struct ChatWindow {
     /// Set when the join is rejected. The window stays open showing why rather
     /// than the app exiting silently.
     mount_error: Option<SharedString>,
-    /// The last good state. Only ever assigned `Some`: a reconnect keeps the
-    /// previous tree rendered (BDR-0015), and the fresh one replaces it
-    /// atomically when the re-seeded initial patch lands.
-    snapshot: Option<Arc<State>>,
-    /// The crate's own liveness signal (BDR-0033), fed by
-    /// [`Mounted::status_updates`]. `Reconnecting` flips the pill the moment
-    /// the client notices a dead socket — idle or not — with no command
+    /// The root view, `None` until the mount resolves. It is **not** a
+    /// snapshot: the tree behind it survives every reconnect (BDR-0015), and
+    /// the rejoin's initial patch is reconciled into it rather than replacing
+    /// it, so unchanged subtrees keep their `NodeId`s and their subscribers.
+    state: Option<State<ChatState>>,
+    /// The `stream_async :messages` node. `loading <-> ok` flips move only
+    /// this node (§3.3), so a reconnect dims the list without repainting a
+    /// single row.
+    feed: Option<AsyncState<Vec<MessageState>>>,
+    /// The keyed collection under it, while the result is not `null`.
+    rows: Option<StreamState<MessageState>>,
+    /// The crate's own liveness signal (BDR-0033), written by the
+    /// [`Mounted::status`] subscription. `Reconnecting` flips the pill the
+    /// moment the client notices a dead socket — idle or not — with no command
     /// involved.
     status: MountStatus,
     /// `None` until the join succeeds; commands are refused before that.
@@ -210,30 +230,36 @@ pub struct ChatWindow {
     busy: Option<Pending>,
     composer: Entity<InputState>,
     name_input: Entity<InputState>,
-    /// Row heights for the message list. `list` measures lazily and caches, so
-    /// the count has to be pushed in whenever the stream changes length.
-    messages: ListState,
-    /// The upload's control plane, taken once the first snapshot names the
-    /// slot. `None` until then, which is what refuses an attach before mount.
+    /// Row heights for the message list. `musubi-gpui`'s driver splices it in
+    /// step with the collection node, so a row that did not move keeps the
+    /// height it was measured at.
+    list: ListState,
+    /// The upload's control plane, reached in one step from the slot node
+    /// (§3.4). `None` until the tree names it, which is what refuses an attach
+    /// before mount.
     upload: Option<Upload>,
-    /// The last handle the upload's own updates stream produced. Upload state
-    /// is *not* part of the state tree (BDR-0028) — it arrives on a separate
-    /// `upload_ops` channel and lands here, so progress repaints without the
-    /// message list re-rendering.
+    /// The last handle the upload published. Upload state is *not* part of the
+    /// state tree (BDR-0028) — it arrives on a separate `upload_ops` channel
+    /// and lands here, so progress repaints without touching a single node.
     attachment: Option<UploadHandle>,
-    /// Held rather than detached: dropping the task cancels the update loop,
-    /// which is the right teardown when the window closes. A detached loop
-    /// would keep the `Mounted` — and so the server-side page — alive.
-    _updates: Task<()>,
-    /// Held: the [`Mounted::status_updates`] loop, started once the mount
-    /// resolves.
-    _status_updates: Option<Task<()>>,
-    /// Held: the upload handle's update loop, started with the first snapshot.
-    _upload_updates: Option<Task<()>>,
+    /// Held rather than detached: dropping the task cancels the mount, which
+    /// is the right teardown when the window closes before the join resolves.
+    /// It finishes on its own the moment the mount lands.
+    _mount: Task<()>,
     /// Held: one command at a time, cancelled with the window.
     _in_flight: Option<Task<()>>,
-    /// Held: dropping a `Subscription` unsubscribes.
-    _subscriptions: Vec<Subscription>,
+    /// The fixed observations, installed when the mount resolves: four nodes
+    /// plus the out-of-tree status handle. One type, one `Vec` — §2.4's
+    /// unification is what collapses the two `Task<()>` loops this file used
+    /// to hold into ordinary subscriptions.
+    _subs: Vec<Subscription>,
+    /// The list driver, which comes and goes with the collection node.
+    _list_driver: Option<Subscription>,
+    /// The upload handle's observation, which comes and goes with the handle.
+    _upload_sub: Option<Subscription>,
+    /// Held: gpui's own input-event subscriptions. A different type from the
+    /// tree's, hence a different `Vec`.
+    _inputs: Vec<InputSubscription>,
 }
 
 impl ChatWindow {
@@ -252,7 +278,7 @@ impl ChatWindow {
 
         // Enter submits, in both fields. `InputEvent::PressEnter` is the only
         // arm either one cares about.
-        let subscriptions = vec![
+        let inputs = vec![
             cx.subscribe_in(&composer, window, |this, _input, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.send_message(window, cx);
@@ -267,11 +293,12 @@ impl ChatWindow {
 
         composer.update(cx, |state, cx| state.focus(window, cx));
 
-        // §5.3: the crossing from the socket task to the UI thread is a
-        // `Stream` consumed by a foreground `cx.spawn`. `Entity`/`Context` are
-        // `!Send` and never cross; the `WeakEntity` + `AsyncApp` this hands out
-        // are what may.
-        let updates = cx.spawn_in(window, async move |this, cx| {
+        // The only task left in this file that touches the connection: it
+        // awaits the mount and then hands the resolved handle to `bind`. There
+        // is no envelope loop any more — every later crossing from the actor
+        // task to this entity is a subscription, and `musubi-gpui` owns the
+        // `!Send` hop each one needs.
+        let mount = cx.spawn_in(window, async move |this, cx| {
             // `attr(:room_id, String.t(), required: true)` on the store is
             // generated as a plain `Params` field, so the required param
             // cannot be forgotten here.
@@ -296,65 +323,17 @@ impl ChatWindow {
                 }
             };
 
-            // Both streams are latest-value and open with what the root
-            // already holds, so there is no subscribe-before-read window to
-            // close here. The two reads below are the synchronous seed for the
-            // first paint; the loops would arrive at the same values a tick
-            // later.
-            let mut updates = mounted.updates();
-            let mut statuses = mounted.status_updates();
-            let initial = mounted.snapshot();
-            let status = mounted.status();
-
-            if this
-                .update_in(cx, |view, window, cx| {
-                    view.adopt(initial, window, cx);
-                    view.status = status;
-                    view.mounted = Some(mounted);
-                    view.watch_upload(window, cx);
-                    // The crate's own liveness stream drives the pill
-                    // (BDR-0033): a socket drop or heartbeat timeout flips it
-                    // with no command involved, and the rejoin's fresh initial
-                    // patch flips it back.
-                    view._status_updates = Some(cx.spawn_in(window, async move |this, cx| {
-                        while let Some(status) = statuses.next().await {
-                            let alive = this.update(cx, |view, cx| {
-                                view.status = status;
-                                cx.notify();
-                            });
-
-                            if alive.is_err() {
-                                break;
-                            }
-                        }
-                    }));
-                    cx.notify();
-                })
-                .is_err()
-            {
-                return;
-            }
-
-            while let Some(snapshot) = updates.next().await {
-                // A closed window is a normal exit, not an error.
-                let alive = this.update_in(cx, |view, window, cx| {
-                    view.adopt(Some(snapshot), window, cx);
-                    view.watch_upload(window, cx);
-                    // `cx.notify()` is the only thing that schedules a repaint;
-                    // mutating the view without it renders nothing.
-                    cx.notify();
-                });
-
-                if alive.is_err() {
-                    break;
-                }
-            }
+            // A closed window is a normal exit, not an error.
+            this.update_in(cx, |view, window, cx| view.bind(mounted, window, cx))
+                .ok();
         });
 
         Self {
             url,
             mount_error: None,
-            snapshot: None,
+            state: None,
+            feed: None,
+            rows: None,
             status: MountStatus::Connecting,
             mounted: None,
             upload: None,
@@ -365,43 +344,127 @@ impl ChatWindow {
             name_input,
             // `Top` because index 0 is the newest message: the "latest" end of
             // this list is its head, not its tail.
-            messages: ListState::new(0, ListAlignment::Top, px(200.0)),
-            _updates: updates,
-            _status_updates: None,
-            _upload_updates: None,
+            list: ListState::new(0, ListAlignment::Top, px(200.0)),
+            _mount: mount,
             _in_flight: None,
-            _subscriptions: subscriptions,
+            _subs: Vec::new(),
+            _list_driver: None,
+            _upload_sub: None,
+            _inputs: inputs,
         }
     }
 
-    /// Installs a new snapshot and keeps the pieces that are derived from it in
-    /// step: the list's row count, and the rename field's draft.
-    fn adopt(&mut self, snapshot: Option<Arc<State>>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(state) = snapshot else {
-            return;
-        };
+    /// Everything the resolved mount owns: the root view, one subscription per
+    /// node this window actually renders, the out-of-tree status hop, and the
+    /// list driver (`docs/rust-reactive-state.md` §6.5.2).
+    ///
+    /// The tree is guaranteed non-empty here. An unseeded mount resolves only
+    /// after its initial patch has been applied and published, and a
+    /// cache-seeded one resolves only after the seed reached subscribers — so
+    /// the generated accessors below have nodes to navigate to.
+    fn bind(
+        &mut self,
+        mounted: Mounted<ChatRoomStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = mounted.state();
+        let feed = state.messages();
 
-        // `App.tsx` re-seeds `nameDraft` from `room.current_user.name` in a
-        // `useEffect`, so the field always shows the name the server settled
-        // on — including a rename made from the browser client.
-        let name = state.current_user.name.clone();
+        self._subs = vec![
+            // The rename draft: one leaf. `App.tsx` re-seeds `nameDraft` from
+            // `room.current_user.name` in a `useEffect`; here the subscription
+            // *is* that effect, and no other field's envelope can touch the
+            // field the user is typing into.
+            musubi_gpui::observe_with(
+                &state.current_user().name(),
+                window,
+                cx,
+                |view, name, window, cx| {
+                    // The body may run once after the token is dropped, by
+                    // which time the node can be gone — hence the checked read.
+                    if let Ok(name) = name.try_value() {
+                        view.set_draft(name.into(), window, cx);
+                    }
+                },
+            ),
+            // Presence, and the receipt line: two more leaves, each waking
+            // nothing else.
+            musubi_gpui::observe(&state.online_users(), cx),
+            musubi_gpui::observe(&state.last_send_status(), cx),
+            // The async node itself. `ok <-> loading` moves only this node
+            // (§3.3), so a reconnect dims the list and repaints the header
+            // without touching a row; the same callback re-hangs the list
+            // driver when the collection appears or goes away.
+            musubi_gpui::observe_with(&feed, window, cx, |view, _feed, _window, cx| {
+                view.rebind_rows(cx);
+                cx.notify();
+            }),
+            // The out-of-tree liveness signal (BDR-0033), through the **same**
+            // `subscribe` and the same `Subscription` (§2.4) — which is why it
+            // lives in this `Vec` beside the four above. A socket drop or a
+            // heartbeat timeout flips the pill with no command involved, and
+            // the rejoin's fresh initial patch flips it back.
+            mounted.status().subscribe(musubi_gpui::to_view(
+                window,
+                cx,
+                |view, status, window, cx| {
+                    view.status = status;
+                    view.watch_upload(window, cx);
+                    cx.notify();
+                },
+            )),
+        ];
 
-        if self.name_input.read(cx).value().as_ref() != name.as_str() {
+        // Subscribe first, read second: that order can repeat one idempotent
+        // assignment, never miss an edge (§5.4).
+        self.status = mounted.status().value();
+        self.state = Some(state);
+        self.feed = Some(feed);
+        self.mounted = Some(mounted);
+
+        let name = self
+            .state
+            .as_ref()
+            .and_then(|state| state.current_user().name().try_value().ok());
+
+        if let Some(name) = name {
+            self.set_draft(name.into(), window, cx);
+        }
+
+        self.rebind_rows(cx);
+        self.watch_upload(window, cx);
+        cx.notify();
+    }
+
+    /// Re-seeds the rename field, unless the user's draft already says that.
+    fn set_draft(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        if self.name_input.read(cx).value() != name {
             self.name_input
-                .update(cx, |input, cx| input.set_value(&name, window, cx));
+                .update(cx, |input, cx| input.set_value(name, window, cx));
         }
 
-        // `ListState` caches a height per row, so it has to be told when the
-        // row count moves. Rows are prepended and trimmed at 100 server-side,
-        // so a reset — which also parks the viewport at the newest message — is
-        // the honest answer to any change.
-        let count = stale_or_fresh(&state.messages).len();
+        cx.notify();
+    }
 
-        if self.messages.item_count() != count {
-            self.messages.reset(count);
+    /// Hangs the list driver on the collection node, or takes it off.
+    ///
+    /// Idempotent, and the criterion is **node identity**: the collection is
+    /// born in the transaction where the result first stops being `null` and
+    /// lives until the root is unmounted or the server pushes it back to
+    /// `null`, so the driver is installed and removed only when *that* flips.
+    /// Ordinary row traffic never reaches this function (§6.3).
+    fn rebind_rows(&mut self, cx: &mut Context<Self>) {
+        let next = self.feed.as_ref().and_then(AsyncState::ok_stream);
+
+        if next.as_ref().map(StreamState::node) == self.rows.as_ref().map(StreamState::node) {
+            return;
         }
 
-        self.snapshot = Some(state);
+        self._list_driver = next
+            .as_ref()
+            .map(|rows| musubi_gpui::drive_list(rows, &self.list, cx));
+        self.rows = next;
     }
 
     // -------------------------------------------------------------------------
@@ -454,44 +517,40 @@ impl ChatWindow {
         );
     }
 
-    /// Subscribes to the upload handle, once the first snapshot names it.
+    /// Takes the upload handle the moment the tree names the slot.
     ///
-    /// Idempotent: called on every snapshot, it does its work exactly once.
-    /// `State::attachment` is an inert [`UploadSlot`](musubi_client::generated::UploadSlot) —
-    /// the framework injects it into the render output and it carries only the
-    /// declared name, which is the key the live handle is reached by
-    /// (`docs/rust-client.md` §10).
+    /// Idempotent — called from the status subscription on every flip, it does
+    /// its work exactly once. [`Mounted::upload_at`] is one step from the slot
+    /// node to the live handle (§3.4): **both** halves of the `(store_id,
+    /// name)` key come off the node, so there is no bare string taken out of a
+    /// materialized value and no hand-written `StoreId::root()` to get wrong.
+    /// The slot itself is an inert lazy leaf that never notifies — the server
+    /// re-renders the same marker every cycle.
     fn watch_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.upload.is_some() {
             return;
         }
 
-        let (Some(mounted), Some(state)) = (self.mounted.clone(), self.snapshot.clone()) else {
+        let (Some(mounted), Some(state)) = (self.mounted.clone(), self.state.as_ref()) else {
             return;
         };
 
-        let upload = mounted.upload(&StoreId::root(), &state.attachment.name);
-        // Subscribe before snapshotting: an upload's `updates()` is a queue of
-        // per-envelope handles, not a latest-value cell like the two streams
-        // the mount path takes, so it does not replay and a progress op
-        // landing between these two lines would otherwise be missed.
-        let mut updates = upload.updates();
+        let Some(upload) = mounted.upload_at(&state.attachment()) else {
+            return;
+        };
 
-        self.attachment = Some(upload.snapshot());
+        // Subscribe before reading: this plane is a queue of per-envelope
+        // handles, not a latest-value cell, so it does not replay and a
+        // progress op landing between these two lines would otherwise be
+        // missed (§6.4). The order costs at worst one repeated assignment.
+        let forward = musubi_gpui::to_view(window, cx, |view, handle, _window, cx| {
+            view.attachment = Some(handle);
+            cx.notify();
+        });
+
+        self._upload_sub = Some(upload.subscribe(move |handle| forward(handle.clone())));
+        self.attachment = Some(upload.value());
         self.upload = Some(upload);
-
-        self._upload_updates = Some(cx.spawn_in(window, async move |this, cx| {
-            while let Some(handle) = updates.next().await {
-                let alive = this.update(cx, |view, cx| {
-                    view.attachment = Some(handle);
-                    cx.notify();
-                });
-
-                if alive.is_err() {
-                    break;
-                }
-            }
-        }));
     }
 
     /// The whole channel-mode upload, end to end.
@@ -645,19 +704,19 @@ impl ChatWindow {
     // Derived state
     // -------------------------------------------------------------------------
 
-    /// The materialized stream. `stream_async` arrives as an ordinary
-    /// `Vec<MessageState>` on the snapshot — the client resolves the stream
-    /// markers before serde runs — so there is no stream type to unwrap.
+    /// How many rows the collection holds, without materializing one of them.
+    ///
+    /// The old accessor handed back a `&[MessageState]` borrowed from the
+    /// snapshot; a collection view has no slice to lend, so the two questions
+    /// the callers actually asked — "how many" and "which row" — are two
+    /// methods now (§6.3). The numbers are the same.
     ///
     /// The server inserts `at: 0` with `limit: -100`, so index 0 is the
     /// **newest** message and the list never exceeds 100 rows. The view renders
     /// newest-first: no reversal, no scroll-to-bottom bookkeeping, which is
     /// also what `App.tsx` does.
-    fn messages(&self) -> &[MessageState] {
-        self.snapshot
-            .as_deref()
-            .map(|state| stale_or_fresh(&state.messages))
-            .unwrap_or_default()
+    fn message_count(&self) -> usize {
+        self.rows.as_ref().map_or(0, StreamState::len)
     }
 
     /// The name in the identity card.
@@ -665,10 +724,19 @@ impl ChatWindow {
     /// Before the first patch there is no identity yet, and the browser client
     /// renders its whole shell as `Connecting...` for exactly that window.
     pub fn poster(&self) -> SharedString {
-        match self.snapshot.as_deref() {
-            Some(state) => state.current_user.name.clone().into(),
+        match self
+            .state
+            .as_ref()
+            .and_then(|state| state.current_user().name().try_value().ok())
+        {
+            Some(name) => name.into(),
             None => "Connecting...".into(),
         }
+    }
+
+    /// The presence node, for the two places that read it.
+    fn presence(&self) -> Option<AsyncState<Vec<OnlineUser>>> {
+        Some(self.state.as_ref()?.online_users())
     }
 }
 
@@ -797,15 +865,11 @@ impl ChatWindow {
     /// PubSub keeps it current: a rename in the browser client moves a row
     /// here.
     fn online_panel(&self) -> AnyElement {
-        let status = self.snapshot.as_deref().map(|state| &state.online_users);
+        let presence = self.presence();
 
         // `.status-dot` and its two overrides. `waiting` shares the default
         // rust dot with `failed`, exactly as the browser class does.
-        let dot = match status {
-            Some(AsyncResult::Ok { .. }) => TEAL,
-            Some(AsyncResult::Loading { .. }) => GOLD,
-            _ => RUST,
-        };
+        let dot = async_dot(presence.as_ref());
 
         let panel = card().flex_col().child(
             div()
@@ -818,19 +882,20 @@ impl ChatWindow {
                 .child(status_dot(dot)),
         );
 
-        let body = match status {
+        // `status()` and `result()` are two reads of the same node, which is
+        // what the old three-arm `AsyncResult` match was doing by hand — the
+        // difference is that only the rows arm materializes anything.
+        let body = match presence.as_ref().map(|node| (node.status(), node.result())) {
             None => side_note("Waiting for the first patch"),
-            Some(AsyncResult::Loading { result: None, .. }) => side_note("Loading presence"),
-            Some(AsyncResult::Failed {
-                result: None,
-                reason,
-            }) => error_note("Presence unavailable", reason_text(reason)),
+            Some((AsyncStatus::Loading, None)) => side_note("Loading presence"),
+            Some((AsyncStatus::Failed, None)) => error_note(
+                "Presence unavailable",
+                reason_text(&presence.expect("matched above").reason().value()),
+            ),
+            Some((AsyncStatus::Ok, None)) => user_rows(&[], false),
             // Stale rows, dimmed, beat blanking the panel while a reconnect
             // re-seeds it — the browser client drops straight to the note.
-            Some(AsyncResult::Loading { result, .. } | AsyncResult::Failed { result, .. }) => {
-                user_rows(result.as_deref().unwrap_or_default(), true)
-            }
-            Some(AsyncResult::Ok { result, .. }) => user_rows(result, false),
+            Some((status, Some(users))) => user_rows(&users.value(), status != AsyncStatus::Ok),
         };
 
         panel.child(body).into_any_element()
@@ -852,20 +917,18 @@ impl ChatWindow {
 
     /// `<header class="chat-header">`: title on the left, activity on the right.
     fn chat_header(&self) -> AnyElement {
-        let state = self.snapshot.as_deref();
-
-        let online = match state.map(|state| &state.online_users) {
-            Some(AsyncResult::Ok { result, .. }) => result.len(),
+        // The count without the rows: `result()` is a handle, and `len()` on
+        // it reads the node's child count rather than deserializing a list.
+        let online = match self.presence() {
+            Some(node) if node.status() == AsyncStatus::Ok => {
+                node.result().map_or(0, |users| users.len())
+            }
             _ => 0,
         };
-        let messages = self.messages().len();
+        let messages = self.message_count();
 
-        // `.status-dot` again, this time for the history AsyncResult.
-        let history = match state.map(|state| &state.messages) {
-            Some(AsyncResult::Ok { .. }) => TEAL,
-            Some(AsyncResult::Loading { .. }) => GOLD,
-            _ => RUST,
-        };
+        // `.status-dot` again, this time for the history node.
+        let history = async_dot(self.feed.as_ref());
 
         div()
             .flex()
@@ -900,10 +963,10 @@ impl ChatWindow {
             .into_any_element()
     }
 
-    /// The pill flips without the message list blanking, because the
-    /// last-good snapshot is kept (BDR-0015).
+    /// The pill flips without the message list blanking, because the tree is
+    /// kept across the rejoin (BDR-0015).
     ///
-    /// It renders [`Mounted::status_updates`] (BDR-0033): a socket that drops
+    /// It renders [`Mounted::status`] (BDR-0033): a socket that drops
     /// while the app is idle flips to "reconnecting" the moment the client
     /// notices — bounded by the heartbeat window — with no command involved,
     /// and the rejoin's fresh initial patch flips it back to "live".
@@ -936,7 +999,7 @@ impl ChatWindow {
     /// that, the copy is the [`MountStatus`] verbatim.
     ///
     /// A cache-seeded mount (`docs/rust-client.md` §6.4) lands in the
-    /// `Connecting` arm *with* a rendered snapshot: `snapshot` and `status` are
+    /// `Connecting` arm *with* a rendered tree: the tree and the status are
     /// independent on purpose, so last-session state paints under a "joining"
     /// pill until the accepted live initial patch flips it — a seed never
     /// counts as `Live`.
@@ -971,7 +1034,11 @@ impl ChatWindow {
         // Before the first patch there is nothing to render but the mount
         // itself — including its failure, which is a panel rather than a
         // silent exit because the window is already open by then.
-        let Some(state) = self.snapshot.clone() else {
+        let Some(feed) = self
+            .feed
+            .as_ref()
+            .filter(|_| self.state.as_ref().is_some_and(State::is_live))
+        else {
             let panel = match &self.mount_error {
                 Some(reason) => error_panel("Could not join the room.", reason.clone()),
                 None => empty_panel("…", format!("Connecting to {}", self.url)),
@@ -980,23 +1047,24 @@ impl ChatWindow {
             return viewport.child(panel).into_any_element();
         };
 
-        // Field names are the *wire* names, and every variant carries both
-        // `result` and `reason` (`docs/rust-client.md` §6.1) — hence the `..`.
-        // The `Loading { result: Some(_) }` arm is the one that matters on
-        // reconnect: the async value goes back to `loading` while still
-        // carrying the previous payload, and rendering those rows dimmed beats
-        // blanking the list.
-        let body = match &state.messages {
-            AsyncResult::Loading { result: None, .. } => empty_panel("…", "Loading history"),
-            AsyncResult::Failed {
-                result: None,
-                reason,
-            } => error_panel("Could not load history.", reason_text(reason)),
-            AsyncResult::Ok { result, .. } if result.is_empty() => {
+        // `ok_stream()` — cached in `self.rows` — answers "is there a payload
+        // at all", whatever its freshness; `status()` answers "is it stale",
+        // separately (§6.3). The old `stale_or_fresh` helper had to fuse the
+        // two, because a whole-root snapshot gave it nowhere to ask them apart.
+        // The stale arm is the one that matters on reconnect: the node goes
+        // back to `loading` while still carrying the previous rows, and
+        // dimming them beats blanking the list.
+        let body = match (feed.status(), self.rows.as_ref()) {
+            (AsyncStatus::Loading, None) => empty_panel("…", "Loading history"),
+            (AsyncStatus::Failed, None) => error_panel(
+                "Could not load history.",
+                reason_text(&feed.reason().value()),
+            ),
+            (AsyncStatus::Ok, None) => empty_panel("+", "No messages yet."),
+            (AsyncStatus::Ok, Some(rows)) if rows.is_empty() => {
                 empty_panel("+", "No messages yet.")
             }
-            AsyncResult::Loading { .. } | AsyncResult::Failed { .. } => self.rows(&state, true),
-            AsyncResult::Ok { .. } => self.rows(&state, false),
+            (status, Some(_)) => self.rows(status != AsyncStatus::Ok),
         };
 
         viewport.child(body).into_any_element()
@@ -1007,11 +1075,19 @@ impl ChatWindow {
     /// `gpui::list` rather than `uniform_list` because bubbles wrap: the row
     /// height depends on the body, so there is no single height to measure
     /// once (`docs/rust-gpui-example.md` §4.2 named this swap).
-    fn rows(&self, state: &Arc<State>, dimmed: bool) -> AnyElement {
-        let state = Arc::clone(state);
+    ///
+    /// What the closure captures is a **collection view**, not a slice
+    /// borrowed from a snapshot: it addresses rows by index into the live
+    /// node, so only the rows actually painted are ever materialized.
+    fn rows(&self, dimmed: bool) -> AnyElement {
+        let Some(rows) = self.rows.clone() else {
+            return div().into_any_element();
+        };
 
-        list(self.messages.clone(), move |index, _window, _cx| {
-            message_row(&state, index, dimmed)
+        let me = self.poster();
+
+        list(self.list.clone(), move |index, _window, _cx| {
+            message_row(&rows, index, &me, dimmed)
         })
         .flex_1()
         .into_any_element()
@@ -1148,9 +1224,9 @@ impl ChatWindow {
         }
 
         match self
-            .snapshot
-            .as_deref()
-            .map(|state| &state.last_send_status)
+            .state
+            .as_ref()
+            .and_then(|state| state.last_send_status().try_value().ok())
         {
             None | Some(SendStatus::Idle) => "idle".into(),
             Some(SendStatus::Ok { id }) => format!("ok ({id})").into(),
@@ -1207,7 +1283,7 @@ async fn transfer(
 
     if entries.is_empty() {
         return Err(upload
-            .snapshot()
+            .value()
             .errors
             .first()
             .map(|error| error.message.clone())
@@ -1514,14 +1590,25 @@ fn user_rows(users: &[OnlineUser], dimmed: bool) -> AnyElement {
 ///
 /// Bodies wrap (`.bubble p { overflow-wrap: anywhere }`), so nothing here
 /// truncates and the row height is whatever the text needs.
-fn message_row(state: &State, index: usize, dimmed: bool) -> AnyElement {
-    let messages = stale_or_fresh(&state.messages);
-
-    let Some(message) = messages.get(index) else {
+///
+/// One row in, one row materialized. `at()` handing back `None` means the
+/// `ListState`'s row count and the collection have not met yet — the splice
+/// and the repaint are one frame apart — and the next frame agrees.
+fn message_row(
+    rows: &StreamState<MessageState>,
+    index: usize,
+    me: &str,
+    dimmed: bool,
+) -> AnyElement {
+    let Some(row) = rows.at(index) else {
         return div().into_any_element();
     };
 
-    let from_self = message.sender == state.current_user.name;
+    let Ok(message) = row.try_value() else {
+        return div().into_any_element();
+    };
+
+    let from_self = message.sender == me;
     let (bubble_bg, bubble_fg, id_fg) = if from_self {
         (TEAL, PAPER, ON_TEAL_MUTED)
     } else {
@@ -1676,15 +1763,14 @@ fn short_message_id(id: &str) -> SharedString {
     }
 }
 
-/// The payload an [`AsyncResult`] currently has, whatever its status: the
-/// resolved value when it is `ok`, the preserved previous value while it is
-/// `loading` or `failed`, and nothing when there has never been one.
-fn stale_or_fresh<T>(value: &AsyncResult<Vec<T>>) -> &[T] {
-    match value {
-        AsyncResult::Loading { result, .. } | AsyncResult::Failed { result, .. } => {
-            result.as_deref().unwrap_or_default()
-        }
-        AsyncResult::Ok { result, .. } => result,
+/// `.status-dot`'s tint for an async node: teal resolved, gold in flight, rust
+/// for a failure *and* for "there is no node yet", exactly as the browser
+/// client's class does.
+fn async_dot<T>(node: Option<&AsyncState<T>>) -> u32 {
+    match node.map(AsyncState::status) {
+        Some(AsyncStatus::Ok) => TEAL,
+        Some(AsyncStatus::Loading) => GOLD,
+        _ => RUST,
     }
 }
 
@@ -1719,7 +1805,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::rc::Rc;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context as TaskContext, Poll};
 
     use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -2236,7 +2322,7 @@ mod tests {
         mount(&mut server, cx);
 
         assert_eq!(chat.update(cx, |chat, _| chat.poster()), ME);
-        assert_eq!(chat.update(cx, |chat, _| chat.messages().len()), 2);
+        assert_eq!(chat.update(cx, |chat, _| chat.message_count()), 2);
         assert_eq!(chat.update(cx, |chat, _| chat.connection_state().0), "live");
 
         assert!(cx.debug_bounds("message-list").is_some());
@@ -2301,7 +2387,7 @@ mod tests {
         // Streams are not cached (`stream_ops` are not part of the tree), so
         // the seeded messages slot hydrates empty until the live envelope
         // refills it.
-        assert_eq!(chat.update(cx, |chat, _| chat.messages().len()), 0);
+        assert_eq!(chat.update(cx, |chat, _| chat.message_count()), 0);
 
         // The join went out concurrently — the seed raced the network, it did
         // not replace it. Answering it swaps the seed for the server's tree.
@@ -2312,7 +2398,7 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(chat.update(cx, |chat, _| chat.poster()), ME);
-        assert_eq!(chat.update(cx, |chat, _| chat.messages().len()), 2);
+        assert_eq!(chat.update(cx, |chat, _| chat.message_count()), 2);
         assert_eq!(chat.update(cx, |chat, _| chat.connection_state().0), "live");
     }
 
@@ -2538,7 +2624,7 @@ mod tests {
         server.push_patch(&join, attachment_envelope(3, 4));
         cx.run_until_parked();
 
-        assert_eq!(chat.update(cx, |chat, _| chat.messages().len()), 3);
+        assert_eq!(chat.update(cx, |chat, _| chat.message_count()), 3);
         assert_eq!(
             chat.update(cx, |chat, _| chat
                 .attach_entry()
@@ -2576,7 +2662,7 @@ mod tests {
             "nothing was dispatched to notice the drop"
         );
         assert_eq!(
-            chat.update(cx, |chat, _| chat.messages().len()),
+            chat.update(cx, |chat, _| chat.message_count()),
             2,
             "the last good snapshot is kept"
         );

@@ -149,10 +149,11 @@ What it demonstrates, beyond what the React client already shows:
   independent patch when the `start_async` task settles. No state is ever read
   out of a command reply.
 - **The upload data plane.** `upload :attachment` is the one feature that is not
-  state: the snapshot carries an inert `UploadSlot`, and the live handle comes
-  from `mounted.upload(&StoreId::root(), &slot.name)` with its own `updates()`
-  stream. Progress repaints the composer dock without the message list
-  re-rendering, because an upload op marks no `socket.assigns` key changed.
+  state: the tree carries an inert `UploadSlot` leaf, and the live handle comes
+  from `mounted.upload_at(&state.attachment())` with its own `subscribe()`.
+  Progress repaints the composer dock without the message list re-rendering,
+  because an upload slot is not a state node and an upload op notifies no state
+  subscriber.
 - **A runtime-free client.** `musubi-client` has no executor of its own, so
   `desktop/src/transport.rs` supplies the four seams over gpui's executor:
   `Spawner`/`Timer` on `BackgroundExecutor`, and a `Connector`/`Socket` pair
@@ -220,9 +221,9 @@ What it demonstrates, beyond what the React client already shows:
 
 With the desktop client running, stop `mix server`. The message list stays
 rendered — BDR-0015 says a client keeps its last good tree rather than blanking
-— and the pill flips to "reconnecting" **on its own**: the crate publishes a
-`MountStatus` stream (`Mounted::status_updates()`, BDR-0033), so the view
-notices the moment the transport reports the drop, or within one heartbeat
+— and the pill flips to "reconnecting" **on its own**: the crate hands out a
+`MountStatus` handle (`Mounted::status()`, BDR-0033) the view subscribes to, so
+it notices the moment the transport reports the drop, or within one heartbeat
 interval (30 s by default) when the socket dies silently. No command is needed;
 pressing **Send** during the window still fails with `Disconnected` on the
 feedback line, coinciding with the pill rather than causing it. Restart the

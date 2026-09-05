@@ -20,6 +20,13 @@ license = "MIT"
 # transport crate. `musubi-client-tokio` is deliberately absent.
 musubi-client = { path = "../../../crates/musubi-client" }
 
+# The gpui adapter (`docs/rust-reactive-state.md` §5.1): the `!Send` hop every
+# per-node subscription needs, and the `ListState` driver that turns keyed
+# collection edits into splices. It depends on `musubi-state` and gpui and
+# never on `musubi-client`, so it adds no transport surface here — the two
+# crates meet only in this file.
+musubi-gpui = { path = "../../../crates/musubi-gpui" }
+
 # UI. Both from crates.io, both Apache-2.0. Use gpui's DEFAULT features:
 # gpui-component 0.5.1 declares a plain `gpui = "0.2.2"` dependency, so cargo
 # feature unification re-enables everything a `default-features = false` here

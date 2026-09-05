@@ -7,7 +7,8 @@
 // client crate (`:rust_codegen_runtime_path`, default `musubi_client`).
 pub mod musubi {
     pub use ::musubi_client::generated::{
-        AsyncError, AsyncResult, Command, Event, NoReply, Store, StoreField, StoreId, UploadSlot,
+        AsyncError, AsyncResult, AsyncState, Command, Event, NoReply, State, StateTree, Store,
+        StoreField, StoreId, StoreState, StreamState, Subscription, UploadSlot, UploadSlotState,
     };
 }
 
@@ -20,6 +21,31 @@ pub mod chat_room {
         pub url: String,
     }
 
+    /// Typed navigation for the shape above: one accessor per declared field,
+    /// each handing back a handle rather than a value
+    /// (`docs/rust-reactive-state.md` §4.2). Reach it through `nav`.
+    pub trait AttachmentStateExt {
+        fn name(&self) -> super::musubi::State<String>;
+        fn content_type(&self) -> super::musubi::State<String>;
+        fn size(&self) -> super::musubi::State<i64>;
+        fn url(&self) -> super::musubi::State<String>;
+    }
+
+    impl AttachmentStateExt for super::musubi::State<AttachmentState> {
+        fn name(&self) -> super::musubi::State<String> {
+            self.child("name")
+        }
+        fn content_type(&self) -> super::musubi::State<String> {
+            self.child("content_type")
+        }
+        fn size(&self) -> super::musubi::State<i64> {
+            self.child("size")
+        }
+        fn url(&self) -> super::musubi::State<String> {
+            self.child("url")
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     pub struct MessageState {
         pub id: String,
@@ -28,10 +54,52 @@ pub mod chat_room {
         pub attachment: Option<super::chat_room::AttachmentState>,
     }
 
+    /// Typed navigation for the shape above: one accessor per declared field,
+    /// each handing back a handle rather than a value
+    /// (`docs/rust-reactive-state.md` §4.2). Reach it through `nav`.
+    pub trait MessageStateExt {
+        fn id(&self) -> super::musubi::State<String>;
+        fn body(&self) -> super::musubi::State<String>;
+        fn sender(&self) -> super::musubi::State<String>;
+        fn attachment(&self) -> super::musubi::State<Option<super::chat_room::AttachmentState>>;
+    }
+
+    impl MessageStateExt for super::musubi::State<MessageState> {
+        fn id(&self) -> super::musubi::State<String> {
+            self.child("id")
+        }
+        fn body(&self) -> super::musubi::State<String> {
+            self.child("body")
+        }
+        fn sender(&self) -> super::musubi::State<String> {
+            self.child("sender")
+        }
+        fn attachment(&self) -> super::musubi::State<Option<super::chat_room::AttachmentState>> {
+            self.child("attachment")
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     pub struct OnlineUser {
         pub id: String,
         pub name: String,
+    }
+
+    /// Typed navigation for the shape above: one accessor per declared field,
+    /// each handing back a handle rather than a value
+    /// (`docs/rust-reactive-state.md` §4.2). Reach it through `nav`.
+    pub trait OnlineUserExt {
+        fn id(&self) -> super::musubi::State<String>;
+        fn name(&self) -> super::musubi::State<String>;
+    }
+
+    impl OnlineUserExt for super::musubi::State<OnlineUser> {
+        fn id(&self) -> super::musubi::State<String> {
+            self.child("id")
+        }
+        fn name(&self) -> super::musubi::State<String> {
+            self.child("name")
+        }
     }
 
     pub mod stores {
@@ -58,6 +126,93 @@ pub mod chat_room {
                 >,
                 pub last_send_status: ChatRoomStoreLastSendStatus,
                 pub attachment: super::super::super::musubi::UploadSlot,
+            }
+
+            /// Typed navigation for the shape above: one accessor per declared field,
+            /// each handing back a handle rather than a value
+            /// (`docs/rust-reactive-state.md` §4.2). Reach it through `nav`.
+            pub trait ChatRoomStoreExt {
+                fn messages(
+                    &self,
+                ) -> super::super::super::musubi::AsyncState<
+                    Vec<super::super::super::chat_room::MessageState>,
+                >;
+                fn current_user(
+                    &self,
+                ) -> super::super::super::musubi::State<super::super::super::chat_room::OnlineUser>;
+                fn online_users(
+                    &self,
+                ) -> super::super::super::musubi::AsyncState<
+                    Vec<super::super::super::chat_room::OnlineUser>,
+                >;
+                fn last_send_status(
+                    &self,
+                ) -> super::super::super::musubi::State<ChatRoomStoreLastSendStatus>;
+                fn attachment(&self) -> super::super::super::musubi::UploadSlotState;
+            }
+
+            impl ChatRoomStoreExt for super::super::super::musubi::State<State> {
+                fn messages(
+                    &self,
+                ) -> super::super::super::musubi::AsyncState<
+                    Vec<super::super::super::chat_room::MessageState>,
+                > {
+                    self.child("messages").into()
+                }
+                fn current_user(
+                    &self,
+                ) -> super::super::super::musubi::State<super::super::super::chat_room::OnlineUser>
+                {
+                    self.child("current_user")
+                }
+                fn online_users(
+                    &self,
+                ) -> super::super::super::musubi::AsyncState<
+                    Vec<super::super::super::chat_room::OnlineUser>,
+                > {
+                    self.child("online_users").into()
+                }
+                fn last_send_status(
+                    &self,
+                ) -> super::super::super::musubi::State<ChatRoomStoreLastSendStatus>
+                {
+                    self.child("last_send_status")
+                }
+                fn attachment(&self) -> super::super::super::musubi::UploadSlotState {
+                    self.child("attachment").into()
+                }
+            }
+
+            impl ChatRoomStoreExt for super::super::super::musubi::StoreState<State> {
+                fn messages(
+                    &self,
+                ) -> super::super::super::musubi::AsyncState<
+                    Vec<super::super::super::chat_room::MessageState>,
+                > {
+                    ChatRoomStoreExt::messages(&self.fields())
+                }
+                fn current_user(
+                    &self,
+                ) -> super::super::super::musubi::State<super::super::super::chat_room::OnlineUser>
+                {
+                    ChatRoomStoreExt::current_user(&self.fields())
+                }
+                fn online_users(
+                    &self,
+                ) -> super::super::super::musubi::AsyncState<
+                    Vec<super::super::super::chat_room::OnlineUser>,
+                > {
+                    ChatRoomStoreExt::online_users(&self.fields())
+                }
+                fn last_send_status(
+                    &self,
+                ) -> super::super::super::musubi::State<ChatRoomStoreLastSendStatus>
+                {
+                    ChatRoomStoreExt::last_send_status(&self.fields())
+                }
+                fn attachment(&self) -> super::super::super::musubi::UploadSlotState {
+                    ChatRoomStoreExt::attachment(&self.fields())
+                }
             }
 
             /// The mount params object, one field per `attr/3` declaration: required
@@ -126,4 +281,13 @@ pub mod chat_room {
             }
         }
     }
+}
+
+// Navigation traits, flat. One `use <bundle>::nav::*;` per consumer file
+// brings every generated accessor into scope.
+pub mod nav {
+    pub use super::chat_room::AttachmentStateExt;
+    pub use super::chat_room::MessageStateExt;
+    pub use super::chat_room::OnlineUserExt;
+    pub use super::chat_room::stores::chat_room_store::ChatRoomStoreExt;
 }
