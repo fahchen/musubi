@@ -511,7 +511,7 @@ defmodule Musubi.Resolver do
 
       {:mount, store_id, %Socket{} = child_socket, consumed_assigns} ->
         ensure_unique_identity!(store_id, live)
-        mounted_socket = Reconciler.mount_store(child_socket)
+        mounted_socket = Reconciler.init_store(child_socket)
 
         {resolved_state, next_socket, next_registry, next_live} =
           render_store(mounted_socket, registry, live)

@@ -1,0 +1,25 @@
+{
+  "expected_state": null,
+  "frames": [
+    {
+      "dir": "out",
+      "event": "phx_join",
+      "payload": {
+        "id": "nope",
+        "module": "Musubi.WireCapture.Stores.ChildStore",
+        "params": {}
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "reason": "unknown root"
+        },
+        "status": "error"
+      }
+    }
+  ],
+  "scenario": "mount_rejected_unknown_root"
+}

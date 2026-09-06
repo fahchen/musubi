@@ -1,0 +1,26 @@
+[package]
+name = "phoenix-channel"
+description = "Phoenix Channel protocol (serializer v2) over a pluggable, runtime-agnostic socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "phoenix_channel"
+
+[dependencies]
+futures-channel.workspace = true
+futures-core.workspace = true
+futures-sink.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true

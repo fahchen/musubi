@@ -6,6 +6,11 @@ and to per-line child stores (BDR-0010 function attrs for parent callbacks),
 lifecycle hooks for auth/audit, shared cart storage, cross-tab synchronization,
 and reconnect recovery through the application persistence layer.
 
+![cart_page demo](demo.gif)
+
+Adding catalog items, stepping line quantities through the per-line child stores,
+reloading to show the persisted cart surviving a remount, then checking out.
+
 ## Store tree
 
 ```text

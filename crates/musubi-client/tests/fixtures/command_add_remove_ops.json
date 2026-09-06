@@ -1,0 +1,133 @@
+{
+  "expected_state": {
+    "__musubi_store_id__": [],
+    "meta": {
+      "b": "2"
+    }
+  },
+  "frames": [
+    {
+      "dir": "out",
+      "event": "phx_join",
+      "payload": {
+        "id": "meta-1",
+        "module": "Musubi.WireCapture.Stores.MetaRootStore",
+        "params": {}
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "root_id": "Musubi.WireCapture.Stores.MetaRootStore:meta-1"
+        },
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 0,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "",
+            "value": {
+              "__musubi_store_id__": [],
+              "meta": {
+                "a": "1"
+              }
+            }
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.MetaRootStore:meta-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 1
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "put",
+        "payload": {
+          "key": "b",
+          "value": "2"
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 1,
+        "events": [],
+        "ops": [
+          {
+            "op": "add",
+            "path": "/meta/b",
+            "value": "2"
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.MetaRootStore:meta-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 2
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "drop",
+        "payload": {
+          "key": "a"
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 2,
+        "events": [],
+        "ops": [
+          {
+            "op": "remove",
+            "path": "/meta/a"
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.MetaRootStore:meta-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 3
+      }
+    }
+  ],
+  "scenario": "command_add_remove_ops"
+}

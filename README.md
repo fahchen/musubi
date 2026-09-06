@@ -9,10 +9,10 @@ Musubi is a server-authoritative runtime for Elixir/Phoenix applications. A
 Phoenix socket owns one Musubi connection, and that connection can mount many
 declared root stores. Each root store runs in its own page-scoped process,
 renders typed state on the server, and streams RFC 6902 JSON Patch envelopes to
-the TypeScript client.
+the client.
 
 Musubi is useful when you want LiveView-style server authority, but your client
-is a TypeScript or React application that owns rendering.
+is a TypeScript, React, or Rust application that owns rendering.
 
 ## Current Status
 
@@ -80,6 +80,55 @@ pnpm install   # or npm install / yarn install
 `@musubi/client` and `@musubi/react` ship TypeScript source directly; the
 consumer bundler (Vite, Phoenix esbuild) transpiles on demand — no build
 step required.
+
+For a Rust client, add the Rust compiler instead of — or alongside —
+`:musubi_ts`:
+
+```elixir
+def project do
+  [
+    app: :my_app,
+    compilers: Mix.compilers() ++ [:musubi_rust]
+  ]
+end
+```
+
+Configure the generated `.rs` bundle path:
+
+```elixir
+config :musubi, :rust_codegen_output_path, "desktop/src/generated.rs"
+```
+
+The Rust client crates — `musubi-client`, `musubi-client-tokio`, and the
+`phoenix-channel` protocol layer beneath them — ship inside the Musubi Hex
+package under `deps/musubi/crates/`. Path-depend on them from the Rust
+project's `Cargo.toml` (adjust the relative path so it points at
+`deps/musubi/crates/<name>` from the crate root):
+
+```toml
+[dependencies]
+musubi-client = { path = "../deps/musubi/crates/musubi-client" }
+# tokio applications also take the tokio spawner, timer and connector:
+musubi-client-tokio = { path = "../deps/musubi/crates/musubi-client-tokio" }
+```
+
+The Rust client is a peer of the TypeScript one, not a subset:
+`Connection::mount::<St>` takes the store's generated `Params` struct (one
+field per `attr/3`, so a required mount param cannot be forgotten at the call
+site), `Mounted::state()` hands back a typed view on a **retained reactive
+state tree** — one transaction per envelope, per-node subscriptions, RAII
+tokens — alongside typed `command(...)` dispatch and typed `events(...)`
+streams, uploads run through `Mounted::upload_at` in both channel and external
+(direct-to-cloud) mode, an opt-in stale-while-revalidate cache hangs off the
+builder (`ConnectionBuilder::cache`), and per-root liveness is observable via
+`Mounted::status()`, whose handle carries `.value()` / `.subscribe()`.
+
+`musubi-client` pulls in no async runtime, so a non-tokio embedder such as a
+gpui desktop app skips `musubi-client-tokio` and supplies its own `Spawner`,
+`Timer`, and `Connector`. See
+[Rust Reactive State](docs/rust-reactive-state.md),
+[Rust Client](docs/rust-client.md), [Rust Codegen](docs/rust-codegen.md), and
+[Rust Codegen Example](docs/rust-codegen-example.md).
 
 ## Minimal Example
 
@@ -169,14 +218,17 @@ await counter.dispatchCommand("increment", { amount: 1 })
 await unmount()
 ```
 
-The `R` generic is bound once on `connect`; the `module` string literal
-drives type inference for every later `mountStore` call. Command
-failures and timeouts throw a `MusubiCommandError` (from
-`@musubi/client`) with `kind`, `command`, `storeId`, `reply`, and an
+`Musubi.Stores` is the store registry the `:musubi_ts` compiler writes into
+your `.d.ts` bundle — one entry per declared store, with its state shape,
+commands and events. You name it once, on `connect`; from there the `module`
+string literal drives type inference for every later `mountStore` call, so
+`counter` is fully typed and `dispatchCommand` only accepts commands that
+store declares. Command failures and timeouts throw a `MusubiCommandError`
+(from `@musubi/client`) with `kind`, `command`, `storeId`, `reply`, and an
 extracted `code`.
 
 React consumers typically go through `createMusubi<Musubi.Stores>()`
-from `@musubi/react`, which binds `R` once and returns the full hook
+from `@musubi/react`, which takes the registry once and returns the full hook
 set — `MusubiProvider` (accepts `connection` or `socket`),
 `useMusubiConnectionStatus`, `useMusubiRoot`, `useMusubiRootSuspense`,
 `useMusubiSnapshot`, and `useMusubiCommand` (mutation-shaped:
@@ -207,9 +259,18 @@ Musubi has no built-in PubSub abstraction — the application owns the broadcast
 - [Getting Started](guides/getting-started.md)
 - [Phoenix Setup](guides/phoenix-setup.md)
 - [Client and React](guides/client-and-react.md)
+- [Streams](guides/streams.md)
 - [Uploads](guides/uploads.md)
+- [Push Events](guides/push-events.md)
+- [Testing](guides/testing.md)
 - [Client Contract](docs/client-contract.md)
+- [Streams Reference](docs/streams.md)
+- [Uploads Reference](docs/uploads.md)
+- [Push Events Reference](docs/push-events.md)
 - [Persistence Pattern](docs/persistence-pattern.md)
+- [Rust Codegen](docs/rust-codegen.md)
+- [Rust Client](docs/rust-client.md)
+- [Rust Codegen Example](docs/rust-codegen-example.md)
 
 Build local ExDoc output with:
 
@@ -223,7 +284,10 @@ mix docs
 The repository includes standalone Phoenix examples under `examples/`:
 
 - `examples/cart_page` - cart UI with nested stores and persistence hooks
-- `examples/chat_room` - PubSub-backed chat room
+  ([demo](examples/cart_page/demo.gif))
+- `examples/chat_room` - PubSub-backed chat room, with React and gpui clients
+  ([demo](examples/chat_room/demo.gif))
 - `examples/poll_app` - multi-root polling application with streams and async
+  ([demo](examples/poll_app/demo.gif))
 
 Each example depends on Musubi with `path: "../.."`.

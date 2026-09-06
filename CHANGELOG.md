@@ -5,11 +5,316 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The Elixir package (`musubi`) and the JS packages (`@musubi/client`,
-`@musubi/react`) share this changelog. Per-package version numbers are
+The Elixir package (`musubi`), the JS packages (`@musubi/client`,
+`@musubi/react`) and the Rust crates (`musubi-state`, `musubi-client`,
+`musubi-client-tokio`, `musubi-gpui`, `phoenix-channel`) share this changelog. Per-package version numbers are
 not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
+
+### Added
+
+- **`musubi`** — **Rust codegen target.** A second codegen target,
+  `:musubi_rust` (`Mix.Tasks.Compile.MusubiRust`), renders one `.rs` bundle of
+  typed store, state, command and event definitions from the same per-module
+  compile-time manifest `:musubi_ts` already consumes. Consumers add it to
+  `compilers:` and point `config :musubi, :rust_codegen_output_path` at the
+  destination; `mix compile.musubi_rust --check` fails the build when the
+  committed bundle drifts from the declarations, exactly as the TypeScript
+  target does. Because Rust is nominal where TypeScript is structural, the
+  renderer (`Musubi.Codegen.Rust`) hoists every anonymous map into a named
+  `struct` and every union into a named `enum` — `Option<T>` for `T | nil`,
+  C-like enums for atom literals, internally tagged enums for maps sharing a
+  discriminant — escapes Rust keywords as raw idents, and emits
+  `super::`-chained cross-module paths so the bundle can be included anywhere
+  in a consumer crate. Output is rustfmt-stable by construction, so
+  `cargo fmt --check` and `compile.musubi_rust --check` cannot fight each
+  other. Two further keys tune the emission: `:rust_codegen_root_module`
+  (default `"musubi"`, the prelude module holding the runtime re-exports) and
+  `:rust_codegen_runtime_path` (default `"musubi_client"`). `docs/rust-codegen.md`
+  is the normative specification; `docs/rust-codegen-example.md` walks one app
+  that exercises every feature reaching the wire types.
+- **`musubi-client` (new, Rust)** — **A Rust client for the Musubi wire
+  contract**, shipped as three crates under `crates/`: `phoenix-channel`
+  (Phoenix Channel serializer v2 over a pluggable socket, not Musubi-aware),
+  `musubi-client` (the runtime-agnostic core), and `musubi-client-tokio`
+  (`TokioSpawner`, `TokioTimer`, a tokio-tungstenite `Connector`, and a
+  `builder/1` that pre-fills all three). The core implements the client
+  contract as a peer of `@musubi/client`, not a port of it: the RFC 6902 patch
+  engine over a shadow `serde_json::Value` document, with the
+  add/remove/replace op allowlist (BDR-0014) and gapless version discipline;
+  client-owned stream materialization (upsert-then-position, `at`/`limit`
+  trimming, prune on owner disappearance); `AsyncResult<T>` carrying the wire
+  `result`/`reason` names; typed commands whose reply type is inferred from the
+  payload's `Command<S>` impl, with reply-before-patch ordering (BDR-0009)
+  documented at the call site; push events (BDR-0032) as typed `Stream`s keyed
+  by `(store_id, name)`; and reconnect-only recovery (BDR-0015) over the
+  phoenix.js backoff ladder. Mounting is refcounted and unmounting is `Drop`.
+  Uploads, typed mount params, the stale-while-revalidate cache, the mount
+  status surface and the wire-fixture suite landed later in the same cycle and
+  have their own entries below. The nine runtime types the
+  generated bundle re-exports (`Store`, `Command<S>`, `Event<S>`,
+  `AsyncResult`, `AsyncError`, `StoreField`, `StoreId`, `NoReply`,
+  `UploadSlot`) are owned by `musubi_client::generated`, so
+  `Connection::mount::<CartStore>()` type-checks against one trait rather than
+  a bundle-local copy. No `tokio` type appears in any `musubi-client`
+  signature: a non-tokio embedder implements the `Connector`, `Spawner` and
+  `Timer` seams and omits `musubi-client-tokio` entirely. Edition 2024, MSRV
+  1.85, MIT, versioned in lockstep with the Hex package. See
+  `docs/rust-client.md`.
+- **`musubi` / `musubi-client` (Rust)** — **Typed mount params.** Root stores
+  declare their mount params with the existing `attr/3` DSL; the shared codegen
+  manifest now carries them as `:attrs` (the stamp is
+  `%{module, kind, fields, commands, events, attrs, uploads, source}`), and the
+  Rust target generates a `Params` struct per store — a `required: true` attr
+  is a plain field, every other attr an `Option<T>` that serializes to an
+  absent key rather than an explicit `null`, and a store declaring no `attr`
+  gets `pub struct Params {}`. `Connection::mount::<St>(id, params)` takes
+  `St::Params`, so a required param cannot be forgotten at the call site;
+  `mount_with_params` remains the untyped `impl Serialize` escape hatch for
+  keys a root reads without declaring. The TS renderer ignores `:attrs` —
+  `StoreDef` has no params slot yet — a deliberate, recorded parity gap
+  (`docs/rust-codegen.md` §8).
+- **`musubi-client` (Rust)** — **Uploads, both planes.** The data plane folds
+  `upload_ops` into per-root handles keyed by `(store_id, upload_name)`
+  (BDR-0028), reached through `Mounted::upload(&store_id, name)` — a cheap
+  `Clone` with `snapshot()`/`updates()` mirroring the mount surface, op
+  application matching `packages/client/src/uploads.ts` op-for-op, and
+  unknown ops skipped element-by-element rather than failing the envelope. The
+  control plane adds `select` (preflight), `start`, `cancel` and `reset` on the
+  same handle: channel mode pushes `config.chunk_size` binary slices over a
+  per-entry `musubi_upload:<ref>` sub-channel (`phoenix-channel` gained
+  serializer v2 binary framing — `BinaryPush`, `Channel::push_binary`), and
+  external mode (BDR-0027) dispatches to an app-supplied
+  `ConnectionBuilder::uploader(name, impl Uploader)` — the crate reads no
+  files and ships no HTTP client. The state slot stays the inert `UploadSlot`;
+  upload failures surface as `MusubiError::Transfer(TransferError)`.
+- **`musubi-client` (Rust)** — **Stale-while-revalidate mount cache.**
+  Connection-wide and opt-in: `ConnectionBuilder::cache(impl CacheStore)` plus
+  `cache_buster`/`cache_gc_time`, with `MemoryCacheStore` in the crate and
+  durable stores left to the embedder. A mount whose
+  `cache_key(module, id, params)` slot holds a fresh, matching-`buster` entry
+  seeds the last-known wire tree immediately (version stays 0, streams hydrate
+  empty) while the live join revalidates; the initial patch swaps the seed out
+  in one whole-root op. Accepted envelopes write back under a 1s trailing
+  throttle; unmount flushes and arms eviction for the remainder of the entry's
+  own lifetime; `disconnect()` flushes without evicting. Commands dispatched on
+  a seeded root queue (bounded, 32) behind the in-flight initial patch instead
+  of rejecting `NotConnected`. Mirrors the `@musubi/client` cache contract
+  (`docs/client-contract.md` § Store Cache) with three recorded divergences.
+- **`@musubi/client` / `musubi-client` (Rust)** — **Mount status** (BDR-0033):
+  socket liveness is now observable without a failed command, as a client-local
+  projection — no wire message carries it, and it never blanks the last-good
+  snapshot it annotates. TypeScript surfaces it per connection:
+  `connection.status()` / `connection.onStatusChange(cb)` over
+  `MusubiSocketStatus` (`"connecting" | "ready" | "reconnecting"`), driven by
+  the now-optional `SocketLike.onOpen`/`onError`/`onClose` hooks (a socket
+  without them reads as a constant `"ready"`). Rust surfaces it per mounted
+  root: `Mounted::status()` / `status_updates()` over
+  `MountStatus { Connecting, Live, Reconnecting }`, folded from the new
+  connection-wide `PhoenixSocket::status()` / `status_updates()`
+  (`SocketStatus`) in `phoenix-channel`. Terminal outcomes stay on the error
+  paths — the status deliberately has no error arm.
+- **`musubi` / `musubi-client` (Rust)** — **Wire fixtures.**
+  `mix musubi.capture_wire` (test-only, under `test/support/`) drives the same
+  connection-channel harness the transport tests use and writes one canonical
+  JSON file per scenario — 21 scenarios covering mount, commands, streams,
+  async, events, uploads (external mode) and a version gap — to
+  `crates/musubi-client/tests/fixtures/`, deterministically (sorted keys,
+  renumbered upload refs) so re-capture plus `git diff --exit-code` is a drift
+  gate. `test/musubi/wire_capture_test.exs` asserts the checked-in files match
+  the live server, CI re-captures and fails on drift, and
+  `crates/musubi-client/tests/fixtures.rs` replays every fixture through a
+  real `Connection` — performing the client call each `out` frame names,
+  feeding `in` frames verbatim, and asserting the final snapshot equals the
+  server-authored `expected_state`.
+- **`musubi`** — The Hex package now ships `crates/`, alongside the workspace
+  root `Cargo.toml` the crate manifests inherit their version and dependency
+  pins from. This mirrors how `packages/client/src` and `packages/react/src`
+  already ride along for JS consumers: a consuming Rust crate path-depends on
+  `musubi-client = { path = "../deps/musubi/crates/musubi-client" }`. Nothing
+  is published to crates.io yet, so the Hex tarball is the only distribution
+  channel and the crate version cannot skew from the server's.
+- **`examples/chat_room`** — A native desktop client under `desktop/`, built on
+  gpui and the Rust crates, alongside the existing React client in `ui/`. It is
+  the reference non-tokio embedder: it depends on `musubi-client` alone and
+  implements the `Spawner`, `Timer` and `Connector` seams over gpui's own
+  executor. Detached from the repo-root Cargo workspace on purpose, and not
+  built in CI.
+- **`examples/chat_room`** — Attachment upload across all three surfaces. The
+  store declares `upload :attachment` (channel mode, one file); both clients
+  run the same select → start → `attach` three-step, where the `attach`
+  command consumes the completed entry (`consume_uploaded_entries/3`), moves
+  the bytes into an application Agent, and appends a chat message carrying a
+  `ChatRoom.AttachmentState` — so the row reaches every client over the
+  ordinary stream, never out of the reply (BDR-0009). The React client wires a
+  file input to the proxy's `UploadHandle`; the desktop client opens the
+  native panel, reads the bytes itself, and pushes them as binary frames.
+  `ChatRoomWeb.Router` serves the stored bytes at `/attachments/:id`.
+- **`examples/chat_room`** — A durable-cache demo in the desktop client:
+  `desktop/src/cache_store.rs` is a file-backed `CacheStore` over one JSON
+  file, wired through `ConnectionBuilder::cache`, and written — like
+  `transport.rs` — to be copied verbatim into other embedders. Relaunching the
+  app renders identity and presence instantly from the last session under a
+  "joining" pill, and the live initial patch swaps the seed out atomically.
+- **`musubi-state` (new, Rust)** — **A retained reactive state tree**, and the
+  Rust client's data plane from here on. One mounted root is one `StateTree`: a
+  long-lived arena of nodes whose `NodeId`s outlive every envelope, so a patch
+  is only *input* and whether anyone is notified is decided by comparing each
+  node's semantic value from before the whole transaction with the one it
+  settles on. One server message is one transaction, journalled and therefore
+  atomic in O(diff) rather than O(tree); the `Notify` it hands back owes its
+  subscribers, and dropping it is what runs them — with the tree lock already
+  released, so a callback may read, subscribe, or open its own transaction.
+  `State<T>` is a typed view rooted at one node: `value()` materializes exactly
+  the subtree it is rooted at, `subscribe()` returns one RAII `Subscription`,
+  and any subtree is a full reactive state passable to a component that knows
+  nothing about the root. Four navigation views specialize it —
+  `StreamState<T>` (ordered **and** keyed, so a row keeps its node and its
+  subscribers across repositioning, and a transaction's keyed edits reach the
+  callback beside the change), `StoreState<S>` (reconciled by
+  `__musubi_store_id__` rather than by position, so a child store that moves
+  keeps its `NodeId`, its subtree and its subscribers), `AsyncState<T>` (status
+  is the node's own semantics, so an `ok -> loading` reconnect flip wakes the
+  async node and not one row under it) and `UploadSlotState` (an inert leaf that
+  knows both halves of its `(store_id, name)` upload key). Navigation is
+  infallible by contract: `x.prop()` costs nothing, reads nothing and cannot
+  fail, and a key the render does not carry yields a handle that reads
+  `is_live() == false` / `try_value() == Err(Gone)`. No network, no UI, no
+  runtime — `serde`, `serde_json`, `slotmap`, `thiserror` and nothing else, with
+  a CI gate asserting `cargo tree -i tokio` matches nothing. `publish = false`.
+  `docs/rust-reactive-state.md` is the normative design.
+- **`musubi-gpui` (new, Rust)** — **The gpui adapter**, two capabilities and
+  deliberately nothing else. `observe` / `observe_with` / `to_view` make the
+  `!Send` hop once, in one place: a subscription callback is
+  `Fn(Change) + Send + Sync` and a gpui entity is thread-affine, so every
+  observation would otherwise repeat the same carry-to-the-foreground,
+  update-the-entity, `cx.notify()`, branch-on-the-entity-being-gone glue — once
+  per view per field under per-node subscription. `to_view` is generic over the
+  notified *value* and never over the handle, which is what lets `musubi-client`'s
+  own out-of-tree handles (`StatusState`, `Upload`) use the identical call site
+  from the far side of a crate boundary this adapter never crosses. `drive_list`
+  translates a transaction's keyed `CollectionEdit`s into `ListState::splice`, so
+  one new message invalidates one row range instead of wiping every cached row
+  height with `reset(count)`. No widgets, no theme, no rendering. Depends on
+  `musubi-state` and gpui and **never** on `musubi-client`, and carries its own
+  `[workspace]` table so gpui — and the tokio it drags in transitively — stays
+  out of the root lockfile and out of the runtime-free gates. `publish = false`.
+- **`musubi` / `musubi-client` (Rust)** — **Generated navigation.** Beside every
+  generated shape struct the bundle now emits a `<Name>Ext` trait implemented for
+  `State<Shape>` (and, for a store's own shape, for `StoreState<Shape>` too), one
+  accessor per declared field, each handing back a **handle** rather than a
+  value: `State<T>` for a plain field, `StreamState<T>` for `stream/3`,
+  `AsyncState<T>` for `Musubi.AsyncResult.of(T)` — plus `ok_stream()` where the
+  manifest knows the result is a stream — `StoreState<S>` for `Module.state()`
+  and `UploadSlotState` for a declared upload. An extension trait rather than an
+  inherent impl because `State<T>` is defined in another crate and there is no
+  orphan-rule escape hatch for inherent impls; a bundle-level `pub mod nav`
+  re-exports every trait, so a consumer writes `use generated::nav::*;` once per
+  file. Accessors are infallible (`self.child("<wire key>")`), so
+  `state.current_user().name()` is legal on a root that has not been patched yet
+  and the check moves to the read. Snapshot types are unchanged — every existing
+  `value()`-shaped consumer keeps compiling. `docs/rust-codegen.md` §"Runtime
+  contract the navigation emission depends on" is the seam.
+
+### Fixed
+
+- **`musubi-client` (Rust)** — An envelope whose state does not match the
+  generated types no longer lands in pieces. The engine used to commit an
+  envelope — bump `version`, patch the shadow tree, publish its `upload_ops` to
+  their subscribers — and only then hand the tree to the caller to deserialize,
+  so codegen drift (`docs/rust-client.md` §11) left the root a version ahead of
+  the snapshot its embedder could read, with upload progress that had run ahead
+  of a state nobody ever saw. Applying is now two-phase: everything that can
+  fail runs against a working copy, the deserialize happens between the phases,
+  and only then does the engine commit and its upload subscribers hear about it.
+  A rejected envelope leaves the version, the tree, the streams and every
+  upload handle exactly as they were, and recovery is a restart rather than a
+  repair. The working copy is not an extra copy per cycle — it is the one
+  hydration already made.
+- **`musubi`** — Channel-mode upload chunks no longer crash the
+  `musubi_upload:<ref>` sub-channel. Over a real WebSocket, Phoenix's v2 JSON
+  serializer delivers a binary frame's payload as
+  `{:binary, data}`, which matched no `handle_in/3` clause — so every real
+  chunk crashed its channel and the entry came back as `{op: cancel}`. The
+  test-suite path (`Phoenix.ChannelTest.push/3` hands the channel a raw
+  binary) had hidden it; `Musubi.Transport.UploadChannel` now accepts both
+  shapes.
+- **`@musubi/client`** — Upload ops now invalidate the owning store's memoized
+  snapshots. An upload op mutates the `UploadHandle` in place and touches no
+  state node, so `proxy.snapshot()` kept its identity and
+  `useSyncExternalStore` consumers bailed out of the re-render the op's
+  notification requested — progress never repainted. Each upload op now drops
+  the cached snapshot for its `store_id` and every ancestor.
+- **`musubi`** — `mix compile` after a wiped codegen manifest (a `mix clean`
+  or `_build` removal with no recompile) no longer silently replaces a
+  committed codegen bundle with its empty render. An empty manifest next to an
+  existing bundle is indistinguishable from "every store was deleted", and
+  only one of the two is recoverable, so both compilers (`:musubi_ts`,
+  `:musubi_rust`) now keep the file, warn with the `mix compile --force`
+  remedy, and still report honest drift under `--check`. The genuine
+  all-stores-deleted case converges one compile later.
+
+### Changed
+
+- **`musubi-client` (Rust)** — **`Mounted::snapshot()`, `Mounted::updates()` and
+  `Mounted::status_updates()` are removed; `Mounted::state()` replaces all
+  three.** This is a forced migration, not a deprecation, and it is what buys
+  the retained tree: keeping them would mean keeping a whole-root
+  `Latest<Arc<St::State>>` cell beside the tree, and with it the per-envelope
+  whole-root hydration, deserialization and clone the tree exists to delete —
+  paid on every envelope, by every mount, whether or not anything read it.
+  `state()` hands back a `State<St::State>` on the retained tree
+  (`musubi-state`), so a read costs the subtree it reads and a subscription
+  wakes only when *that* node's semantic value changed. The five removals map
+  one-to-one: `snapshot()` becomes `state().value()` (and
+  `snapshot().is_none()` becomes `state().revision() == 0`, with
+  `!state().is_live()` for a torn-down tree); `updates()` becomes
+  `state().subscribe(..)` on whichever node the consumer actually renders;
+  `status_updates()` becomes `status().subscribe(..)`, with
+  `status().into_stream()` for a consumer whose shape is a loop; and
+  `Upload::snapshot()` / `Upload::updates()` become `value()` / `subscribe()` /
+  `into_stream()` on the same handle. That last pair is a rename, not a
+  semantic change. What is left is one convention across the whole API:
+  `x.prop()` gives a **handle**, `handle.value()` gives a **value**,
+  `handle.subscribe(cb)` gives a **subscription**, and `drop(subscription)` is
+  the only way to unsubscribe — with `Subscription` the receipt everywhere, tree
+  and non-tree alike, so one `Vec<Subscription>` holds every observation a view
+  has. `PatchEngine`, `PatchEnvelope`, `PatchOp`, `StreamOp`, `UploadOp`,
+  `PushEvent` and `Uploads` come off the crate's public surface at the same
+  time; `StoreId`, `UploadSlot`, `StoreField`, `AsyncResult`, `AsyncError` and
+  `AsyncErrorKind` moved to `musubi-state` and are re-exported verbatim from
+  `musubi_client::generated`, so no bundle path changes. `json-patch` is gone
+  from the dependency tree — the pointer walk is owned by `musubi-state`, because
+  `json_patch::patch` needs a `serde_json::Value` document and there is no longer
+  one to give it. `docs/rust-reactive-state.md` §5.3 is the migration table.
+- **`musubi-client` (Rust)** — **The mount status delivers the latest value
+  instead of a queue.** `MountStatus` is a client-local liveness projection no
+  wire message carries, so it does not live on the retained tree; what is left
+  of `latest.rs` is one small runtime-free latest-value cell behind
+  `Mounted::status() -> StatusState`, rather than an unbounded channel. Three
+  visible consequences: a consumer that falls behind gets the **current** status
+  on its next poll and never the intermediates it missed, so a stalled consumer
+  can no longer grow the client's memory and no longer runs its body once per
+  skipped envelope; the **first poll of `into_stream()` replays** what `value()`
+  holds, which retires the subscribe-before-you-read idiom the old pair
+  required; and teardown still ends the stream after handing over a last unseen
+  value. `events()` is unaffected — discrete occurrences, no current value to
+  read, still an unbounded queue per subscription — and one event now fans out
+  as a shared `Arc<Value>` rather than a deep payload clone per subscriber.
+  `docs/rust-client.md` §2.4 has the full contract.
+- **`musubi`** — **Internal: the codegen manifest is now target-neutral.**
+  `Musubi.Plugin.TypeScript` became `Musubi.Plugin.Codegen`,
+  `Musubi.Codegen.TypeScript.Manifest` became `Musubi.Codegen.Manifest`, and
+  the compile-time stamp moved from `_build/<env>/musubi-codegen-ts/` to
+  `_build/<env>/musubi-codegen/`, so one `@after_compile` callback now feeds
+  every renderer instead of one stamp per target. Both modules are internal and
+  excluded from the published docs, so no consumer code changes; the only
+  visible effect is that the old `musubi-codegen-ts/` directory becomes an
+  orphan that `mix clean` no longer removes and that survives until the next
+  `_build` wipe. The `:__streams__` field filter moved up to
+  `Musubi.Codegen.Manifest.renderable_fields/1` so both renderers share one
+  copy of a target-agnostic policy.
 
 ## [0.13.1] — 2026-08-09
 

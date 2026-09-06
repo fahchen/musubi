@@ -6,7 +6,7 @@ defmodule Musubi.Codegen.TypeScript.TypeRenderer do
   assembly, manifest discovery, or alias-expansion concerns mixed in.
 
   All `{:__aliases__, _, parts}` nodes are expected to be already-fully-
-  qualified — `Musubi.Codegen.TypeScript.Manifest` resolves consumer aliases
+  qualified — `Musubi.Codegen.Manifest` resolves consumer aliases
   at `@after_compile` time using the captured `Macro.Env` before serializing.
 
   ## Type mapping

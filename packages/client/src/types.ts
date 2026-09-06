@@ -242,8 +242,10 @@ export interface UploadError {
     | "too_many_files"
     | "not_accepted"
     | "chunk_timeout"
+    | "chunk_too_large"
     | "external_failed"
     | "preflight_rejected"
+    | "internal"
     | (string & {})
   message: string
 }

@@ -666,6 +666,16 @@ class FakeMusubiConnection implements MusubiConnection<ReactTestStores> {
     this.clearedTargets.push(target ?? null)
   }
 
+  // BDR-0033 status surface; the hooks under test never read it, so the fake
+  // reports a constant "ready" and a no-op subscription.
+  status(): "connecting" | "ready" | "reconnecting" {
+    return "ready"
+  }
+
+  onStatusChange(): () => void {
+    return () => {}
+  }
+
   async disconnect(): Promise<void> {
     this.disconnected = true
   }

@@ -1,8 +1,8 @@
 defmodule Musubi.Codegen.TypeScriptTest do
   use ExUnit.Case, async: true
 
+  alias Musubi.Codegen.Manifest
   alias Musubi.Codegen.TypeScript
-  alias Musubi.Codegen.TypeScript.Manifest
   alias Musubi.TestSupport.TypespecProbe
   alias Musubi.TestSupport.TypespecProbeChild
   alias Musubi.TestSupport.TypespecProbeWithCommand

@@ -1,29 +1,46 @@
-defmodule Musubi.Codegen.TypeScript.Manifest do
+defmodule Musubi.Codegen.Manifest do
   @moduledoc false
-  # Per-module compile-time manifest for the `:musubi_ts` Mix compiler.
+  # Per-module compile-time manifest shared by every Musubi codegen target.
   #
   # The pattern mirrors `Phoenix.LiveView.ColocatedJS`: every Musubi `state do`
-  # module gets its own subdirectory under `Mix.Project.build_path()`, and
-  # `Mix.Tasks.Compile.MusubiTs` discovers eligible modules by listing those
+  # module gets its own subdirectory under `Mix.Project.build_path()`, and each
+  # codegen Mix compiler (`Mix.Tasks.Compile.MusubiTs` and
+  # `Mix.Tasks.Compile.MusubiRust`) discovers eligible modules by listing those
   # subdirectories — no beam scan, no `:application.get_key/2` walk.
   #
   # Layout:
   #
-  #     <build>/musubi-codegen-ts/<inspect(module)>/state.term
+  #     <build>/musubi-codegen/<inspect(module)>/state.term
   #
-  # Each `state.term` is `:erlang.term_to_binary(%{module, fields, commands,
-  # source})`. The `module` atom inside the term is the canonical reference;
-  # the directory name is purely organizational so consumers can `mix clean`.
+  # Each `state.term` is `:erlang.term_to_binary(%{module, kind, fields,
+  # commands, events, attrs, uploads, source})`. The payload is target-neutral
+  # — raw Musubi reflection with quoted Elixir type ASTs, no renderer strings — so
+  # one stamp feeds N renderers. The `module` atom inside the term is the
+  # canonical reference; the directory name is purely organizational so
+  # consumers can `mix clean`.
   #
-  # `__after_compile__/2` is registered by `Musubi.Plugin.TypeScript` on every
+  # `__after_compile__/2` is registered by `Musubi.Plugin.Codegen` on every
   # `state do` module and runs at the tail of that module's compilation,
-  # serializing the data the codegen renderer needs. Modules whose source
+  # serializing the data the codegen renderers need. Modules whose source
   # lives under `test/` are skipped so test fixtures don't pollute the bundle.
 
-  @subdir "musubi-codegen-ts"
+  @subdir "musubi-codegen"
+
+  # Fields the DSL injects for runtime bookkeeping. They are not part of any
+  # target's rendered shape, so the exclusion is target-agnostic policy and
+  # lives here rather than in a renderer.
+  @internal_fields [:__streams__]
 
   @type entry() ::
-          {module(), %{kind: :state | :store, fields: list(), commands: list(), uploads: list()}}
+          {module(),
+           %{
+             kind: :state | :store,
+             fields: list(),
+             commands: list(),
+             events: list(),
+             attrs: list(),
+             uploads: list()
+           }}
 
   @doc false
   @spec __after_compile__(Macro.Env.t(), binary()) :: :ok
@@ -50,6 +67,7 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
             fields: list(),
             commands: list(),
             events: list(),
+            attrs: list(),
             uploads: list()
           }
   def collect(%Macro.Env{module: module} = env) do
@@ -59,6 +77,7 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
       fields: expand_field_aliases(List.wrap(module.__musubi__(:fields)), env),
       commands: expand_command_aliases(List.wrap(module.__musubi__(:commands)), env),
       events: expand_event_aliases(List.wrap(module.__musubi__(:events)), env),
+      attrs: expand_field_aliases(List.wrap(module.__musubi__(:attrs)), env),
       uploads: read_uploads(module)
     }
   end
@@ -77,6 +96,12 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
     ArgumentError -> nil
   end
 
+  # Test/manual-only counterpart to `__after_compile__/2`: it stamps the same
+  # 8-key payload from module reflection alone, so — having no `Macro.Env` —
+  # it performs **no** alias expansion. Entries it writes can therefore carry
+  # single-segment `{:__aliases__, _, [:Child]}` nodes that the real compile
+  # path never produces. Renderers must be written against the expanded form
+  # `collect/1` emits; never against what `stamp/3` happens to persist.
   @doc false
   @spec stamp(module(), Path.t(), Path.t()) :: :ok
   def stamp(module, source_file, target) do
@@ -89,6 +114,7 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
       fields: List.wrap(module.__musubi__(:fields)),
       commands: List.wrap(module.__musubi__(:commands)),
       events: List.wrap(module.__musubi__(:events)),
+      attrs: List.wrap(module.__musubi__(:attrs)),
       uploads: read_uploads(module)
     }
 
@@ -161,10 +187,10 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
   end
 
   @doc """
-  Lists every stamped module's `{module, %{fields, commands}}` entry under
-  `target`. Skips entries whose module no longer loads (e.g. a `state do`
-  module deleted from source between compiles — its dir lingers until
-  `clean_outdated/1` or `mix clean`).
+  Lists every stamped module's `{module, %{kind, fields, commands, events,
+  attrs, uploads}}` entry under `target`. Skips entries whose module no longer
+  loads (e.g. a `state do` module deleted from source between compiles — its dir
+  lingers until `clean_outdated/1` or `mix clean`).
   """
   @spec list(Path.t()) :: [entry()]
   def list(target \\ target_dir()) do
@@ -177,6 +203,23 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
       _other ->
         []
     end
+  end
+
+  @doc """
+  Drops DSL-internal bookkeeping fields from an entry's `:fields` list,
+  leaving only the fields a codegen target should render.
+
+  The exclusion list is target-agnostic policy, so every renderer calls this
+  instead of re-deriving it.
+
+      iex> [%{name: :__streams__, type: quote(do: map())}, %{name: :title, type: quote(do: String.t())}]
+      ...> |> Musubi.Codegen.Manifest.renderable_fields()
+      ...> |> Enum.map(& &1.name)
+      [:title]
+  """
+  @spec renderable_fields([map()]) :: [map()]
+  def renderable_fields(fields) when is_list(fields) do
+    Enum.reject(fields, fn %{name: name} -> name in @internal_fields end)
   end
 
   @doc """
@@ -217,12 +260,13 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
   @doc false
   @spec target_dir() :: Path.t()
   def target_dir do
-    # Tests scope an alternate target via `Process.put(:__musubi_ts_target_dir__, ...)`
-    # so they can drive `__after_compile__/2` and the compiler's `list/0` /
-    # `clean_outdated/0` against an isolated tmp dir without clobbering the
-    # real `_build/<env>/musubi-codegen-ts/` tree. Production callers leave the
+    # Tests scope an alternate target via
+    # `Process.put(:__musubi_codegen_target_dir__, ...)` so they can drive
+    # `__after_compile__/2` and a compiler's `list/0` / `clean_outdated/0`
+    # against an isolated tmp dir without clobbering the real
+    # `_build/<env>/musubi-codegen/` tree. Production callers leave the
     # process dict untouched and fall through to `Mix.Project.build_path()`.
-    Process.get(:__musubi_ts_target_dir__) || Path.join(Mix.Project.build_path(), @subdir)
+    Process.get(:__musubi_codegen_target_dir__) || Path.join(Mix.Project.build_path(), @subdir)
   end
 
   defp module_dir(module, target), do: Path.join(target, inspect(module))
@@ -238,6 +282,7 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
       kind = Map.get(data, :kind) || module_kind(module)
       uploads = List.wrap(Map.get(data, :uploads, []))
       events = List.wrap(Map.get(data, :events, []))
+      attrs = List.wrap(Map.get(data, :attrs, []))
 
       [
         {module,
@@ -246,6 +291,7 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
            fields: data.fields,
            commands: data.commands,
            events: events,
+           attrs: attrs,
            uploads: uploads
          }}
       ]
@@ -273,9 +319,7 @@ defmodule Musubi.Codegen.TypeScript.Manifest do
     ArgumentError -> nil
   end
 
-  defp eligible_source?(file) when is_binary(file) do
-    not (String.contains?(file, "/test/support/") or String.contains?(file, "/test/"))
-  end
+  defp eligible_source?(file) when is_binary(file), do: not String.contains?(file, "/test/")
 
   defp eligible_source?(_other), do: true
 end

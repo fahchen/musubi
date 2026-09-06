@@ -1,0 +1,134 @@
+{
+  "expected_state": {
+    "__musubi_store_id__": [],
+    "panel": null
+  },
+  "frames": [
+    {
+      "dir": "out",
+      "event": "phx_join",
+      "payload": {
+        "id": "toggle-1",
+        "module": "Musubi.WireCapture.Stores.ToggleRootStore",
+        "params": {}
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "root_id": "Musubi.WireCapture.Stores.ToggleRootStore:toggle-1"
+        },
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 0,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "",
+            "value": {
+              "__musubi_store_id__": [],
+              "panel": null
+            }
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.ToggleRootStore:toggle-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 1
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "toggle",
+        "payload": {
+          "show": true
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 1,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "/panel",
+            "value": {
+              "__musubi_store_id__": [
+                "panel"
+              ],
+              "label": "panel"
+            }
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.ToggleRootStore:toggle-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 2
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "toggle",
+        "payload": {
+          "show": false
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 2,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "/panel",
+            "value": null
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.ToggleRootStore:toggle-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 3
+      }
+    }
+  ],
+  "scenario": "child_mount_unmount"
+}

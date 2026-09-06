@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react"
-import type { SubmitEvent } from "react"
+import { useEffect, useReducer, useState } from "react"
+import type { ChangeEvent, SubmitEvent } from "react"
 import { MusubiCommandError, type StoreProxy } from "@musubi/react"
 
 import {
@@ -40,11 +40,20 @@ function ChatRoom({ root }: { root: Store<RootModule> }) {
 
   const setName = useMusubiCommand(root, "set_name")
   const sendMessage = useMusubiCommand(root, "send_message")
+  const attach = useMusubiCommand(root, "attach")
 
   const [nameDraft, setNameDraft] = useState("")
   const [body, setBody] = useState("")
   const [feedback, setFeedback] = useState("")
   const busy = setName.isPending ? "name" : sendMessage.isPending ? "send" : null
+
+  // `store.attachment` is a stable `UploadHandle` whose internals mutate in
+  // place as `upload_ops` arrive, so the snapshot object it sits on keeps its
+  // identity and `useSyncExternalStore` bails out of the render. The store
+  // subscription still fires for every upload op, so this turns one into a
+  // repaint. Everything read below comes off the handle, not off a reply.
+  const [, repaintUpload] = useReducer((tick: number) => tick + 1, 0)
+  useEffect(() => root.subscribe(repaintUpload), [root])
 
   useEffect(() => {
     setNameDraft(room?.current_user.name ?? "")
@@ -57,6 +66,11 @@ function ChatRoom({ root }: { root: Store<RootModule> }) {
   const currentUser = room.current_user
   const onlineUsers = room.online_users
   const messages = room.messages
+  // The upload handle, straight off the proxy: `select`/`start` live on it and
+  // the server drives its entries over `upload_ops`.
+  const attachment = room.attachment
+  const attaching = attach.isPending || attachment.isSelecting || attachment.isUploading
+  const entry = attachment.entries[0]
   const onlineCount = onlineUsers.status === "ok" ? onlineUsers.data.length : 0
   const messagesList = messages.data ?? []
   const messagesCount = messagesList.length
@@ -95,6 +109,32 @@ function ChatRoom({ root }: { root: Store<RootModule> }) {
       setBody("")
     } catch (error) {
       setFeedback(formatCommandError(error, "Message send"))
+    }
+  }
+
+  // select -> start -> `attach`. The three steps are the whole channel-mode
+  // flow: `select` preflights and the server signs one token per accepted
+  // entry, `start` joins `musubi_upload:<ref>` and pushes the chunks, and the
+  // command is what consumes the finished entry server-side. The message row
+  // arrives afterwards on the ordinary stream, never out of the reply.
+  async function handleAttach(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget
+    const files = input.files
+
+    if (!files || files.length === 0) return
+
+    try {
+      setFeedback(`Uploading ${files[0]?.name ?? "file"}...`)
+      await attachment.select(files)
+      await attachment.start()
+
+      const reply = await attach.dispatch({})
+      setFeedback(reply.attached ? `Attached ${reply.name}.` : "Nothing to attach.")
+    } catch (error) {
+      setFeedback(formatCommandError(error, "Attachment"))
+    } finally {
+      // Clearing the input is what lets the same file be picked twice.
+      input.value = ""
     }
   }
 
@@ -204,6 +244,7 @@ function ChatRoom({ root }: { root: Store<RootModule> }) {
                         <small>{shortMessageId(message.id)}</small>
                       </header>
                       <p>{message.body}</p>
+                      {message.attachment && <Attachment file={message.attachment} />}
                     </article>
                   </li>
                 )
@@ -216,6 +257,46 @@ function ChatRoom({ root }: { root: Store<RootModule> }) {
           <div className="send-state" aria-live="polite">
             {feedback || renderSendStatus(room.last_send_status)}
           </div>
+
+          <div className="attach-row">
+            <label className="attach-button" data-busy={attaching || undefined}>
+              <input
+                type="file"
+                className="sr-only"
+                accept={
+                  attachment.config.accept === "any"
+                    ? undefined
+                    : attachment.config.accept.join(",")
+                }
+                disabled={attaching}
+                onChange={handleAttach}
+              />
+              {attaching ? "Uploading" : "Attach file"}
+            </label>
+
+            {entry ? (
+              <span className="attach-progress" aria-label="Upload progress">
+                <progress value={entry.progress} max={100} />
+                <small>
+                  {entry.clientName} — {entry.progress}%
+                </small>
+              </span>
+            ) : (
+              <small className="attach-hint">
+                {attachment.config.accept === "any"
+                  ? "Any file"
+                  : attachment.config.accept.join(" ")}{" "}
+                up to {formatBytes(attachment.config.maxFileSize)}
+              </small>
+            )}
+
+            {attachment.errors.map((error) => (
+              <small key={error.code} className="attach-error">
+                {error.message}
+              </small>
+            ))}
+          </div>
+
           <form className="message-form" onSubmit={handleSend}>
             <label className="sr-only" htmlFor="message-body">
               Message
@@ -234,6 +315,35 @@ function ChatRoom({ root }: { root: Store<RootModule> }) {
       </section>
     </main>
   )
+}
+
+// The consumed upload, as it arrives on the message row: a plain state field
+// on `ChatRoom.MessageState`. Nothing here reads the upload handle — by the
+// time this renders the entry has been consumed and the handle is back to idle.
+function Attachment({ file }: { file: ChatRoom.AttachmentState }) {
+  const isImage = file.content_type.startsWith("image/")
+
+  return (
+    <a className="attachment" href={file.url} target="_blank" rel="noreferrer">
+      {isImage ? (
+        <img className="attachment-preview" src={file.url} alt={file.name} />
+      ) : (
+        <span className="attachment-mark" aria-hidden="true">
+          FILE
+        </span>
+      )}
+      <span className="attachment-meta">
+        <strong>{file.name}</strong>
+        <small>{formatBytes(file.size)}</small>
+      </span>
+    </a>
+  )
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} kB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
 function renderSendStatus(status: {

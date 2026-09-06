@@ -95,7 +95,13 @@ defmodule Musubi.Transport.UploadChannel do
 
   def join(_topic, _payload, _socket), do: {:error, %{reason: "unauthorized"}}
 
+  # Both are the same chunk, so both are accepted — matching only the raw form
+  # makes every real channel-mode upload crash the sub-channel on its first
+  # frame.
   @impl Phoenix.Channel
+  def handle_in("chunk", {:binary, binary}, %Phoenix.Socket{} = socket) when is_binary(binary),
+    do: handle_in("chunk", binary, socket)
+
   def handle_in("chunk", binary, %Phoenix.Socket{} = socket) when is_binary(binary) do
     payload = socket.assigns[@assigns.payload]
     bytes = socket.assigns[@assigns.bytes_written]

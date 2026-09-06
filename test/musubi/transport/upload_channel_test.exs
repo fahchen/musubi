@@ -152,6 +152,27 @@ defmodule Musubi.Transport.UploadChannelTest do
       assert_reply(ref, :ok, %{progress: 100})
     end
 
+    test "accepts the serializer's {:binary, data} payload shape", %{page: page} do
+      entry = preflight_one_entry(page, 128)
+
+      {:ok, _r, channel_socket} =
+        subscribe_and_join(
+          socket(MusubiSocket, "x", %{}),
+          Musubi.Transport.UploadChannel,
+          "musubi_upload:" <> entry["entry_ref"],
+          %{"token" => entry["token"]}
+        )
+
+      # What a websocket transport actually delivers: `push/3` skips the
+      # serializer, but `Phoenix.Socket.V2.JSONSerializer.decode_binary/1`
+      # tags every binary frame this way before the channel sees it.
+      ref = push(channel_socket, "chunk", {:binary, :binary.copy(<<3>>, 64)})
+      assert_reply(ref, :ok, %{progress: 50})
+
+      ref = push(channel_socket, "chunk", {:binary, :binary.copy(<<3>>, 64)})
+      assert_reply(ref, :ok, %{progress: 100})
+    end
+
     test "final chunk completes the upload without any close event", %{page: page} do
       entry = preflight_one_entry(page, 64)
       assert_receive {:patch, _add_env}, 500

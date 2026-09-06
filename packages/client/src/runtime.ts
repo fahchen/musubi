@@ -56,9 +56,33 @@ export interface SocketLike {
   // join params carry `{module, id, params}` — join IS the mount. Phoenix
   // auto-rejoins each channel after a transport drop, which re-runs the server
   // join and rebuilds the root; the per-channel `join().receive("ok")` callback
-  // drives client-side recovery. No socket-level reopen handling needed.
+  // drives client-side recovery. The socket-level lifecycle hooks below feed
+  // the *status surface* only (BDR-0033), never recovery.
   channel(topic: string, payload?: object): ChannelLike
+  // Optional socket lifecycle hooks (phoenix.js provides all three). Without
+  // them the connection status degrades to a constant "ready" after
+  // `connect()` — exactly the information content the surface had before
+  // BDR-0033. Each returns a ref that `off` (when present) detaches.
+  onOpen?(callback: () => void): unknown
+  onClose?(callback: (reason?: unknown) => void): unknown
+  onError?(callback: (reason?: unknown) => void): unknown
+  off?(refs: unknown[]): unknown
 }
+
+// Socket-liveness status of one connection (BDR-0033). Client-local: no wire
+// message carries it, and the server is not involved.
+//
+// - "connecting": the transport has never been open (initial connect attempts,
+//   including failures, stay here — never was up means not "reconnecting").
+// - "ready": the transport is open.
+// - "reconnecting": the transport was lost after having been open; phoenix.js
+//   is working its way back. Mounted roots keep serving their last-good
+//   snapshot through this state (BDR-0015) — the status annotates stale
+//   rendering, it never blanks it.
+//
+// Terminal outcomes (join rejection, unmount, disconnect) stay on their
+// existing error paths; there is deliberately no error arm here.
+export type MusubiSocketStatus = "connecting" | "ready" | "reconnecting"
 
 type PendingConnect = {
   generation: number
@@ -164,6 +188,15 @@ export interface ConnectionState {
     { persister: MusubiCachePersister; gcMs: number; buster: string }
   >
   readonly cacheEvictionTimers: Map<string, ReturnType<typeof setTimeout>>
+
+  // Socket-liveness status (BDR-0033), driven by the SocketLike lifecycle
+  // hooks. Mutable; read via `getConnectionStatus`, observed via
+  // `subscribeConnectionStatus`.
+  status: MusubiSocketStatus
+  readonly statusListeners: Set<(status: MusubiSocketStatus) => void>
+  // Refs returned by the socket lifecycle hooks; detached on disconnect when
+  // the socket supports `off`.
+  readonly socketHookRefs: unknown[]
 }
 
 export interface SharedRuntime {
@@ -220,10 +253,14 @@ export function openConnectionState(
     cacheWriters: new Map(),
     cacheRegistry: new Map(),
     cacheEvictionTimers: new Map(),
-    uploaders: options.uploaders ?? {}
+    uploaders: options.uploaders ?? {},
+    status: "connecting",
+    statusListeners: new Set(),
+    socketHookRefs: []
   }
 
   runtime.connections.set(baseTopic, connection)
+  wireSocketStatus(connection)
 
   // Open the transport now; per-root channels join lazily on mount. There is no
   // connection-level channel, so `ready` resolves immediately — auth and root
@@ -231,6 +268,69 @@ export function openConnectionState(
   connection.socket.connect()
 
   return { connection, ready: Promise.resolve() }
+}
+
+// Socket lifecycle → connection status (BDR-0033). The hooks feed the status
+// surface only; recovery stays channel-driven (join("ok") + initial patch).
+function wireSocketStatus(connection: ConnectionState): void {
+  const socket = connection.socket
+
+  if (!socket.onOpen && !socket.onClose && !socket.onError) {
+    // No lifecycle signal to project; degrade to a constant "ready".
+    setConnectionStatus(connection, "ready")
+    return
+  }
+
+  const refs = connection.socketHookRefs
+  const lost = (): void => {
+    // A socket that has never been open is still connecting, not
+    // reconnecting — phoenix.js fires onError/onClose on failed initial
+    // attempts too, and those must not read as a regression.
+    if (connection.status !== "connecting") {
+      setConnectionStatus(connection, "reconnecting")
+    }
+  }
+
+  if (socket.onOpen) {
+    refs.push(socket.onOpen(() => setConnectionStatus(connection, "ready")))
+  }
+  if (socket.onClose) {
+    refs.push(socket.onClose(lost))
+  }
+  if (socket.onError) {
+    refs.push(socket.onError(lost))
+  }
+}
+
+function setConnectionStatus(
+  connection: ConnectionState,
+  next: MusubiSocketStatus
+): void {
+  if (connection.status === next) {
+    return
+  }
+
+  connection.status = next
+
+  // Snapshot before iterating: a listener may unsubscribe mid-dispatch.
+  for (const listener of Array.from(connection.statusListeners)) {
+    listener(next)
+  }
+}
+
+export function getConnectionStatus(connection: ConnectionState): MusubiSocketStatus {
+  return connection.status
+}
+
+export function subscribeConnectionStatus(
+  connection: ConnectionState,
+  listener: (status: MusubiSocketStatus) => void
+): () => void {
+  connection.statusListeners.add(listener)
+
+  return () => {
+    connection.statusListeners.delete(listener)
+  }
 }
 
 export interface MountRootResult {
@@ -662,6 +762,21 @@ export async function disconnectConnectionState(
   void Promise.resolve()
     .then(() => connectionState.memoryPersister.clear?.())
     .catch(() => undefined)
+
+  // Detach the status hooks (when the socket supports it) and end the status
+  // surface: the connection object is dead after this.
+  if (connectionState.socket.off && connectionState.socketHookRefs.length > 0) {
+    try {
+      // A copy: the shared array is cleared below, and `off` must not observe
+      // the mutation.
+      connectionState.socket.off([...connectionState.socketHookRefs])
+    } catch {
+      /* noop — the socket may already be torn down */
+    }
+  }
+  connectionState.socketHookRefs.length = 0
+  connectionState.statusListeners.clear()
+
   const runtime = getSharedRuntime(connectionState.socket)
   runtime.connections.delete(connectionState.baseTopic)
 }
@@ -919,6 +1034,7 @@ function acceptEnvelope(
     connection.snapshotCache,
     envelope.ops,
     envelope.stream_ops,
+    uploadOps,
     previousRoot,
     nextRoot
   )
@@ -1230,6 +1346,7 @@ function invalidateSnapshotsForOps(
   snapshotCache: Map<string, unknown>,
   ops: readonly JsonPatchOp[],
   streamOps: readonly StreamOp[],
+  uploadOps: readonly UploadOp[],
   previousRoot: unknown,
   root: unknown
 ): void {
@@ -1245,6 +1362,14 @@ function invalidateSnapshotsForOps(
   }
 
   for (const op of streamOps) {
+    invalidateStoreIdAncestors(snapshotCache, op.store_id)
+  }
+
+  // Upload ops mutate the `UploadHandleImpl` in place, so no JSON patch op ever
+  // touches the owning store's node. Without this the cached snapshot keeps its
+  // identity and `useSyncExternalStore` bails out of the re-render that the
+  // upload-touched notification in `notifySubscribers` just asked for.
+  for (const op of uploadOps) {
     invalidateStoreIdAncestors(snapshotCache, op.store_id)
   }
 }

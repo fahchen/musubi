@@ -20,7 +20,11 @@ defmodule Musubi.MixProject do
         plt_local_path: "priv/plts/musubi.plt",
         plt_core_path: "priv/plts/core.plt",
         plt_add_apps: [:ex_unit, :mix],
-        ignore_warnings: ".dialyzer_ignore.exs"
+        ignore_warnings: ".dialyzer_ignore.exs",
+        # Fail on an ignore entry that no longer matches anything, so the
+        # narrow entries in `.dialyzer_ignore.exs` cannot rot into whole-file
+        # suppression as the code they cover moves.
+        list_unused_filters: true
       ],
       aliases: aliases()
     ]
@@ -36,7 +40,7 @@ defmodule Musubi.MixProject do
 
   def cli do
     [
-      preferred_envs: [precommit: :test]
+      preferred_envs: [precommit: :test, "musubi.capture_wire": :test]
     ]
   end
 
@@ -65,6 +69,12 @@ defmodule Musubi.MixProject do
   # so that consuming Phoenix apps can reference them via
   # `file:../deps/musubi/packages/<name>` from their JS package.json. The
   # consumer's bundler (Vite, esbuild) transpiles `.ts`/`.tsx` on demand.
+  #
+  # `crates/` rides along for the same reason (docs/rust-client.md §1.3): a
+  # consuming Rust crate path-depends on
+  # `../deps/musubi/crates/<name>`. The root `Cargo.toml` ships with it because
+  # every crate manifest inherits `version`/`edition`/dependency versions from
+  # `[workspace.package]`; without it Cargo cannot load the path dependency.
   defp package do
     [
       licenses: ["MIT"],
@@ -79,6 +89,8 @@ defmodule Musubi.MixProject do
           packages/client/package.json
           packages/react/src
           packages/react/package.json
+          crates
+          Cargo.toml
         )
     ]
   end
@@ -108,7 +120,10 @@ defmodule Musubi.MixProject do
         {"docs/uploads.md", filename: "uploads-reference", title: "Uploads reference"},
         {"docs/push-events.md",
          filename: "push-events-reference", title: "Push events reference"},
-        "docs/persistence-pattern.md"
+        "docs/persistence-pattern.md",
+        {"docs/rust-codegen.md", title: "Rust codegen reference"},
+        {"docs/rust-client.md", title: "Rust client reference"},
+        {"docs/rust-codegen-example.md", title: "Rust codegen example"}
       ],
       groups_for_extras: [
         Tutorials: [
@@ -125,7 +140,10 @@ defmodule Musubi.MixProject do
           "docs/streams.md",
           "docs/uploads.md",
           "docs/push-events.md",
-          "docs/persistence-pattern.md"
+          "docs/persistence-pattern.md",
+          "docs/rust-codegen.md",
+          "docs/rust-client.md",
+          "docs/rust-codegen-example.md"
         ]
       ],
       groups_for_modules: [
@@ -151,7 +169,8 @@ defmodule Musubi.MixProject do
           Musubi.Transport.Channel
         ],
         Codegen: [
-          Mix.Tasks.Compile.MusubiTs
+          Mix.Tasks.Compile.MusubiTs,
+          Mix.Tasks.Compile.MusubiRust
         ],
         Testing: [
           Musubi.Testing
@@ -178,22 +197,35 @@ defmodule Musubi.MixProject do
       Musubi.Transport.ConnectionChannel,
       Musubi.Transport.Channel,
       Mix.Tasks.Compile.MusubiTs,
+      Mix.Tasks.Compile.MusubiRust,
       Musubi.Testing
     ]
   end
 
   defp skip_doc_reference?(reference) when is_binary(reference) do
-    Enum.any?(skipped_doc_references(), &String.starts_with?(reference, &1))
+    reference in verbatim_skipped_doc_references() or
+      Enum.any?(skipped_doc_references(), &String.starts_with?(reference, &1))
   end
 
   defp skip_doc_reference?(_other), do: false
+
+  # Bare project names, matched verbatim rather than by prefix: the CHANGELOG's
+  # historical "renamed from `Arbor` to `Musubi`" entry is prose, not a module
+  # reference, and prefix-matching `Musubi` would silence every real
+  # `Musubi.*` reference in the docs.
+  defp verbatim_skipped_doc_references do
+    ["Arbor", "Musubi"]
+  end
 
   defp skipped_doc_references do
     [
       "Musubi.Application",
       "Musubi.Async.Telemetry",
       "Musubi.AsyncSupervisor",
-      "Musubi.Codegen.TypeScript.Manifest",
+      "Musubi.Codegen.Compiler",
+      "Musubi.Codegen.Manifest",
+      "Musubi.Codegen.Rust",
+      "Musubi.Codegen.TypeScript",
       "Musubi.DSL.",
       "Musubi.Hooks.",
       "Musubi.Page.",
@@ -219,6 +251,7 @@ defmodule Musubi.MixProject do
         "format",
         "credo --strict",
         "compile.musubi_ts --check",
+        "compile.musubi_rust --check",
         "dialyzer",
         "test"
       ],

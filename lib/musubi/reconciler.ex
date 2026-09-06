@@ -110,10 +110,10 @@ defmodule Musubi.Reconciler do
   def init_store(%Socket{module: module} = socket) when is_atom(module) do
     {result, fun, arity} =
       cond do
-        function_exported?(module, :init, 1) ->
+        module_exports?(module, :init, 1) ->
           {module.init(socket), :init, 1}
 
-        function_exported?(module, :mount, 1) ->
+        module_exports?(module, :mount, 1) ->
           {module.mount(socket), :mount, 1}
 
         true ->
@@ -128,26 +128,6 @@ defmodule Musubi.Reconciler do
     # declare uploads also emit their config when they first mount —
     # required for the per-item child-store pattern (BDR-0028).
     Musubi.Upload.ensure_configs(socket)
-  end
-
-  @doc """
-  Runs the legacy store mount callback.
-
-  This function remains as a compatibility wrapper for callers using the old
-  `mount/1` naming. New code should call `init_store/1`.
-
-  ## Examples
-
-      iex> defmodule ReconcilerLegacyMountDocStore do
-      ...>   def mount(socket), do: {:ok, Musubi.Socket.assign(socket, :mounted?, true)}
-      ...> end
-      iex> socket = %Musubi.Socket{module: ReconcilerLegacyMountDocStore}
-      iex> Musubi.Reconciler.mount_store(socket).assigns.mounted?
-      true
-  """
-  @spec mount_store(Socket.t()) :: Socket.t()
-  def mount_store(%Socket{} = socket) do
-    init_store(socket)
   end
 
   @doc """
@@ -166,7 +146,7 @@ defmodule Musubi.Reconciler do
   def update_store(%Socket{module: module} = socket, new_assigns)
       when is_atom(module) and is_map(new_assigns) do
     result =
-      if function_exported?(module, :update, 2) do
+      if module_exports?(module, :update, 2) do
         module.update(new_assigns, socket)
       else
         {:ok, Socket.assign(socket, new_assigns)}
@@ -210,7 +190,7 @@ defmodule Musubi.Reconciler do
   @spec normalize_assigns(module(), map()) :: map()
   def normalize_assigns(module, assigns) when is_atom(module) and is_map(assigns) do
     attrs =
-      if function_exported?(module, :__musubi__, 1) do
+      if module_exports?(module, :__musubi__, 1) do
         module.__musubi__(:attrs)
       else
         []
@@ -232,6 +212,17 @@ defmodule Musubi.Reconciler do
           acc
       end
     end)
+  end
+
+  # Same cold-VM defence as `Musubi.Page.Server.module_exports?/3`. The BEAM
+  # lazy-loads modules, so `function_exported?/3` answers `false` for a child
+  # store whose only reference so far is the `child(Module, ...)` atom in a
+  # parent's render — silently skipping its `init/1`, `update/2` or `attr/3`
+  # defaults. `Code.ensure_loaded?/1` loads the .beam first.
+  @spec module_exports?(module(), atom(), arity()) :: boolean()
+  defp module_exports?(module, fun, arity)
+       when is_atom(module) and is_atom(fun) and is_integer(arity) do
+    Code.ensure_loaded?(module) and function_exported?(module, fun, arity)
   end
 
   @spec emit_lazy_discard(identity_key(), StoreTable.t()) :: :ok

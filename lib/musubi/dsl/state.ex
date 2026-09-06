@@ -23,7 +23,7 @@ defmodule Musubi.DSL.State do
         plugin(Musubi.Plugin.StateField)
         plugin(Musubi.Plugin.Reflection)
         plugin(Musubi.Plugin.TypeSpec)
-        plugin(Musubi.Plugin.TypeScript)
+        plugin(Musubi.Plugin.Codegen)
 
         import TypedStructor, except: [field: 2, field: 3]
         import Musubi.DSL.Field, only: [field: 2, field: 3]

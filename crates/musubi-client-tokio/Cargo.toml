@@ -1,0 +1,25 @@
+[package]
+name = "musubi-client-tokio"
+description = "Tokio transport for the Musubi client: TokioSpawner, TokioTimer and a tokio-tungstenite Connector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "musubi_client_tokio"
+
+[dependencies]
+futures-core.workspace = true
+futures-sink.workspace = true
+futures-util.workspace = true
+musubi-client.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true
+tokio = { workspace = true, features = ["macros"] }

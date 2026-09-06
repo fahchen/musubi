@@ -1,0 +1,63 @@
+[package]
+name = "chat-room-desktop"
+version = "0.1.0"
+edition = "2024"
+# Matches musubi-client's MSRV; neither gpui 0.2.2 nor gpui-component 0.5.1
+# declares a `rust-version`, and both are edition 2024, so 1.85 is the floor.
+rust-version = "1.85"
+publish = false
+license = "MIT"
+
+# Detached from the repo-root Cargo workspace on purpose. Examples are
+# documentation, not members of the library's build graph (AGENTS.md), and gpui
+# must not appear in the root Cargo.lock or in musubi-client's CI.
+[workspace]
+
+[dependencies]
+# The Musubi client runtime core — runtime-free by construction. It re-exports
+# the four `phoenix-channel` seams (`Connector`/`Socket`/`Spawner`/`Timer`), so
+# an embedder implements them against `musubi_client` alone and never names the
+# transport crate. `musubi-client-tokio` is deliberately absent.
+musubi-client = { path = "../../../crates/musubi-client" }
+
+# The gpui adapter (`docs/rust-reactive-state.md` §5.1): the `!Send` hop every
+# per-node subscription needs, and the `ListState` driver that turns keyed
+# collection edits into splices. It depends on `musubi-state` and gpui and
+# never on `musubi-client`, so it adds no transport surface here — the two
+# crates meet only in this file.
+musubi-gpui = { path = "../../../crates/musubi-gpui" }
+
+# UI. Both from crates.io, both Apache-2.0. Use gpui's DEFAULT features:
+# gpui-component 0.5.1 declares a plain `gpui = "0.2.2"` dependency, so cargo
+# feature unification re-enables everything a `default-features = false` here
+# would try to drop.
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+
+# Transport: the smol family, driven by gpui's own executor. No tokio reactor.
+async-net = "2"
+# `handshake` gives `client_async`, `futures-03-sink` gives the `Sink` impl on
+# `WebSocketStream`. They are the crate's defaults; spelling them out pins away
+# the `tokio-runtime` / `async-std-runtime` / TLS features.
+async-tungstenite = { version = "0.35", default-features = false, features = [
+  "handshake",
+  "futures-03-sink",
+] }
+futures = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The file cache (`cache_store.rs`) logs read/write failures instead of
+# surfacing them — the `CacheStore` contract is that a broken cache degrades to
+# a cold mount. No subscriber is installed here; the events are for embedders
+# who copy the file and already have one.
+tracing = "0.1"
+
+# Tests only. The same crates.io `gpui`, with its in-process test platform and
+# `TestAppContext` turned on; `cargo build` links neither the feature nor the
+# extra dependencies it pulls. `phoenix-channel` stays absent here too — the
+# rig in `app.rs` spells the serializer-v2 five-tuple out by hand rather than
+# name the transport crate an embedder is not supposed to depend on.
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }

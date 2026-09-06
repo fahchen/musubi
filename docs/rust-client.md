@@ -1,0 +1,1889 @@
+# Musubi Rust client — design
+
+This document specifies the Rust client crates, which implement the Musubi
+client contract as a peer of `packages/client` (TypeScript). Every normative
+statement here is derived from `docs/client-contract.md`, `docs/streams.md`,
+`docs/push-events.md`, `docs/uploads.md`, the `spec/decisions/BDR-*` records,
+and `packages/client/src/*.ts`. Where those disagree, the runtime and
+`packages/client/src/types.ts` win.
+
+The Rust client is a **second consumer of the same wire contract**, not a port
+of the TypeScript runtime. The TS client is dynamically typed at the edges
+(proxies, structural marker types, `unknown` fallbacks); Rust is nominal and
+deserialization-driven. That single difference drives most of the decisions
+below.
+
+---
+
+## 1. Crate identity and placement
+
+### 1.1 Names
+
+| Artifact | Name |
+|---|---|
+| Core crate (runtime-agnostic) | `musubi-client` (lib `musubi_client`) |
+| Tokio transport crate | `musubi-client-tokio` (lib `musubi_client_tokio`) |
+| Phoenix Channel protocol crate | `phoenix-channel` (lib `phoenix_channel`) — not Musubi-aware, see §3 |
+| Generated code crate-side helper module | `musubi_client::generated` (the shared runtime types the generated file re-exports; see §8.2) |
+| Elixir compiler task | `mix compile.musubi_rust` (`Mix.Tasks.Compile.MusubiRust`), compiler atom `:musubi_rust` |
+| Elixir renderer | `Musubi.Codegen.Rust` + `Musubi.Codegen.Rust.TypeRenderer` |
+
+### 1.2 Placement
+
+Decision: a **Cargo workspace at the repo root** with three crates under
+`crates/`.
+
+```
+/Cargo.toml                            # [workspace] members = ["crates/*"], resolver = "3"
+/crates/phoenix-channel/               # Phoenix Channel protocol, not Musubi-aware (§3)
+/crates/musubi-client/                 # runtime-agnostic Musubi core
+/crates/musubi-client/LICENSE          # copy of /LICENSE (each crate carries its own)
+/crates/musubi-client/tests/fixtures/*.json  # wire fixtures, `mix musubi.capture_wire` (§12)
+/crates/musubi-client-tokio/           # tokio Spawner/Timer/Connector impls (§2.3)
+```
+
+Rejected alternatives:
+
+- `packages/rust/` — `packages/` in this repo means "npm workspace member"
+  (`pnpm-workspace.yaml` globs `packages/*`). Putting a Cargo crate there
+  makes the pnpm workspace root ambiguous for humans even though pnpm itself
+  only picks up directories containing `package.json`.
+- A separate git repository — the wire contract, the BDRs, and the codegen
+  renderer live here; splitting the repo means the Rust client can no longer
+  be validated against captured fixtures in the same CI run (see §12).
+
+### 1.3 Hex-tarball implications (asymmetry with the TS packages)
+
+`mix.exs` `package/0` ships `packages/client/src` and `packages/react/src`
+**inside the Hex tarball** so that consuming Phoenix apps can depend on them
+via `file:../deps/musubi/packages/client` from their `package.json`. That
+mechanism exists because npm has no per-language registry story for
+"library-adjacent JS shipped by an Elixir dep".
+
+The Rust crates follow the **same pattern**:
+
+- `crates/` **is** added to `package/0` `:files`, next to `packages/`.
+  Consumers depend by path from the fetched Hex dep, the Cargo mirror of the
+  npm `file:` reference:
+
+  ```toml
+  musubi-client       = { path = "../deps/musubi/crates/musubi-client" }
+  musubi-client-tokio = { path = "../deps/musubi/crates/musubi-client-tokio" }
+  ```
+
+- **Nothing is published to crates.io at this time.** The Hex tarball is the
+  only distribution channel, so the crate version is the Hex `musubi` version —
+  a single version stream, no skew between the generated file and the crate.
+- Accepted limitation: a Rust consumer with no Elixir dep tree (a native app
+  talking to a remote Musubi server) must vendor the crates via a git
+  dependency on this repo. Publishing to crates.io is deferred until that
+  consumer exists; revisit then.
+- Only the *generated* file crosses the boundary through the consumer's own
+  repo: `mix compile.musubi_rust` writes a `.rs` file that the consumer's Rust
+  crate `include!`s or checks in as a module. Same shape as the TS
+  `musubi.d.ts` bundle.
+
+### 1.4 MSRV, edition, license
+
+- Edition **2024**, MSRV **1.85**, pinned in `Cargo.toml`
+  (`rust-version = "1.85"`) and verified by a CI job on exactly that toolchain.
+  Rationale: `gpui`-based consumers (the motivating non-tokio embedder) already
+  track recent stable; 1.85 is the first edition-2024 stable.
+- License **MIT**, matching `/LICENSE` (Copyright (c) 2026 Phil Chen).
+  `license = "MIT"` in each `Cargo.toml` plus a verbatim `LICENSE` copy per
+  crate directory (the copies ride the Hex tarball with the sources).
+
+### 1.5 Dependencies
+
+Per crate; no optional dependencies, no feature flags — runtime choice is a
+crate choice (§2.3).
+
+| Crate | Dependency | Version | Why |
+|---|---|---|---|
+| `phoenix-channel` | `serde`, `serde_json` | `1` | frame (de)serialization |
+| `phoenix-channel` | `futures-core` / `futures-sink` | `0.3` | `Stream`/`Sink` in the `Socket` trait (§2.2) |
+| `phoenix-channel` | `futures-channel` / `futures-util` | `0.3` | inbox, oneshot replies, `select!`, `BoxFuture` |
+| `phoenix-channel` | `tracing` | `0.1` | protocol-layer diagnostics |
+| `musubi-client` | `phoenix-channel` | path | protocol layer (§3) |
+| `musubi-client` | `musubi-state` | path | the retained reactive state tree, and the wire vocabulary it names (`docs/rust-reactive-state.md` §1.3) |
+| `musubi-client` | `serde` (derive), `serde_json` | `1` | wire types, envelope decoding |
+| `musubi-state` | `serde` (derive), `serde_json` | `1` | the tree is built from and projected back to `Value` |
+| `musubi-state` | `slotmap` | `1` | the generational node arena — what makes a `State<T>` that outlived its node read as dead |
+| `musubi-state` | `thiserror` | `2` | `TreeError` / `ReadError` |
+| `musubi-client` | `futures-*` | `0.3` | as above |
+| `musubi-client` | `tracing` | `0.1` | `warn!`/`debug!` in §7/§10/§11 |
+| both | `thiserror` | `2` | `Display`/`Error` derives for §11 (idiomatic error types without hand-written impls) |
+| `musubi-client-tokio` | `musubi-client` | path | re-exports the core |
+| `musubi-client-tokio` | `tokio` | `1` (rt, time, net) | `TokioSpawner`/`TokioTimer` |
+| `musubi-client-tokio` | `tokio-tungstenite` | `0.24` (rustls-tls-webpki-roots) | `TungsteniteConnector` |
+
+`arc-swap` is deliberately **not** a dependency — see §2.4 — and neither is
+`json-patch`: the pointer walk is the client's own, in `musubi-state`, against
+the retained tree (`docs/rust-reactive-state.md` §1.4). Neither `musubi-client`'s nor
+`musubi-state`'s dependency tree contains a runtime, which is what a GUI
+embedder needs; tokio embedders add `musubi-client-tokio`. Both are enforced in
+CI by `! cargo tree -p <crate> -i tokio`.
+
+---
+
+## 2. Runtime model
+
+### 2.1 Constraint
+
+The primary embedder target is **not** a tokio server. `gpui` runs its own
+executor (`BackgroundExecutor` / `ForegroundExecutor`) and does not host a
+tokio reactor; spawning tokio-dependent futures from gpui requires dragging a
+whole runtime in and bridging it. Meanwhile the obvious default transport,
+`tokio-tungstenite`, *is* tokio-bound.
+
+Decision: **runtime-agnostic core, pluggable transport + spawner + timer;
+tokio support ships as its own crate** (`musubi-client-tokio`, §2.3). No
+`tokio::` type appears in any `musubi-client` signature. The core is a
+single-owner actor driven by whatever executor the embedder hands it.
+
+### 2.2 The three seams
+
+```rust
+/// One WebSocket frame as Phoenix sees it.
+pub enum Frame {
+    Text(String),
+    Binary(Vec<u8>),   // upload chunks ride these (§10.2)
+}
+
+/// A connected socket: a Sink of outbound frames + a Stream of inbound frames.
+pub trait Socket:
+    Sink<Frame, Error = TransportError>
+    + Stream<Item = Result<Frame, TransportError>>
+    + Send
+    + Unpin
+    + 'static
+{
+}
+
+/// How to (re)open a socket. Called once per connect and once per reconnect
+/// attempt; the crate owns backoff, not the impl.
+pub trait Connector: Send + Sync + 'static {
+    fn connect(&self, url: &str) -> BoxFuture<'static, Result<Box<dyn Socket>, TransportError>>;
+}
+
+/// Detached task spawning. `gpui::BackgroundExecutor`, `tokio::spawn`,
+/// `async_std::task::spawn`, or a test's manual pump all satisfy this.
+pub trait Spawner: Send + Sync + 'static {
+    fn spawn(&self, fut: BoxFuture<'static, ()>);
+}
+
+/// Time. Needed for heartbeats (30s), push timeouts, and reconnect backoff.
+/// Must be injectable so tests are deterministic.
+pub trait Timer: Send + Sync + 'static {
+    fn sleep(&self, dur: Duration) -> BoxFuture<'static, ()>;
+}
+```
+
+`Sink`/`Stream` come from `futures-core`/`futures-sink`, which are
+runtime-agnostic. Using them instead of an `async_trait` transport avoids both
+a `dyn`-dispatch-per-frame `Box<dyn Future>` allocation and an `async-trait`
+dependency in the public API.
+
+### 2.3 Provided implementations
+
+| Crate | Contents |
+|---|---|
+| `musubi-client-tokio` | `TokioSpawner`, `TokioTimer`, `TungsteniteConnector` (tokio-tungstenite + rustls); re-exports `musubi_client::*` |
+| gpui | *no crate — deliberately* |
+
+Not a `tokio` cargo feature on the core: a separate crate keeps the core's
+dependency tree runtime-free by construction (no `default-features = false`
+discipline to enforce) and lets the tokio adapter rev independently.
+`musubi-client-tokio` also ships the one-liner convenience
+`musubi_client_tokio::builder(url) -> ConnectionBuilder` — the core builder
+pre-filled with `TokioSpawner`/`TokioTimer`/`TungsteniteConnector`.
+
+There is no `gpui` crate. gpui embedders implement `Spawner`/`Timer` in three
+lines each against their own executor and supply a `Connector` over whatever
+WS client they already link (or `tokio-tungstenite` driven on a dedicated
+thread). A `gpui` adapter crate would put a fast-moving, unpublished-ABI
+dependency in the workspace for no API benefit. A reference adapter — the three
+seams over gpui's executor, meant to be copied verbatim — ships as
+`examples/chat_room/desktop/src/transport.rs`.
+
+### 2.4 Concurrency shape: one actor, no locks
+
+The connection is a **single owned task**:
+
+```
+Actor {
+    socket: PhoenixSocket,             // phoenix-channel owns the `Box<dyn Socket>`
+    roots: HashMap<Arc<str>, Root>,    // one entry per mounted root, keyed by root id
+    rx: UnboundedReceiver<ActorMsg>,   // futures-channel, runtime agnostic
+    ...
+}
+```
+
+Public handles (`Connection`, `Mounted<S>`) are cheap `Clone` values holding an
+`mpsc::Sender<ActorMsg>`; every request carries a `oneshot::Sender` for its
+reply. The actor does **not** `select!` over several sources. It drains **one
+FIFO inbox**, and everything becomes an `ActorMsg` before it arrives there:
+
+```rust
+while let Some(msg) = self.rx.next().await {
+    if matches!(msg, ActorMsg::Shutdown) { break; }
+    self.handle(msg).await;              // one message, to completion
+}
+```
+
+Handle methods (`mount`, `command`, the `Drop` impls) send straight into it.
+Inbound channel events arrive through **one forwarding task per channel
+incarnation**, which pumps that channel's `ChannelEvents` stream into the same
+inbox, stamping each event with the generation the channel was attached under
+(§3.2). A command's `phx_reply` arrives through one task per push, awaiting the
+push's oneshot and re-entering as `CommandReply`. Cache reads, write throttles
+and evictions do the same. Socket-level timing — heartbeat ticks, join and push
+timeouts, reconnect backoff — belongs to the socket actor one layer down (§3)
+and only ever reaches this actor as `ChannelEvent`s.
+
+Why: it removes all shared-mutable state (no `Mutex<Tree>` contended between a
+UI thread and a socket thread), and it makes the whole protocol layer testable
+by feeding a scripted `Socket` impl. The single queue also gives **total
+ordering with no interleaving**: one producer-agnostic FIFO with one consumer
+means each message is handled to completion before the next is dequeued, so no
+other message can observe a half-applied envelope, and the order the actor sees
+is a single global sequence rather than a per-source race resolved by `select!`
+branch priority. That covers the gaps *between* messages; the one inside a
+single envelope is the transaction's job — one envelope is one transaction
+against the retained tree, and a rejected one rolls back whole
+(`docs/rust-reactive-state.md` §3.6).
+
+Note what that total order is *not*: it is **inbox** order, not frame order, so
+it does not buy reply-before-patch ordering (BDR-0009), which is **not** a
+client guarantee. A `phx_reply` reaches the Musubi actor through the per-push
+task that awaits the push's oneshot, while a `"patch"` push reaches it through
+the per-channel forwarding task; two independently woken tasks feeding one inbox
+means inbox order is executor-scheduling dependent, not frame order. §6.2 and
+`Mounted::command`'s `# Ordering` section are the contract: a resolved reply
+implies nothing about applied state. Read state from `Mounted::state()`, and
+subscribe to the node whose settling you actually care about.
+
+**Head-of-line blocking.** "One message to completion" is also the cost: the
+handler runs *on* the actor task, so an `.await` inside one stalls the whole
+inbox — every root's patch delivery, every command dispatch, every cache
+message queued behind it. The handlers that await are the ones that (re)attach a
+channel — a mount and a version-gap recovery, both through `attach_and_join` —
+plus `disconnect`, which is terminal anyway. `attach_and_join` awaits
+`PhoenixSocket::channel`: a round trip through the socket actor's own inbox, not
+to the server, since the join push that follows is fire-and-forget.
+That window is microseconds, and it stays microseconds under a concurrent
+channel-mode upload: the socket actor queues writes rather than awaiting them
+(§3.1), so an upload chunk costs it an encode and an enqueue, not a flush. A
+slow link — or a peer that has stopped reading altogether — backs the chunks up
+in the socket actor's outbox, where they wait on the transport instead of on the
+`Attach`.
+
+**No backpressure, anywhere.** Sends are non-blocking and
+infallible-until-closed, which is what lets the actor publish without ever
+awaiting a consumer — but it means there is **no backpressure path to the
+server**. A consumer that stops polling its stream does not slow the actor, does
+not slow the socket, and does not make the server send less. What that costs
+depends on the kind of subscription, and the two kinds are deliberately
+different:
+
+- **Callback, no queue at all** (`State::subscribe` and every other handle's
+  `subscribe`). A subscriber runs synchronously at the notification point, on
+  the actor task, and nothing is buffered on its behalf. The contract is
+  therefore *schedule, do not compute*: a callback that blocks is head-of-line
+  blocking (above), and a callback that only posts to its own UI queue costs the
+  actor a function call. This is the shape state delivery takes now
+  (`docs/rust-reactive-state.md` §2.6).
+- **Latest-value** (`Mounted::status()`'s `into_stream()`). One value, not a
+  queue: every item subsumes the one before it, so a stalled consumer costs one
+  slot and one waker, whatever the rate. Falling behind is not an error, it is
+  the contract — the next poll yields the current value and the skipped ones are
+  gone. Nothing reads intermediates.
+- **Queue** (`events()`, `Upload::into_stream()`, the actor's own inbox, and the
+  socket actor's outbox).
+  `futures_channel::mpsc::unbounded`, because these items are discrete
+  occurrences and none of them stands in for another. Here the old cost is
+  real: a consumer that stops polling grows its queue without bound until the
+  process runs out of memory, and an embedder that cannot keep up must drop the
+  stream (which unsubscribes, and the sender is pruned at the next send) or
+  coalesce on its own side. The same applies to a stalled actor: the inbox grows
+  while a handler is blocked. The socket actor's outbox is the same shape and
+  the same trade: a transport that stops accepting writes does not slow the
+  producer, it grows the queue — which is why the push timeout, not the socket,
+  is what bounds a command whose frame is still waiting to go out.
+
+The consequence worth stating for consumers of both: an event is delivered with
+no promise about which state a neighbouring status stream is showing, because
+that one may already have coalesced past the envelope the event rode in on. Read
+state from the tree, and treat an event as a notification, not a diff.
+
+State delivery to the embedder is **not** through the actor's inbox. Each
+mounted root owns the retained tree its envelopes are applied to, plus one
+latest-value cell for the mount status (`src/latest.rs`):
+
+```rust
+pub(crate) struct RootCell<St: Store> {
+    tree: StateTree,
+    status: Latest<MountStatus>,
+    ...
+}
+```
+
+The status cell is hand-rolled, ~120 lines: a `std::sync::Mutex` over
+`{value, version, closed, wakers, callbacks}`, a `set_with` that decides an edge
+and wakes, and a receiver that is a `Stream` yielding the current value when its
+seen version is behind and parking its waker otherwise. Not
+`tokio::sync::watch` — this crate is runtime-free (§2.1) — and not `arc-swap`: a
+read happens once per render and a write once per liveness edge, so the
+uncontended-mutex cost is irrelevant and it drops a dependency.
+
+Three properties fall out of that shape, and each has a tree analogue:
+
+- **Coalescing is structural** for the status cell: an intermediate value is
+  gone the moment the next write lands. The tree does not coalesce, it
+  *settles*: a transaction that puts a node's value back where it was notifies
+  nobody at all (`docs/rust-reactive-state.md` §9.2).
+- **The first poll replays** — for the status cell's stream shape only.
+  `subscribe`, on either plane, never fires at registration: the current value
+  is `value()`, and subscribe-then-read can repeat one idempotent assignment but
+  cannot miss an edge.
+- **Closing is the terminal signal.** Teardown closes both: the status stream
+  takes a value it had not seen and then ends, and the tree is emptied and
+  closed, which notifies every node subscriber once before every view on it
+  reads `is_live() == false` (§7, §9). A reconnect closes nothing and empties
+  nothing.
+
+Writes happen on the actor task, and so do the callbacks they owe — with no lock
+held, so a callback may read, subscribe, or drop its own subscription. Embedders
+that need thread affinity (gpui) schedule from inside the callback rather than
+computing there.
+
+---
+
+## 3. Phoenix Channel protocol layer
+
+Musubi adds no framing below the channel layer, so this layer is a small,
+self-contained reimplementation of the parts of `phoenix.js` the contract
+depends on. It is its **own crate**, `phoenix-channel`
+(`crates/phoenix-channel/`), and is not Musubi-aware — `musubi-client` is one
+consumer of it. The `Socket`/`Connector`/`Spawner`/`Timer` traits of §2.2 are
+defined here and re-exported by `musubi_client`. Unpublished like the rest of
+the workspace (§1.3); the crates.io name is a question for publishing time.
+
+### 3.1 Wire framing (serializer v2)
+
+- Endpoint: caller-supplied base (e.g. `wss://host/socket`); the crate appends
+  `/websocket` and `vsn=2.0.0` plus the caller's connect params as query
+  string. **Auth goes in socket connect params, never in join params.**
+- Every text frame is a 5-tuple array:
+  `[join_ref, ref, topic, event, payload]`, with `join_ref`/`ref` nullable
+  strings and `payload` an arbitrary JSON object.
+- Replies arrive as event `"phx_reply"` with
+  `payload = {"status": "ok" | "error", "response": {...}}` and `ref` equal to
+  the originating push's ref.
+- Lifecycle events: `"phx_join"`, `"phx_leave"`, `"phx_close"`, `"phx_error"`.
+- Heartbeat: push `{event: "heartbeat", topic: "phoenix", payload: {}}` every
+  30s (configurable). Missing a heartbeat reply before the next tick ⇒ treat
+  the socket as dead and tear down for reconnect, matching `phoenix.js`.
+
+  The clock is **self-clocking and fenced**, which is what makes that rule mean
+  what it says:
+
+  - Each tick is armed by the one before it, *from the point where the
+    heartbeat was written to the socket* — never from a wall clock running
+    beside the actor. An independent timer that keeps ticking while the actor
+    is behind puts two ticks in the inbox at once, and the second reads the
+    first one's heartbeat, sent moments earlier, as unanswered: a full
+    reconnect and re-hydrate on a connection that had just recovered. Socket
+    writes now go through an outbox (below), so the anchor is explicit: the
+    queued beat carries the incarnation it beats for, and the tick is armed by
+    the write driver once the sink has actually taken the frame — never when it
+    was queued behind whatever else was waiting. A socket that will not take the
+    beat therefore never re-arms the clock and is not torn down by it; pushes
+    riding on it still fail on their own timeouts, and bounding an unwritable
+    socket is a *write deadline*, a separate question from this one.
+  - Each tick names the socket incarnation it beats for, and one that outlives
+    its socket is dropped on arrival. Timers here cannot be cancelled (the
+    `Timer` seam returns a future, not a handle), so a tick armed against a
+    socket that then dies would otherwise beat off-phase on its replacement and
+    leave it running two clocks.
+  - Before an unanswered heartbeat is called a missed one, whatever the
+    transport has already delivered is read. The actor loop is inbox-first
+    (below), so the reply may be sitting in the socket, delivered but unread —
+    an unread reply is not a missed one.
+- Actor loop fairness: the loop selects inbox-first, so a handle's join or push
+  is not queued behind an inbound broadcast, and the bias is deterministic
+  because the protocol suites drive the loop on a hand-pumped single-threaded
+  pool where a randomised `select!` would make frame ordering irreproducible.
+  The bias carries a budget: after a bounded run of consecutive inbox wake-ups
+  a ready inbound frame takes the lead, which it holds only until it supplies
+  one frame. Without that ceiling a producer that outruns frame encoding (an
+  unthrottled upload progress reporter is the reachable one) can keep the
+  socket unread indefinitely, and a socket whose frames go unread is
+  indistinguishable from a dead one.
+- **Socket writes are queued, never awaited.** The actor holds an outbox of
+  frames and drains it by driving `poll_ready`/`start_send`/`poll_flush` as loop
+  state, at the top of every wake-up and *ahead of* the bias above — not as a
+  third branch of it, which the inbox-first bias could starve. Awaiting a write
+  inline is the thing the loop must not do: a peer that stops reading (a full
+  send buffer, a zero-window TCP receiver, an upload's chunks banked up behind
+  one slow consumer) parks `poll_ready` indefinitely and says nothing about it,
+  and a loop parked there reads no frames and handles no `Timeout`,
+  `HeartbeatTick`, `Reconnect` or `Disconnect` — so every timeout stops being a
+  bound on wall-clock time and `disconnect().await` never returns. Queueing is
+  synchronous, infallible and unbounded, for the same reason the inbox is: the
+  outbox is a staging area between two queues that already existed (the actor's
+  inbox and the transport's send buffer), not a new place to accumulate work,
+  and a producer that outruns the socket is bounded by the push timeouts that
+  fail it. The outbox belongs to the socket incarnation that will write it — a
+  teardown empties it along with the flush it owed and the heartbeat tick that
+  flush would have armed, so nothing a dead socket queued or failed can reach
+  its replacement.
+- Refs are a monotonically increasing `u64` stringified; `join_ref` is the ref
+  of the channel's current `phx_join` and must be echoed on every push for that
+  channel.
+
+### 3.2 Channels
+
+- **One channel per mounted root.** Topic `"<base_topic>:<root_id>"` where
+  `base_topic` defaults to `"musubi:connection"` and
+  `root_id = format!("{module}:{id}")`.
+- **Join is mount; leave is unmount.** There are no `mount`/`unmount` messages.
+  Join payload, exact keys:
+  ```json
+  {"module": "MyApp.Stores.CartPageStore", "id": "cart:page", "params": {}}
+  ```
+  `id` must be a non-empty string; `params` must be a JSON object (default
+  `{}`).
+- Join ok reply `{"root_id": "..."}` — the client recomposes `root_id` locally
+  and **fails the mount on mismatch**. Join error reply `{"reason": "..."}` is
+  surfaced as `MusubiError::Join { reason }`. Join timeout is a join failure.
+- **Rejoin.** On socket reopen, every channel still in the registry is
+  re-joined with its original params, and the join-ok handling runs again
+  (Phoenix `Push.resend` semantics). This is load-bearing for §9; a Rust
+  channel that only fires its ok-hook once is wrong.
+- **One join attempt per channel at a time.** Phoenix answers a `phx_join` for
+  a topic the socket already holds by killing that channel and running the join
+  again (`Phoenix.Socket.shutdown_duplicate_channel/1`), so a second attempt
+  throws away the work the first is waiting on. A join is only sent for a
+  channel that is closed — `phoenix.js`'s `joinedOnce` and `rejoin()`
+  leaving-guard in one condition.
+- **Attempts are fenced, not cancelled.** The `Timer` seam returns a future,
+  not a cancellable handle, so every join carries an attempt counter: a reply
+  or a timeout naming an attempt the channel has moved off (joined, closed,
+  leaving, or already onto a later one) is dropped. Scheduled rejoins carry the
+  same stamp and a socket drop disarms them, so a rejoin that outlived its
+  socket cannot land on top of the one the reconnect already sent — and a
+  rejoin that comes due with no transport under it defers to the reconnect
+  ladder rather than dialling on its own (`phoenix.js` gates its rejoin timer
+  on `socket.isConnected()`).
+- **A join the client abandons is left before it is retried.** On a join
+  timeout — or a reply that will not parse — the client sends `phx_leave`
+  stamped with the abandoned attempt's join_ref before rearming, exactly as
+  `phoenix.js` does. Without it a mount that merely runs longer than the join
+  timeout never converges: the server finishes the join and holds the channel,
+  the retry arrives as a duplicate and restarts the same expensive join, for
+  ever. Every other way an attempt ends (`phx_error`, a deliberate leave, a
+  dead transport) is one the server already knows about and owes no leave.
+- Per-push timeout (default 10s, configurable) yields a `Timeout` outcome
+  rather than hanging the caller's future.
+- **Generation counter.** Each `attach_and_join` for a root bumps a `u64`
+  generation stamped into every callback/inflight push; anything arriving with
+  a stale generation is dropped. Deliberate leaves set `suppress_close` so the
+  resulting `phx_close` does not re-enter reconnect handling.
+
+### 3.3 Reconnect (socket level)
+
+Exponential backoff with jitter (`[10ms, 50ms, 100ms, 150ms, 200ms, 250ms,
+500ms, 1s, 2s, 5s]`, then 5s steady — matching `phoenix.js`'s default ladder
+closely enough), reset on a successful open. The jitter (up to +25%) is seeded
+from `std::collections::hash_map::RandomState`, so no PRNG dependency is needed
+— a reconnecting fleet needs spread, not randomness. The socket layer is responsible
+for reconnecting and rejoining; the Musubi layer only reacts to
+join-ok/close/error (§9).
+
+---
+
+## 4. Patch engine
+
+> **The data plane is specified in `docs/rust-reactive-state.md`.** An envelope
+> is one **transaction** against a retained reactive state tree; §4.1 below is
+> the map into that document. §4.4 (envelope validation) and §4.5 (version
+> discipline) are specified here and are normative.
+
+### 4.1 Where the data plane is specified
+
+| Concern | Where |
+|---|---|
+| Pointer walk (RFC 6902/6901) | The client's own, in `musubi-state` (`docs/rust-reactive-state.md` §1.4). The op allowlist is enforced at envelope decode, so `move`/`copy`/`test` never reach the tree, and it is a version-mismatch-class failure (§9). `TreeError::Pointer` and `TreeError::Index` map onto `PatchError::Apply` (§11). |
+| The document | The tree is authoritative and retained; ops reconcile into it, and the only whole-root deserialize is the drift check on a root `replace ""` (reactive-state §4.4). |
+| Apply and settle | One transaction: `ops` land before `stream_ops`, drift is validated inside the open transaction, and the commit settles, diffs and collects. Rolling back is O(diff), not a whole-tree clone. The 13-step cycle is reactive-state §3.6. |
+| Hydration and the store index | Neither is a phase. A stream slot **is** a materialized collection node, a store node's owner is resolved once at node creation, and the `StoreId -> node` map is maintained incrementally (reactive-state §3.5). Two on-demand projections — hydrated and wire — are what a consumer reads through. |
+
+The four wire marker shapes are classified by the same-shape rules, one crate
+down:
+
+| Marker | Shape |
+|---|---|
+| Store node | any object containing `"__musubi_store_id__": ["seg", ...]` (root `[]`) |
+| Stream slot | `{"__musubi_stream__": "<name>"}` — exactly one key |
+| Upload slot | `{"__musubi_upload__": "<name>"}` — exactly one key |
+| Async value | `{"__musubi_async__": true, "status": ..., "result": ..., "reason": ...}` |
+
+### 4.4 Envelope validation
+
+```rust
+struct PatchEnvelope {
+    r#type: String,               // must be "patch"
+    root_id: String,              // present; validated then ignored
+    base_version: u64,
+    version: u64,
+    #[serde(default)] ops: Vec<PatchOp>,
+    #[serde(default)] stream_ops: Vec<StreamOp>,
+    #[serde(default)] upload_ops: Vec<UploadOp>,   // optional for tolerance
+    #[serde(default)] events: Vec<PushEvent>,      // optional for tolerance
+}
+```
+
+`ops` and `stream_ops` are required by the TS predicate but `#[serde(default)]`
+costs nothing and matches the "forward/backward tolerant" posture the TS client
+takes for `upload_ops`/`events`. Unknown fields are ignored (no
+`deny_unknown_fields` anywhere on wire types — the server is allowed to add
+fields).
+
+`root_id` is checked against the root the channel was mounted for. A mismatch is
+unreachable against a correct server — the one page process bound to the channel
+stamps it — but it is **not** merely logged, because dropping the envelope
+silently is the one outcome nothing recovers from: any mount waiting on it fails
+with `MusubiError::Protocol`, and a root that has already published (so has no
+mount left to fail) goes into §9 recovery, which is the only thing that can move
+it off the version it is stuck on.
+
+### 4.5 Version discipline
+
+`version: u64` per root, `0` meaning "not connected / awaiting initial".
+
+- Initial envelope must be exactly `base_version == 0 && version == 1`.
+  Anything else fails the pending mount with
+  `MusubiError::Protocol("Initial patch envelope must start at version 1")`.
+- Subsequent: `envelope.base_version == version && envelope.version == version + 1`.
+  Otherwise ⇒ §9 recovery.
+- `version` is a **message sequence**, not a state version: event-only and
+  stream-only cycles bump it (BDR-0018). Idle cycles emit nothing, so the
+  sequence is gapless for the life of one page runtime.
+- The initial envelope's `ops` is always
+  `[{"op":"replace","path":"","value":<full wire root>}]`, plus whatever
+  stream/upload/event ops `mount` queued.
+
+### 4.6 Wire-tree markers and the hydration pass
+
+Replaced — see the §4.1 table. The four marker shapes are unchanged (listed
+there); what is gone is the *walk*. A stream slot is a `Collection` node whose
+owner was resolved once at creation, so no marker is ever re-resolved, and the
+two projections that replace the walk — hydrated and wire — are on-demand rather
+than once per envelope (`docs/rust-reactive-state.md` §3.5).
+
+---
+
+## 5. Streams: client-owned materialization
+
+Per `docs/streams.md` and BDR-0018, the server keeps no ordered key list, makes
+no upsert decision, and does no limit trimming. All of it is the client's job.
+
+**Where the list lives.** A stream slot **is** a node on the retained tree:
+`NodeKind::Collection { name, owner, items }`, where `items` is the ordered
+`Vec<(item_key, NodeId)>` — every item is a subtree with its own identity, not
+an inline `Value`. `stream_ops` reconcile into it directly, resolved through the
+tree's `(StoreId, stream) -> NodeId` index and applied inside the same
+transaction as `ops`, after them: the first envelope's `replace ""` is what
+creates the slot that the same envelope's inserts fill. There is no separate
+stream store beside the tree. The normative specification of the node — keyed
+item identity, `NodeId` survival across an upsert, the per-transaction
+carry-over table that makes `reset: true` behave as a keyed diff, and the
+ordering rule (a pure reorder notifies the collection, not the items) — is
+`docs/rust-reactive-state.md` §3.1.
+
+Wire ops, each stamped with `store_id` by the page server and flushed
+parent-first by `store_id` length:
+
+```json
+{"op":"reset",  "stream":"messages","ref":"0","store_id":[]}
+{"op":"insert", "stream":"messages","ref":"0","store_id":[],"item_key":"msg-1","at":-1,"item":{...},"limit":-100}
+{"op":"delete", "stream":"messages","ref":"0","store_id":[],"item_key":"msg-1"}
+```
+
+`ref` is the per-store slot ref; the client ignores it and keys by
+`(store_id, stream)`. Within one store's flush the order is always
+`[reset?] ++ inserts ++ deletes`. An op naming a slot the tree does not have is
+dropped — every declared stream renders its marker every cycle
+(`docs/streams.md`), so the only window is a store unmounting in the cycle it is
+inserted into, and that store's subtree is gone by the end of the same envelope.
+
+The per-op list semantics below are the behavior-sensitive part of the port:
+they must match `packages/client/src/streams.ts` op-for-op, because both clients
+have to materialize the same list.
+
+Semantics:
+
+- `reset` ⇒ the list becomes empty.
+- `delete` ⇒ retain entries whose `item_key != op.item_key`.
+- `insert` (**upsert-then-position**, in this exact order):
+  1. If an entry with the same `item_key` exists, **remove it first**. The list
+     entry is repositioned rather than edited in place; the item's *node* is
+     reused and reconciled into, so a view bound to that row keeps its
+     subscribers and hears only about the fields that actually changed
+     (`docs/rust-reactive-state.md` §3.1).
+  2. Resolve the index against the **post-removal** length `len`:
+     `at == -1` ⇒ `len` (append); `at <= 0` (0 or any other negative) ⇒ `0`
+     (prepend); `at > 0` ⇒ `min(at, len)`.
+  3. Insert.
+  4. Trim by `limit`.
+- `limit` trimming (per-op, `null` = no limit): `size = limit.abs()`;
+  `size == 0` ⇒ empty list; `len <= size` ⇒ no trim; else
+  `overflow = len - size` and — **direction is chosen by `at`, not by the sign
+  of `limit`** — if `at == 0` drop `overflow` from the **end**, otherwise
+  (including `at == -1` and `at > 0`) drop `overflow` from the **front**.
+  The server-side convention writes negative limits (`-100`); the client does
+  not read that sign.
+- **Owner disappearance**: no `reset` is emitted when a store unmounts. This is
+  now **structural**: a collection node is a child of its owning store node, so
+  it is freed with that store's subtree and there is no pruning walk left
+  (BDR-0011 fresh-mount semantics: reappearance starts empty). Upload pruning
+  survives, against the tree's live store ids
+  (`docs/rust-reactive-state.md` §3.5).
+- Async streams: an async wire `result` may itself be a stream marker; it
+  becomes a collection node under the async node, which is what makes
+  `stream_async` render as `AsyncResult<Vec<Item>>` and what
+  `AsyncState::ok_stream()` navigates to.
+
+**Change notification: per node.** Notification is semantic equality over the
+retained tree (`docs/rust-reactive-state.md` §1.2, §9): a node's subscribers
+are called when *that node's* value changed, ancestors follow from their
+children, and untouched siblings hear nothing. Two consequences are worth
+naming, because a whole-root publisher would have to special-case both:
+
+- **An upload cycle wakes no state subscriber.** An upload slot is an inert leaf
+  (§3.4 there), so a 100-chunk upload costs zero state-plane notifications. The
+  upload handle's own subscribers fire on the upload plane.
+- **A stream edit reaches the collection node and nothing else.** A collection's
+  ordered `(item_key, value)` vector **is** its semantic value, so any edit to
+  it — including a pure reorder — is a change to the collection node and to its
+  ancestors. The keyed edits themselves reach an incremental list adapter as the
+  second argument of `StreamState::subscribe`.
+
+Exposure to the app: `StreamState<T>::value()` still yields `Vec<T>`, and the
+snapshot struct a generated bundle emits for a `stream(T)` field is still
+`Vec<T>` — the collection projects back to a JSON array. What is new is that the
+*handle* is keyed: `by_key`, `keys`, `at`, `iter`, and an item's `NodeId`
+surviving a `reset: true` refresh (§3.1 there). Item deserialization failures
+stay per-read (§11) rather than per-cycle, because materialization is now
+per-read.
+
+---
+
+## 6. AsyncResult, commands, events, mount cache
+
+### 6.1 `AsyncResult<T>`
+
+Wire (`lib/musubi/async_result.ex`):
+
+```json
+{"__musubi_async__": true, "status": "loading"|"ok"|"failed",
+ "result": <T|null|marker>, "reason": null | {"kind":"error"|"exit","value":<any>} | <any>}
+```
+
+Detection predicate: object, `__musubi_async__ == true`, `status` in
+`{loading, ok, failed}`, both `result` and `reason` keys present.
+
+**This is the single definition.** It lives in `musubi_client::generated` and is
+re-exported by the generated bundle (`docs/rust-codegen.md` §4.5); no other
+document defines it.
+
+```rust
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AsyncResult<T> {
+    Loading { result: Option<T>, reason: Option<AsyncError> },
+    Ok { result: T, reason: Option<AsyncError> },
+    Failed { result: Option<T>, reason: Option<AsyncError> },
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum AsyncError {
+    Structured { kind: AsyncErrorKind, value: Value },
+    Opaque(Value),      // server falls back to inspect/1 strings
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsyncErrorKind { Error, Exit }
+```
+
+Field naming: **`result` / `reason`, the wire names**, not the TS client's
+app-facing `data` / `error` normalization. Rationale — the derive then works
+with no hand-written `Deserialize`, and the three variants line up 1:1 with
+`lib/musubi/async_result.ex`'s `%AsyncResult{status, result, reason}`. The
+divergence from `packages/client`'s `{status, data, error}` is deliberate and
+is explained in `crates/musubi-client/README.md`.
+
+Every variant carries `reason`, including `Ok`, because the server always
+renders the key (as `null` when not failed). Consumers matching only on the
+payload write `AsyncResult::Ok { result, .. }`.
+
+`__musubi_async__` needs no handling: an internally-tagged enum on `status`
+ignores unknown sibling keys. The detection predicate above is what the tree's
+classifier uses to recognize an async node.
+
+`result` is resolved **recursively** through the same marker rules — it can be a
+stream marker, a store node, an array, or a plain object — because it is an
+ordinary child node that reconciles on its own. The reactive counterpart of this
+value type is `AsyncState<T>`, whose `status()` is part of the async node's own
+semantics: a `loading -> ok` flip notifies the async node even when the result
+did not move, and an `ok -> loading` flip that preserved the previous payload
+notifies the async node and **not** the result subtree
+(`docs/rust-reactive-state.md` §3.3).
+
+Deliberately no `Default`/`unwrap_or_default` conveniences: `Loading` with
+`result: None` and `Ok` are semantically different states and the app must
+branch.
+
+### 6.2 Commands
+
+Push event `"command"` on the root's channel, payload exactly:
+
+```json
+{"store_id": ["child","0"], "name": "checkout", "payload": {...}}
+```
+
+`store_id` is the server-authored path, echoed verbatim (root = `[]`). No
+`root_id` — one root per channel.
+
+Typed surface, generated per command:
+
+```rust
+pub trait Command<S: Store>: Serialize + Send + 'static {
+    const NAME: &'static str;
+    type Reply: DeserializeOwned + Send + 'static;
+}
+
+// generated into `my_app::stores::cart_store` (docs/rust-codegen.md §4.6):
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Checkout { pub coupon: Option<String> }
+impl Command<CartStore> for Checkout {
+    const NAME: &'static str = "checkout";
+    type Reply = CheckoutReply;
+}
+```
+
+`CartStore` here is the zero-sized **marker** type, not the state struct; the
+state struct is `my_app::stores::cart_store::State`
+(`<CartStore as Store>::State`).
+
+Outcomes are transport `phx_reply` (BDR-0001: no application-level ack, no
+`client_seq`):
+
+- `status: "ok"` ⇒ `response` is the command reply map. `{:reply, payload,
+  socket}` wire-serializes the payload (string keys, atoms stringified —
+  BDR-0029, applied at transport egress); `{:noreply, socket}` ⇒ **`{}`**, not
+  `null`. Commands declared with no reply fields generate
+  `type Reply = NoReply`, a permissive struct that deserializes from `{}`.
+- `status: "error"` ⇒ `response = {"reason": "<string>"}` ⇒
+  `CommandError::Failed`. Known reasons include `"unknown command"`,
+  `"unknown root"`, `"unknown store"`, `"missing required field"`, plus
+  authorization halts (BDR-0008).
+- Push timeout ⇒ `CommandError::Timeout`.
+- `code` extraction from the error response: the first **string-valued** field
+  among `"code"`, `"error"`, `"reason"`, in that order; else `None`.
+
+Preconditions: **no channel, or `version == 0` (mid-reconnect) ⇒
+`MusubiError::NotConnected`.** No retry, ever — a dispatch is either sendable
+now or rejected.
+
+The one exception is a root a **cache seed** made renderable before its live
+initial patch (§6.4). There the caller is looking at state, so `NotConnected`
+would be a lie; the dispatch is held instead and flushed, in queue order, the
+moment the initial patch is published and `version` reaches `1`. "In order"
+is the order the queue is drained and the pushes are issued in; each one is
+handed to the spawner as its own task, so which reaches the socket first is
+ultimately the executor's choice, exactly as for two concurrent `command`
+calls. The queue is a bridge
+across exactly one revalidation, not a retry buffer:
+
+- It is bounded (32 dispatches per root). Past the bound a dispatch gets the
+  same `NotConnected` an unseeded root gives.
+- Every bulk rejection empties it and clears the seeded flag with it —
+  `VersionMismatch` on recovery (a revalidation that produced a version gap),
+  `Disconnected` on channel close, `Unmounted` on teardown, the join reason on a
+  failed re-join. After any of those the root is back to the plain contract
+  above, so nothing queues behind a revalidation that is not coming.
+- A root that reached `version == 1` on its own and then reconnected is **not**
+  seeded, so it rejects as before. Queueing is a property of the seed, not of
+  the cache being enabled.
+
+**Ordering (BDR-0009): the server writes the reply, then the `"patch"` push,
+then server-side effects — and that frame order is *not* a client guarantee
+(§2.4).** The Rust API must not let callers mistake a resolved reply for applied
+state. Concretely: `Mounted::command(...).await` returns `Reply` and the docs
+state, at the method's `# Ordering` heading, that the reply is not gated on the
+patch it caused and implies nothing about applied state — neither that the patch
+has landed nor that it has not. There is deliberately **no**
+`command_and_wait_for_patch` helper in v1 — a `{:noreply}` command still
+patches out of band and there is no correlation id to wait on, so any such
+helper would be a race dressed as an API. Apps that need "state settled" put a
+subscription on the node whose condition they care about.
+
+Bulk rejection of pending commands: `Disconnected` on channel close/error,
+`Unmounted` on teardown, `VersionMismatch` on recovery, and the join failure
+reason on a failed (re)join.
+
+BDR-0030 (`send_update`) is server-internal and produces ordinary envelopes —
+no client work.
+
+### 6.3 Push events (BDR-0032)
+
+Events ride in `PatchEnvelope.events`; there is **no** `"event"` channel frame.
+Shape: `{"store_id": [...], "name": "toast", "payload": <wire term>}`.
+
+- The registry lives on the **root connection**, keyed by `(store_id, name)`,
+  and **survives reconnect** — it is cleared only on unmount/disconnect. That
+  clear is **terminal for the registry as a whole**, not just for the keys it
+  held: nothing rejoins afterwards, so a handle still held across a teardown
+  gets an already-ended stream from `events()` rather than one that can never
+  yield, exactly as the state and status cells answer `subscribe` (§2.4).
+- Multiple `events()` streams per key; events with no live stream are silently
+  dropped.
+- Dispatched exactly once per event, **after** ops/stream_ops/upload_ops are
+  applied and the state notification (`docs/rust-reactive-state.md` §3.6 steps
+  9 and 11). Dispatch is a send into each live
+  stream's sender; closed receivers are pruned on the way. The payload is
+  wrapped in an `Arc` for the fan-out and each subscription deserializes its
+  `E` from the shared value, so a second subscriber costs a refcount bump
+  rather than a deep clone of the payload tree.
+- Ordering against state is per-stream only: the state stream is latest-value
+  (§2.4), so by the time an event is polled its envelope's state may already
+  have been coalesced past. An event is a notification, not a diff.
+- No ack, no retry, no replay. Events inside an envelope rejected for a version
+  gap are discarded with it. A cold client can miss mount-time events —
+  documented and accepted upstream.
+
+Typed surface. The wire name has to come from the type, because the dispatch key
+is `(store_id, name)`; so the crate defines an `Event` trait mirroring `Command`,
+and the generated bundle implements it **on the payload struct**:
+
+```rust
+pub trait Event<S: Store>: DeserializeOwned + Send + 'static {
+    const NAME: &'static str;
+}
+
+// generated into `my_app::stores::cart_store` (docs/rust-codegen.md §4.6):
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToastPayload { pub message: String }
+impl Event<CartStore> for ToastPayload {
+    const NAME: &'static str = "toast";
+}
+```
+
+API:
+
+```rust
+let mut toasts = mounted.events::<ToastPayload, _>(&StoreId::root());
+while let Some(toast) = toasts.next().await { show(&toast.message); }
+// dropping `toasts` unsubscribes
+```
+
+The stream is the subscription: dropping it unregisters (no separate
+`Subscription` guard type). Payload deserialization failure logs and drops
+that event rather than failing the envelope (an event is not state).
+
+### 6.4 Mount cache (stale-while-revalidate)
+
+The normative cache contract is `docs/client-contract.md` § Store Cache
+(Stale-While-Revalidate); this section records the Rust shape and the three
+divergences from it.
+
+Opt-in and **connection-wide**, unlike the TypeScript client's per-mount `cache`
+option:
+
+```rust
+let connection = Connection::builder()
+    .url(url).connector(connector).spawner(spawner).timer(timer)
+    .cache(MemoryCacheStore::new())          // any `CacheStore`
+    .cache_buster(env!("CARGO_PKG_VERSION")) // default ""
+    .cache_gc_time(Duration::from_secs(300)) // default 5min
+    .build()?;
+```
+
+**Entry.** `CacheEntry { data: Value, updated_at: u64, buster: String }`, keyed
+by `cache_key(module, id, params)` = `"<id>|<module>|<canonical params>"`,
+params canonicalized with sorted keys so field order cannot fork one store into
+two slots. It matches `storeCacheKey` in `packages/client/src/cache.ts` for
+object-valued params over non-float scalars — which is every generated `Params`
+struct — and deliberately not beyond that: TypeScript renders *omitted* params
+as `null` where Rust always has an object (`Params {}` ⇒ `{}`), and
+`serde_json`'s float rendering is not `JSON.stringify`'s (`1.0` vs `1`). Point
+two clients at one durable store only under those terms. `data` is the **wire tree** (the shadow document, `__musubi_store_id__`
+and `__musubi_stream__` markers intact), so seeding is the same marker
+substitution the engine already does and there is no second decoding path.
+`updated_at` is `now_ms()`, wall-clock milliseconds since the Unix epoch.
+
+**Store.** `trait CacheStore { get, put, evict }`, `Send + Sync + 'static`,
+each returning a `BoxFuture`. Every method is fallible in practice and
+infallible in the signature: an implementation that cannot read returns `None`
+and one that cannot write does nothing, so a broken cache degrades to a cold
+mount instead of failing one. The crate ships `MemoryCacheStore` only — a
+durable store is the embedder's, because the file system and the platform's
+storage are runtime decisions this crate does not make.
+
+**Mount.** The registry insert and the join happen first, then the read is
+*spawned*, so a slow store delays the seed and never the revalidation. When the
+read produces an entry whose `buster` matches and whose age is within
+`cache_gc_time`, the actor seeds the root from it — the tree is **built** from
+the cached wire value, in one transaction, **version stays 0** — notifies, and
+resolves every mount waiting on the root. The live initial patch is still required to be
+`base_version: 0, version: 1`, and its whole-root `replace ""` swaps the seed
+out in one op.
+
+Five things drop a seed rather than showing it:
+
+- A stale or wrong-`buster` entry is evicted by the reading task; the mount is
+  cold.
+- A read that suspends past the live initial patch loses: `published || version
+  != 0` means the server's state stays and the seed is discarded (the same race
+  guard `trySeedFromCache` has).
+- A read that suspends past its own *mount* loses. A root is addressed by
+  `"<module>:<id>"` but its slot also keys on the params, so a failed join
+  followed by a re-mount of the same id under different params would otherwise
+  be seeded from the first mount's slot. `ActorMsg::CacheSeed` carries the key
+  it was issued for and is dropped when that is no longer the root's.
+- A tree the generated types reject — a shape an older build wrote — fails the
+  drift check *inside* the seeding transaction, so it is **rolled back** rather
+  than undone by a second call; the slot is evicted and the mount goes on
+  waiting for the cold path. This is deliberately **not** `MusubiError::Decode`
+  reaching the embedder: nothing is diverged, the live patch is still coming.
+- Streams are not cached (`stream_ops` are not part of the tree), so a seeded
+  stream slot reads as `[]` until the live envelope refills it — exactly what
+  the TypeScript client does, which seeds `root` without seeding `streams`.
+
+**Writes.** After every accepted envelope is published, the root's **wire**
+projection (`StateTree::to_wire`, markers intact) is queued for its slot under a
+trailing throttle (`CACHE_WRITE_THROTTLE`, 1s): a
+burst of envelopes costs at most one write per interval, always the latest tree,
+fire-and-forget.
+
+**Teardown.** Unmount flushes the pending write, then arms the gc timer with the
+remainder of `cache_gc_time` measured from the entry's own `updated_at`, so a
+slot that was already half-expired is not given a fresh lifetime. A re-mount of
+the same slot cancels that eviction. `disconnect()` flushes but does **not**
+evict: the entry ages out on its own and a reconnecting app can seed from it
+again — the one place this diverges from `disconnectConnectionState`, which
+clears the runtime-owned memory persister. Here the store is the embedder's, so
+wiping it on disconnect would be a surprise.
+
+Not carried over from the TypeScript layer: `initialData` (a per-mount option,
+and this cache is connection-wide) and the durable-persister-without-`buster`
+warning (a `CacheStore` does not declare whether it is durable).
+
+---
+
+## 7. Public API sketch
+
+```rust
+// ---- conventions -------------------------------------------------------
+/// Crate-wide alias, the std convention (`std::io::Result`-style).
+pub type Result<T, E = MusubiError> = std::result::Result<T, E>;
+
+/// Server-authored store path (root = empty). A newtype, not a `Vec` alias,
+/// so ids cannot be confused with arbitrary string vectors.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct StoreId(Vec<String>);
+
+impl StoreId {
+    pub fn root() -> Self;
+    pub fn as_slice(&self) -> &[String];
+}
+
+// ---- entry point: builder, not a 4-positional free function ------------
+impl Connection {
+    pub fn builder() -> ConnectionBuilder;
+}
+
+impl ConnectionBuilder {
+    pub fn url(self, url: impl Into<String>) -> Self;          // required
+    pub fn connector(self, c: impl Connector) -> Self;         // required seam
+    pub fn spawner(self, s: impl Spawner) -> Self;             // required seam
+    pub fn timer(self, t: impl Timer) -> Self;                 // required seam
+    pub fn topic(self, topic: impl Into<String>) -> Self;      // default "musubi:connection"
+    pub fn heartbeat(self, d: Duration) -> Self;               // default 30s
+    pub fn join_timeout(self, d: Duration) -> Self;            // default 10s
+    pub fn push_timeout(self, d: Duration) -> Self;            // default 10s
+    pub fn uploader(self, name: impl Into<String>, u: impl Uploader) -> Self;
+    pub fn cache(self, store: impl CacheStore) -> Self;        // §6.4, off by default
+    pub fn cache_buster(self, buster: impl Into<String>) -> Self; // default ""
+    pub fn cache_gc_time(self, d: Duration) -> Self;           // default 5min
+    /// Spawns the actor; the socket opens lazily on first use. The only
+    /// build-time error is a missing required seam.
+    pub fn build(self) -> Result<Connection, BuildError>;
+}
+
+impl Connection {
+    /// `params` is the **mount** params object (the channel join payload's
+    /// `params` key), not the socket connect params. It is the store's
+    /// generated `Params` struct — one field per `attr/3` declaration — so a
+    /// required attr cannot be forgotten at the call site. A hand-written
+    /// `Store` impl whose `Params` serializes to a non-object is rejected with
+    /// `MusubiError::Protocol` before anything is sent.
+    pub async fn mount<St: Store>(&self, id: &str, params: St::Params)
+        -> Result<Mounted<St>>;
+
+    /// The escape hatch: `attr/3` is the child-store assign contract, and the
+    /// page server hands the join payload's `params` map to `mount/2`
+    /// unvalidated (`mount_root_store/2`), so a root that reads a key it never
+    /// declared as an attr is legal and unreachable through `St::Params`.
+    /// Same object guard, no attr typing.
+    pub async fn mount_with_params<St: Store>(&self, id: &str, params: impl Serialize)
+        -> Result<Mounted<St>>;
+    pub async fn disconnect(self) -> Result<()>;
+}
+
+// ---- the three traits the generated bundle implements ------------------
+// Defined here, in `musubi_client::generated`; the bundle re-exports them
+// (docs/rust-codegen.md §4.5) rather than declaring its own.
+pub trait Store: Send + Sync + 'static {
+    const MODULE: &'static str;                       // "MyApp.Stores.CartStore"
+    type State: DeserializeOwned + Send + Sync + 'static;
+    type Params: Serialize + Send + 'static;          // from `attr/3`
+}
+
+pub trait Command<S: Store>: Serialize + Send + 'static {
+    const NAME: &'static str;
+    type Reply: DeserializeOwned + Send + 'static;
+}
+
+pub trait Event<S: Store>: DeserializeOwned + Send + 'static {
+    const NAME: &'static str;
+}
+
+// ---- mounted root ------------------------------------------------------
+/// Client-local liveness projection (BDR-0033). No wire message carries it.
+pub enum MountStatus { Connecting, Live, Reconnecting }
+
+impl<St: Store> Mounted<St> {
+    /// This root's state, as the root view of its retained reactive tree —
+    /// a handle, not a value, and never an `Option` (the root node always
+    /// exists). `state().revision() == 0` is "nothing has landed yet";
+    /// `!state().is_live()` is "torn down". Navigation is generated
+    /// (`state().title()`), materialization is `value()`, and observation is
+    /// `subscribe(..)`, which hands back a RAII `Subscription`.
+    /// `docs/rust-reactive-state.md` §2.4 is the surface.
+    pub fn state(&self) -> State<St::State>;
+
+    /// BDR-0033: `Connecting` until the first *accepted* initial patch (a
+    /// cache seed does not count), `Live` after, `Reconnecting` from a socket
+    /// drop / heartbeat timeout / version-gap recovery until the rejoin's
+    /// fresh initial patch lands. Terminal outcomes (rejected join, unmount,
+    /// disconnect) stay on the mount error path — no error arm here.
+    ///
+    /// One property, three actions, exactly as on the tree:
+    /// `status().value() -> MountStatus`,
+    /// `status().subscribe(cb) -> Subscription`, and
+    /// `status().into_stream()` for a consumer whose shape is a loop — the same
+    /// subscription in `await` shape, latest-value, edges only, first poll
+    /// replays. Every BDR-0033 rule is unchanged; only the path to it is
+    /// (`docs/rust-reactive-state.md` §5.4).
+    pub fn status(&self) -> StatusState;
+
+    pub async fn command<C: Command<St>>(&self, cmd: C) -> Result<C::Reply>;
+
+    /// Child-store dispatch. `T` is inferred from `cmd`'s `Command<T>` impl —
+    /// no turbofish at the call site.
+    pub async fn command_on<C, T>(&self, target: &StoreId, cmd: C) -> Result<C::Reply>
+    where T: Store, C: Command<T>;
+
+    /// Push events (BDR-0032) as a typed `Stream` — an unbounded queue, not a
+    /// latest-value cell (§2.4): events are discrete, so a slow consumer gets
+    /// all of them and pays for the backlog. Dropping the stream unregisters.
+    /// `mounted.events::<ToastPayload, _>(&StoreId::root())`.
+    #[must_use]
+    pub fn events<E, T>(&self, store_id: &StoreId) -> impl Stream<Item = E> + Send + 'static
+    where T: Store, E: Event<T>;
+
+    /// The live upload handle for a slot on this mount's tree — **the way a
+    /// consumer walks from the state tree to the upload plane.** Both halves of
+    /// the `(store_id, name)` key come from the node, so there is no bare string
+    /// and no hand-written `StoreId`. `None` exactly when the slot node is gone.
+    /// See §10 and `docs/rust-reactive-state.md` §3.4.
+    pub fn upload_at(&self, slot: &UploadSlotState) -> Option<Upload>;
+
+    /// The same handle by raw key: the registry primitive, kept for a
+    /// hand-written embedder addressing a slot it never navigated to.
+    pub fn upload(&self, store_id: &StoreId, name: &str) -> Upload;
+
+    // No unmount method: unmounting is automatic. Dropping the last clone of
+    // this handle leaves the channel (RAII) — see the "Unmount" note below.
+}
+```
+
+Notes on the shape:
+
+- **Idiom baseline.** Builder for construction (reqwest-style) instead of a
+  positional free function; a crate `Result` alias; one RAII `Subscription` for
+  every observation on the whole API — tree node, mount status, upload handle —
+  so a view keeps all of them in one `Vec`; `#[must_use]` on subscriptions,
+  streams and command futures; generics ordered so the inferable parameter comes
+  last (call sites never need a bare `_` turbofish except `events::<Payload, _>`).
+  A subscriber callback runs on the actor task with no lock held, so the
+  contract is *schedule, do not compute*; embedders that need thread affinity
+  (gpui) schedule from inside the callback.
+- **`state()` is not an `Option`.** The root node always exists, so the question
+  the old `snapshot() -> Option` answered moved onto the view:
+  `revision() == 0` is "nothing has landed yet" — neither an accepted initial
+  patch nor a cache seed (§6.4) — and `!is_live()` is "torn down", which a
+  still-held handle can observe only via `Connection::disconnect` (§9). A
+  reconnect empties nothing: the last-good tree keeps rendering and the rejoin's
+  initial patch is *reconciled* into it, so an unchanged subtree keeps its
+  identity and notifies nobody.
+- **`status()` answers "am I current", the tree answers "have I loaded".**
+  The two are deliberately separate (BDR-0033): a reconnect never clears the
+  tree, so an idle disconnect is observable only on the status surface.
+  The socket layer underneath exposes the connection-wide analogue
+  (`PhoenixSocket::status` / `status_updates`,
+  `SocketStatus { Connecting, Connected, Reconnecting, Closed }`); this crate
+  folds the per-topic projection of the same signal — the `ChannelEvent`s the
+  socket actor emits from the identical transitions — into a per-root
+  `MountStatus`. While `Reconnecting`, the embedder MUST keep rendering the
+  last-good tree; the status exists to annotate stale rendering, never to
+  blank it.
+- **Typed mount params.** `Store::Params` is the struct the generator emits
+  from `__musubi__(:attrs)`, which the shared manifest carries as `:attrs`
+  (`{module, kind, fields, commands, events, attrs, uploads, source}` — see
+  `Musubi.Codegen.Manifest.collect/1`). A `required: true` attr is a plain
+  field, every other attr an `Option<T>`; a store declaring no `attr` gets
+  `pub struct Params {}`. That matters because params are **not** optional
+  data: `ChatRoom.Stores.ChatRoomStore` declares
+  `attr(:room_id, String.t(), required: true)` and its `mount/2` does
+  `Map.fetch!(params, "room_id")`, so an untyped `json!({})` mount would fail
+  only at the server. `mount` still validates that the value serialized to a JSON
+  object, because `Store` is unsealed and `Params` is only bound by
+  `Serialize`. The TS target has no params typing
+  (`StoreDef<Module, Shape, Commands, Events>`); that parity gap is recorded in
+  `docs/rust-codegen.md` §8.
+- **No `type Commands` / `type Events` on `Store`.** Nothing consumes a sum
+  enum; dispatch is per-payload-type via `Command<S>` / `Event<S>`.
+- **No proxy, no dynamic field access, no `keyOf`.** Nominal Rust replaces the
+  TS proxy layer: `state.header().title()` is a generated accessor, and
+  `.value()` is the one explicit materialization point. Reserved runtime
+  member names (`dispatchCommand`, `subscribe`, `handleEvent`, `snapshot`)
+  therefore have no collision risk on the state struct, and a declared state
+  field cannot be named `__musubi_store_id__` in the first place —
+  `Musubi.DSL.Field.validate_reserved!/1` (`lib/musubi/dsl/field.ex`) already
+  raises `ArgumentError` at `state do` expansion time for any name starting with
+  `__musubi_`. No new codegen guard is needed.
+- **Child store dispatch.** A `Module.state()` field's snapshot type is still
+  `musubi::StoreField<ChildState>` — `{ store_id, #[serde(flatten)] state }`
+  (`docs/rust-codegen.md` §4.5) — and its *handle* is `StoreState<ChildState>`,
+  so `mounted.command_on(&panel_id, Pay { .. })` — with `panel_id` from
+  `state.checkout_panel().store_id()`, an `Option<StoreId>` that is `None` only
+  when nothing is mounted under that handle — is the idiomatic child-command
+  call, and `state.checkout_panel().fields().total()` navigates into the child.
+  Store ids are **server-authored**; the client echoes them verbatim and never
+  constructs or parses them.
+- **Duplicate mounts.** Two `mount::<St>("cart:page", ..)` calls for the same
+  `(module, id)` alias one root: the second bumps a refcount and returns a
+  second `Mounted` handle over the same channel. The registry insert happens
+  **synchronously before any await** in the mount path so concurrent mounts
+  cannot open two channels on one topic. First-mount params win; later params
+  are ignored, with a `tracing::warn!`. If the existing root's initial patch is
+  still in flight, the aliasing caller awaits it and, on failure, decrements the
+  refcount and propagates the error.
+- **A cancelled mount gives its hold back.** The hold the actor counts for a
+  waiting caller travels *inside* the mount reply, so dropping the mount future
+  — `tokio::time::timeout`, a losing `select!` branch, an aborted task —
+  releases it whether the cancellation lands before the actor answers or after.
+  Releasing on "the send reported no receiver" would cover only the first of
+  those: a `oneshot` send succeeds the moment the value is stored, and a
+  receiver dropped an instant later takes the value with it. A reply nobody
+  reads must not leave a joined channel and a live page server behind.
+- **Unmount is `Drop`, not a method.** There is no explicit `unmount()`.
+  `Mounted` is `Clone` over a refcount; `Drop` decrements it, and at zero sends
+  a non-blocking `Leave` message into the actor inbox (an unbounded
+  `mpsc::Sender::unbounded_send` — safe from a sync `Drop`). The actor then
+  rejects pending mount/commands with `Unmounted`, resets state, drops the root
+  from the registry, and leaves the channel (the server's `terminate/2` stops
+  the root). If the actor is already gone (connection dropped), the send fails
+  silently — the server side is torn down with the socket anyway. Apps that
+  need to *observe* teardown completion use `Connection::disconnect()`.
+
+  There is **no unmount grace window and no cancel-by-remount**. The TS client
+  has one because React StrictMode double-invokes effects; a Rust embedder has
+  no such double-mount, and the TS window is `0` anyway. Refcounted aliasing is
+  kept (`Mounted` is `Clone`; the last drop leaves the channel); a configurable
+  grace can be added later if a real embedder needs it.
+- **Streams are keyed views.** A stream field's snapshot type is still
+  `Vec<Item>`, but its handle is `StreamState<Item>`: `by_key`, `keys`, `at`,
+  `iter`, and a `subscribe` whose callback is handed this transaction's keyed
+  edits (`docs/rust-reactive-state.md` §6.3).
+- **No UI binding layer.** There is no Rust equivalent of `@musubi/react`. A UI
+  integrates against `state()` and per-node subscriptions directly, which is
+  what makes the surface portable across GUI frameworks. The one adapter that
+  exists, `musubi-gpui`, depends on `musubi-state` alone and never sees an
+  envelope, a socket or a `Mounted`.
+- **The patch engine is not a public entry point.** `PatchEngine`,
+  `PatchEnvelope`, `PatchOp`, `StreamOp`, `UploadOp`, `PushEvent` and `Uploads`
+  are `pub(crate)`. Promising them would drag the tree's whole **write** half
+  into the public API (`StateTree::apply`/`begin`/`close`, `Transaction`, `Notify`,
+  `ChangeSet`, `NodeKind`, `Node`, `SemanticValue`, `TreeError`) — the half most
+  likely to be overturned by implementation — for a capability with no known
+  caller, and AGENTS.md's rule is that there is no promise without a second
+  caller. The TypeScript precedent does not carry over: `applyPatch`,
+  `applyStreamOps` and `applyUploadOps` are pure functions with no identity, no
+  subscribers and no lifetime, so their promise *is* their signature. The Rust
+  equivalent of "read state without wiring it yourself" is `Mounted::state()`,
+  and the write half is `#[doc(hidden)]` in `musubi-state`
+  (`docs/rust-reactive-state.md` §5.5).
+- **`BinaryPush` is re-exported as a test-harness affordance.** The seams
+  (`Connector`, `Socket`, `Spawner`, `Timer`, `Frame`, `TransportError`) are
+  re-exported so an embedder implements them against `musubi_client` alone
+  (§2.2); `BinaryPush` rides along because a scripted `Socket` has to *decode*
+  what the client sent to assert on it, and upload chunks are binary frames
+  (§10.2). `examples/chat_room/desktop` does exactly this — it asserts on
+  `BinaryPush { event, payload, .. }` in its fake socket — without ever naming
+  `phoenix-channel` in its `Cargo.toml`. Re-exporting it is what keeps that
+  dependency out of embedders' manifests.
+
+---
+
+## 8. Codegen
+
+`docs/rust-codegen.md` is the **normative** specification of the generator:
+compiler and config names, the Elixir → Rust type mapping, hoisting/naming
+rules, the module tree, and the exact emission shape. This section carries only
+what the *client crate* owes the generator, plus the manifest layer the two
+targets share.
+
+Names, fixed once and used in both documents: compiler atom `:musubi_rust`,
+task `mix compile.musubi_rust` (`Mix.Tasks.Compile.MusubiRust`), config keys
+`:rust_codegen_output_path` (default `"priv/codegen/rust/musubi.rs"`),
+`:rust_codegen_root_module` (default `"musubi"`, a **sibling** prelude module),
+and `:rust_codegen_runtime_path` (default `"musubi_client"`).
+
+### 8.1 The shared manifest
+
+`Musubi.Plugin.Codegen` stamps
+`_build/<env>/musubi-codegen/<inspect(module)>/state.term` with
+`%{module, kind, fields, commands, events, attrs, uploads, source}`, and
+`Musubi.Codegen.Manifest` reads it back. The payload is **fully
+target-agnostic**: raw Musubi reflection with quoted Elixir type ASTs, no TS
+strings, no marker names, no output path.
+
+One stamp, N renderers. A second `@after_compile` per target is explicitly
+rejected — it doubles compile-time IO for identical data. For the same reason
+the `:__streams__` field filter lives on the shared layer as
+`Manifest.renderable_fields/1` rather than being re-derived per renderer; see
+`docs/rust-codegen.md` §1.1–§1.2 for the full manifest contract.
+
+`:attrs` is what makes typed mount params possible: the Rust target generates a
+`Params` struct per store from it (§7, `docs/rust-codegen.md` §4.6), and the TS
+renderer ignores the key.
+
+### 8.2 What the generated file depends on
+
+The generated bundle is type-only — no runtime logic, no registries, no store
+objects (same rule as the TS bundle). Its entire dependency surface is `serde`,
+`serde_json`, and these nine items, which it re-exports into its own prelude
+module (`docs/rust-codegen.md` §4.5):
+
+```rust
+musubi_client::generated::{
+    AsyncError, AsyncResult, Command, Event, NoReply, Store, StoreField, StoreId, UploadSlot,
+}
+```
+
+That list is normative and must match `docs/rust-codegen.md` §4.5 verbatim.
+`AsyncErrorKind` is reachable through `AsyncError` and is exported too, but no
+generated item names it directly.
+
+Points worth stating because they are easy to get wrong:
+
+- The bundle emits `impl ::musubi_client::generated::Store for CartStore`. The
+  traits are **not** sealed — a sealed trait could not be implemented from a
+  file generated into a consumer crate.
+- `stream(T)` renders as `Vec<T>` on the snapshot struct, not a marker type: the tree's hydrated projection
+  substitutes the array before serde runs. There is no `StreamField`.
+- Uploads render as the inert `UploadSlot` only; the `UploadHandle` family is
+  hand-written in `musubi-client` and keyed by `(store_id, name)`, so codegen
+  emits nothing for it (§10).
+
+## 9. Reconnect and recovery (BDR-0015: reconnect-only, no resync)
+
+There is **no** application-level resync command. Loss recovery *is* the
+reconnect path.
+
+**Transport drop / server-initiated close, with live consumers:**
+keep the last-good tree rendering, whole — nodes, identities, subscribers;
+set `version = 0`; clear the pending-initial-patch waiter; reject pending
+commands with `Disconnected`; and **keep the channel registered so the socket
+layer rejoins it**. On rejoin the server re-runs `mount` (fresh page server,
+fresh version sequence from 0) and pushes a fresh initial patch
+(`replace ""`) that atomically swaps the state in. No client-driven resync
+push, no delta replay, no event replay.
+
+**Rejoin handling.** The join-ok hook fires on *every* rejoin. On each fire:
+verify `root_id`, set `version = 0`, and re-arm the initial-patch waiter — but
+only when no waiter is already pending (i.e. this is a reconnect, not the first
+join).
+
+**Close with refcount 0**: leave and drop the root so nothing rejoins an orphan.
+
+**Version mismatch on a still-live channel.** Guard with a `recovering` flag,
+then: reject pending commands with `VersionMismatch`; **soft reset** (keep
+last-good tree/index/streams/snapshots; set `version = 0`); leave the channel
+(stopping the server-side root) and re-create + re-join it. If that re-join
+fails, **do not disconnect** — log, keep the last-good rendering, and rely on
+the transport's continued rejoin attempts.
+
+**Generation guarding.** As in §3.2: every `patch` / `on_close` / `on_error` /
+join callback carries the generation captured at `attach_and_join` time and is
+ignored if stale. Deliberate leaves set `suppress_close`.
+
+**Status surface (BDR-0033).** Every path above is observable without a failed
+command: transport drop, heartbeat timeout and version-gap recovery each flip
+`Mounted::status()` to `Reconnecting` the moment the client notices (bounded
+by the heartbeat interval for a silent death), and the rejoin's fresh initial
+patch — not the rejoin itself — flips it back to `Live`. A root that never
+reached `Live` stays `Connecting` through socket churn; terminal outcomes stay
+on the mount error path. The status is a client-local projection of the
+signals in this section — no wire message carries it, and it never modifies
+the recovery behavior it reports on. One gap follows from having no terminal
+variant: after `Connection::disconnect` the teardown resets each root's status
+cell to the pre-initial baseline, so a `Mounted` still held across it reports
+`status().value() == Connecting` forever, indistinguishable from a root that has
+not connected *yet*. The tree is the terminal signal on the state side —
+teardown closes it, so every view reads `is_live() == false` and no later
+transaction can reopen it — as is the ended `status().into_stream()`; the handle
+should be dropped with the connection.
+
+Consequences the embedder must be told about, in rustdoc: reconnect re-runs
+server `mount`, so mount-time push events re-fire and stream contents are
+rebuilt from whatever `mount` re-seeds (`stream(..., reset: true)` /
+`stream_async(..., reset: true)`, BDR-0022). Uploads in flight are lost —
+uploads are not resumable. The reconnect window itself is renderable state:
+`status().value()` / `status().subscribe(..)` report it while the tree keeps
+serving the last-good rendering.
+
+---
+
+## 10. Uploads
+
+Both halves are implemented. The **data plane** — everything the server drives
+over `upload_ops` — matches `packages/client/src/uploads.ts` op-for-op, exactly
+like streams (§5). The **control plane** — selecting files, preflight, and
+moving bytes — is the client's own API, and it is the only thing that ever
+writes `UploadHandle::status`.
+
+Both live under `crates/musubi-client/src/uploads/`, one file per layer:
+`ops.rs` is the wire vocabulary, `registry.rs` the data plane, `transfer.rs`
+the control plane, and `mod.rs` re-exports the public surface. The
+dependencies point one way — control plane → data plane → vocabulary — so
+`PatchEnvelope` decodes `upload_ops` without reaching the transfer machinery.
+
+### 10.1 Data plane
+
+`crates/musubi-client/src/uploads/registry.rs`, over the wire types in
+`uploads/ops.rs`. The patch engine folds `upload_ops` into a
+per-root registry (`Uploads`) keyed by `(StoreId, upload_name)` — uploads are
+singletons per store, so that pair is the identity (BDR-0028). The pair is
+hashed directly; the TS `json(store_id) + "\0" + name` string key is an
+implementation detail of a JS `Map`, not a wire format.
+
+The slot on the tree stays inert: it is `NodeKind::UploadSlot { name, owner }`,
+its snapshot type is still `UploadSlot { name: String }`, and because the server
+re-renders the same marker every cycle it **never notifies**. Live upload state
+is reached through the handle, never through the state value, and the walk from
+one plane to the other is one step:
+
+```rust
+let avatar = cart.upload_at(&cart.state().avatar()).expect("the root is mounted");
+
+let handle = avatar.value();                                    // UploadHandle, always available
+let _bar = avatar.subscribe(|handle| set_bar(handle.progress()));
+let mut stream = avatar.clone().into_stream();                  // or the loop shape
+```
+
+Both halves of the `(store_id, name)` key come off the slot node — the owner is
+the nearest enclosing store, resolved once when the node was created — so a slot
+declared inside a child store cannot be looked up against `StoreId::root()` by
+accident (`docs/rust-reactive-state.md` §3.4).
+
+`Upload` is a cheap `Clone` over the live cell, and `value()`/`subscribe()`
+mirror every other handle on this API; `into_stream()` is the same subscription
+in `await` shape, and it is a **queue**, not a latest-value cell. A handle is
+created on first access — before any op it reads as idle with the framework
+defaults — and the same key always resolves to the same handle, so it can be
+taken as soon as the marker appears.
+
+Op application (`UploadHandle`, mirroring `applyOps`):
+
+| op | effect |
+|---|---|
+| `config` | replace the handle's `UploadConfig` (`chunk_timeout` is not on the wire) |
+| `add` | upsert by `ref`, keeping the entry's position; the wire `progress`/`status`/`errors` win |
+| `progress` | `entry.progress = op.progress`; status `success` at `>= 100`, else `uploading`; unknown ref ignored |
+| `complete` | `progress = 100`, status `success` — the 10 Hz progress throttle can swallow the final `100`, `complete` is never dropped; unknown ref ignored |
+| `error` | with `ref`: status `error` and **append** to the entry's errors; without one: append to the handle's errors |
+| `cancel` | **delete** the entry — cancellation is a deletion, never a status |
+| `reset` | clear every entry and the handle's errors; the handle's own status is untouched |
+
+`UploadHandle::progress()` is the plain mean over **all** entries — pending and
+failed included — rounded half-up, `0` with no entries. Entries keep insertion
+order (a `Vec`, not a `HashMap`), which is what the TS `Map` iteration order
+gives.
+
+Each touched handle publishes exactly **one** value per envelope, not one per
+op, and an envelope that changes nothing publishes nothing. Handles whose store
+has left the tree are pruned against `StateTree::store_ids()`, which ends their
+subscriptions (BDR-0011 fresh-mount semantics; uploads are not resumable per
+BDR-0003). Streams need no equivalent — a collection node is freed with the
+store subtree that owns it. Unmounting the root clears the whole registry.
+
+Both are **recorded**, not merely emptied, exactly as `Mounted::events()`
+records its own closure: a subscription taken *after* a prune or a teardown
+is an already-ended stream, never one waiting on a publish that can no longer
+come. The record lives on the registry as well as on the cell, because a
+retained `Upload` and a fresh `Mounted::upload(…)` fail differently — the
+first still holds the closed cell, while the second asks a registry that no
+longer has one and would otherwise be handed a brand-new open one. A pruned
+store's tombstone lifts the moment the store is back in the index, so a store
+that comes and goes gets a live handle each time it returns.
+
+Types are the wire types: `UploadOp` is a `#[serde(tag = "op")]` enum over the
+seven variants with `error.ref` optional, `UploadAccept` is
+`Any | Extensions(Vec<String>)`, and `UploadErrorCode` is an **open** enum —
+`too_large | too_many_files | not_accepted | chunk_timeout | chunk_too_large |
+external_failed | preflight_rejected | internal`, with `Other(String)` for
+anything a newer server adds — the same union `docs/uploads.md` documents, over
+a TS type that is open too (`(string & {})`).
+
+`upload_ops` decodes **element by element**: an op whose `op` tag (or whose
+`entry.status`) this build does not know is logged and skipped, not failed. One
+unknown upload delta must not take the state `ops`, `stream_ops` and `events`
+travelling in the same envelope with it and gap the root's version;
+`applyOps` in `packages/client/src/uploads.ts` is a `switch` with no `default`,
+so it already drops exactly these ops and applies the rest.
+
+`UploadStatus` (`idle|selecting|uploading|success|error|cancelled`) is
+**never written by an op** — it is driven by the client's own
+`select`/`start`/`cancel`/`reset` (§10.2). `cancelled` is reserved on both
+clients: neither ever assigns it to a handle or an entry, because `cancel`
+deletes the entry.
+
+### 10.2 Control plane
+
+`crates/musubi-client/src/uploads/transfer.rs`. Four `async` methods on the same
+`Upload` the data plane hands out, so an app never holds two objects for one
+upload:
+
+```rust,ignore
+let entries = avatar.select(vec![UploadFile::new("me.png", "image/png", bytes)]).await?;
+avatar.start().await?;                  // every entry, concurrently
+avatar.cancel(Some(&entries[0].r#ref)).await?;
+avatar.reset().await?;
+```
+
+`UploadFile` is bytes plus client metadata (`name`, `content_type`); the crate
+is runtime-free, so **the embedder reads the file** and `client_size` is
+`bytes.len()` — a size disagreeing with the bytes would strand the transfer,
+since channel-mode completion is `bytes_written >= client_size`. A streaming
+chunk provider is a later addition; nothing in the wire contract depends on the
+whole file being resident.
+
+**Where the pushes go.** Main-channel pushes (`allow_upload`, `cancel_upload`,
+`upload_progress`, `upload_error`) are routed through the connection actor as
+`ActorMsg::RootPush`, which owns the current channel incarnation — a handle
+pinning a `Channel` would push into one that recovery has replaced. That
+message is subsystem-agnostic: it answers with the raw push outcome, and the
+upload control plane maps it onto `TransferError` itself, so nothing about
+uploads is baked into the actor. Chunk sub-channels are opened straight on the
+`PhoenixSocket`: they are per-entry, short-lived, and the actor has no business
+tracking them. External-mode progress is **coalesced** rather than relayed
+report-for-report: `UploadProgress::report` overwrites a single pending value,
+and a relay driven on the caller's own task (no spawner) keeps at most one
+`upload_progress` push in flight, awaiting its reply before sending the newest
+value recorded meanwhile. That is deliberate — it is the only producer in this
+client whose rate an app controls, and an unthrottled one starves the socket
+read loop into a spurious reconnect mid-upload. The transfer's outcome is a
+barrier in the same relay: the final `100` (or `upload_error`) is pushed last,
+detached, since nothing follows it and a transfer must not hang on an
+acknowledgement no one reads. A failure discards progress the relay has not
+sent yet — the server moves an entry it already failed back to `uploading` for
+one — and a cancelled entry relays nothing at all, not even the `100`.
+
+**Preflight.** `select` sets `status = selecting`, clears the handle's errors,
+and pushes `allow_upload` with one offered entry per file, `client_ref` being
+the file's index. The reply carries the live `config`, the accepted entries
+keyed by `client_ref`, and one error per rejected file; rejections become
+handle-level errors and produce no entry and no op at all, so a partially
+rejected selection still ends in `status = error`. Entries are seeded in
+selection order (the reply's map is sorted by `client_ref`) and merge with the
+`{op: add}`s that arrive **after** the reply (BDR-0009) — whichever lands
+first, there is exactly one entry.
+
+A preflight that does not finish leaves the handle in `status = error`, never
+in `selecting`: a rejected push, a timeout, a disconnect, a malformed reply, or
+the `select` future simply being dropped. The caller gets the `Err`, but it is
+rarely the only one watching — a spinner bound to `status` would otherwise
+never resolve — so the transition is a guard's `Drop` rather than code on the
+error path. An accepted entry keyed by a `client_ref` this call never offered
+is a `Protocol` error rather than a silently skipped entry: there is no file to
+transfer and no entry for an error to attach to, and a reply made only of those
+would finish with no entries, no errors and a handle still reading `selecting`.
+
+**Starting.** `start` transfers each entry **once**. A terminal outcome —
+success, failure, cancellation, or the `start` future being dropped — consumes
+the entry's transport state, so a later `start` moves only what is still
+outstanding. Without that a repeat call replays the transfer: the preflight
+token verifies statelessly inside its 600s window and the server opens a fresh
+temp file per join, so every replay orphans the file before it. A second
+`start` while one is running is refused with `TransferError::AlreadyStarted`
+rather than racing it — both would join `musubi_upload:<ref>`, and attaching
+replaces the socket's registry entry and bumps the generation, so the loser is
+disconnected, its pushes go stale, and its cleanup clears the channel the
+winner is still using.
+
+**Channel mode (BDR-0026).** `phoenix-channel` gained serializer v2 binary
+framing for this: `BinaryPush` (kind `0`, four length-prefixed header fields,
+then the payload verbatim) and `Channel::push_binary`. Only the client→server
+push layout is modelled — the three server→client binary layouts have different
+headers and a Musubi server never sends one, since even a chunk's reply is a
+text `phx_reply`. Per entry: join `musubi_upload:<entry_ref>` with the
+stateless preflight token, then push `config.chunk_size` slices
+**sequentially**, each awaiting its `{"progress": n}` ack. Entries run
+concurrently with each other (`join_all` on the caller's task — no spawner
+involved). There is no `"close"` event: the server completes on
+`bytes_written >= client_size`, replies `100`, and stops the channel; the
+authoritative signal is the `{op: complete}` on the main channel, and the
+per-chunk reply is only an ack. The sub-channel is **always** left afterwards —
+success, rejection or cancellation — because a channel left registered would be
+rejoined by the socket's own recovery, and with a token still inside its 600s
+window that would open a second upload of the same entry.
+
+One deliberate divergence: an **empty file** is sent as one empty chunk. The TS
+client's `offset < size` loop sends nothing at all, and the server then waits
+for the chunk-timeout watchdog; one empty chunk completes it immediately, and
+the server accepts it (`0 >= 0`).
+
+**External mode (BDR-0027).** `ConnectionBuilder::uploader(name, impl Uploader)`
+builds a registry the server's `uploader` string dispatches against; a name this
+connection never registered fails the entry with `TransferError::NoUploader`
+rather than falling back to channel mode. The trait is runtime-agnostic:
+
+```rust,ignore
+pub trait Uploader: Send + Sync + 'static {
+    fn upload(&self, request: UploadRequest) -> BoxFuture<'static, Result<(), UploaderError>>;
+}
+```
+
+`UploadRequest` carries the entry snapshot, the bytes, the opaque `meta` from
+`upload_external/3`, an `UploadProgress` sink and a `CancelSignal` (pollable
+with `is_cancelled()`, or `select!`-able on `cancelled()`). The app does the PUT
+itself — the crate ships no HTTP client. On success the client reports
+`progress: 100`, which is what makes the server emit `{op: complete}`; on
+failure it pushes `upload_error` with `code: "external_failed"` and the
+uploader's message, then returns `TransferError::Uploader`.
+
+**Cancellation.** `cancel(Some(ref) | None)` raises the entry's `CancelSignal`,
+leaves its sub-channel — which is what makes the server delete the partial file
+— and pushes `cancel_upload` per entry, sequentially. The handle's own status is
+untouched: the server answers with `{op: cancel}`, which *deletes* the entry, so
+there is no cancelled state to observe. `reset` cancels everything, clears the
+entries and errors, and returns the handle to `idle`.
+
+Raising the signal is **every** retirement path's job, not just this one's. A
+transfer clones the bytes, the mode and the signal before its first await and
+holds an `Arc` of the cell, so deleting the transport entry does not stop it:
+the server-driven `{op: cancel}` / `{op: reset}`, a prune, and the root's own
+teardown all abort through the same helper, which raises the signal and leaves
+the sub-channel before removing. Aborting a request already in flight is the
+entire purpose of `CancelSignal` — without it an external-mode transfer runs to
+completion and the file lands in the destination bucket after the user
+cancelled it or navigated away. Two windows are closed alongside it: a
+preflight whose reply lands *after* its cell was retired is refused rather than
+re-populating it (`Unmounted`), and a sub-channel opened after its entry was
+already removed is left immediately, since nothing else knows it exists.
+
+**Failures.** Upload-specific ones are `TransferError` (`Rejected`, `Chunk`,
+`Cancelled`, `AlreadyStarted`, `NoUploader`, `Uploader`), reached through
+`MusubiError::Transfer`; everything shared with the rest of the client stays on
+`MusubiError` (`Join`, `Timeout`, `NotConnected`, `Disconnected`). `start`
+returns the first failure and ends the handle in `status = error` — which also
+covers an entry the *server* failed with `{op: error}`, where no transfer here
+returned anything.
+
+**Recovery.** On `soft_reset`, a rejoin or a version gap the handles are
+**kept**, matching the TS client. Uploads are not resumable (BDR-0003): an
+in-flight entry the server dropped is only cleared once its store leaves the
+index or the server emits a `reset`, and a transfer that was running fails on
+its own push — disconnected, or the push timeout — rather than being retried.
+
+**Two deliberate divergences from the reference client.** Both are gaps in
+`packages/client/src/uploads.ts` rather than port regressions, and both are
+fixed here rather than reproduced. First, its op-driven cancel
+(`uploads.ts:330-334`) deletes the internal entry without touching the entry's
+`abortController`, while its own client-driven `cancel()` (`:229-231`) does
+abort — so a server-driven cancellation does not stop a transfer in flight.
+Second, its `select` (`:103-107`) sets `status = "selecting"` and can then
+throw without writing a status, while its `start()` (`:211-213`) catches and
+sets `error` — the same asymmetry. The Rust client raises cancellation on every
+retirement path and fails the handle on every preflight exit; the TypeScript
+client should follow.
+
+**Not supported.** The crate reads no files and streams nothing off disk: you
+hand it an `UploadFile`, so entry bytes are held in memory for the duration of
+the transfer. Size is bounded by the store's `max_file_size` declaration, which
+the server enforces at preflight.
+
+---
+
+## 11. Error taxonomy
+
+```rust
+pub enum MusubiError {
+    /// Socket/IO level: connect failed, frame decode failed, socket closed.
+    Transport(TransportError),
+    /// Channel join rejected by the server. `reason` is the server string:
+    /// "unauthorized", "params must be a map", "missing required field",
+    /// "missing root id", "missing Musubi connection socket",
+    /// "missing Musubi socket", "declared store is not a root store",
+    /// "unknown root", "internal error".
+    Join { topic: String, reason: String },
+    /// Join or push exceeded its timeout.
+    Timeout,
+    /// No channel, or version == 0 (mid-reconnect) at dispatch time.
+    NotConnected,
+    /// Envelope failed version continuity; recovery has been initiated.
+    VersionMismatch,
+    /// Root was unmounted (or dropped) with work in flight.
+    Unmounted,
+    /// disconnect() was called with work in flight.
+    Disconnected,
+    /// Envelope violated the contract: bad discriminator, root_id mismatch,
+    /// unsupported op, bad pointer, initial version != 1.
+    Protocol(&'static str),
+    /// RFC 6902 application failure.
+    Patch(PatchError),
+    /// The wire tree did not match the generated types — i.e. codegen drift.
+    Decode { store_id: StoreId, source: serde_json::Error },
+    /// Command outcome.
+    Command(CommandError),
+}
+
+pub enum CommandError {
+    Failed { command: &'static str, store_id: StoreId, reply: Value, code: Option<String> },
+    Timeout { command: &'static str, store_id: StoreId },
+}
+```
+
+Rules:
+
+- `MusubiError` implements `std::error::Error` and is `#[non_exhaustive]`;
+  `Display`/`Error`/`From` impls come from `thiserror` derives, not
+  hand-written boilerplate.
+- Error identity is by variant, not by string matching (the TS client matches
+  on `name == "MusubiCommandError"` only because of cross-module realm issues;
+  Rust has no such problem).
+- `Decode` is the one variant that almost always means "the generated file and
+  the server disagree". It carries the offending `store_id` and is logged at
+  `error!` with the pointer, because a silent partial state is worse than a
+  loud stall. A decode failure of the **root** state fails the envelope and
+  enters recovery (§9); the tree is not advanced.
+- Reason strings from the server are propagated verbatim and never parsed into
+  variants — the server's reason list is not a stability contract.
+
+---
+
+## 12. Test strategy
+
+No live-server tests in v1. Three layers:
+
+1. **Wire fixtures captured from the Elixir suite.** One mechanism, not two:
+   `mix musubi.capture_wire` drives the connection-channel harness and writes
+   one JSON file per scenario to
+   `crates/musubi-client/tests/fixtures/<scenario>.json`:
+
+   ```json
+   {
+     "scenario": "stream_limit_variants",
+     "frames": [{"dir": "in" | "out", "event": "phx_reply", "payload": { }}],
+     "expected_state": { }
+   }
+   ```
+
+   `dir` is relative to the client (`in` = server→client). Fixtures are checked
+   in; the regenerate-and-diff CI job in §12.4 fails the build when a
+   server-side wire change makes them stale.
+
+   The harness — endpoint, `Musubi.Socket`, fixture root stores, recorder,
+   scenario list — lives in `test/support/wire_capture/`, and so does the task
+   itself (`test/support/mix/tasks/musubi.capture_wire.ex`): the
+   stores it drives are test-only and must not ship in the Hex tarball. The
+   same modules back `test/musubi/transport/connection_channel_test.exs`, which
+   is what "one mechanism" means here. `test/musubi/wire_capture_test.exs`
+   covers the frame schema, the canonical encoding, and that the checked-in
+   files match what the current server emits.
+
+   **Replay.** `crates/musubi-client/tests/fixtures.rs` drives every fixture
+   back through a real `Connection` over the layer-3 `MockSocket`, so the two
+   halves meet: capture is the server's story, replay is the client's. Per
+   fixture, in recorded order —
+
+   - an `out` frame is **not** injected. It names the call the client is
+     expected to make — `mount`, `command_on`, `Upload::select` / `start` /
+     `cancel`, or dropping the last `Mounted` — and the frame the client
+     actually writes must equal it: event, payload and topic, in that position
+     of the sequence. A mount takes the store marker whose `MODULE` matches the
+     recorded join, and a command the payload marker whose `NAME` matches, i.e.
+     exactly the types `mix compile.musubi_rust` emits; `State` is a
+     `serde_json::Value`, because layer 1's subject is the wire tree and not
+     one generated struct's field set.
+   - an `in` frame is fed in verbatim: a `phx_reply` answers the oldest
+     unanswered push, a `"patch"` rides the join.
+   - afterwards the root's snapshot must equal `expected_state`. That is what
+     makes the pass non-circular: the document is the **server's**, authored by
+     `Musubi.Page.Server`, and the client has to reach it by applying only what
+     the fixture delivered.
+
+   The fixture directory is enumerated at run time rather than listed in the
+   suite, so a scenario added to `Scenarios.all/0` is replayed the moment it is
+   captured.
+
+   Contract details worth pinning:
+
+   - **`expected_state` is the server's own wire root** after the scenario's
+     last *delivered* envelope — `Musubi.Page.Server.State.previous_wire_root`,
+     read off the page server rather than replayed from the very ops under
+     test. It is therefore the document a client's patch engine must hold
+     **before hydration**: stream slots are still `{"__musubi_stream__": …}`
+     markers and upload slots still `{"__musubi_upload__": …}`, because stream
+     and upload contents arrive out of band in `stream_ops` / `upload_ops`.
+     Materialization is layer 2's subject.
+   - **Determinism.** Output is canonical JSON (sorted keys at every depth,
+     two-space indent, trailing newline). Server-issued upload entry refs are
+     minted from `:crypto.strong_rand_bytes/1`, so they are renumbered
+     `u_0001`, `u_0002`, … in first-appearance order. Phoenix's `ref` /
+     `join_ref` counters are not recorded at all. The fixture stores render no
+     timestamps, pids or random ids. Two consecutive captures are byte-identical,
+     which is what makes §12.4's `git diff --exit-code` gate meaningful.
+   - **No binary frames.** The upload *control* plane (`allow_upload`,
+     `upload_progress`, `cancel_upload`) rides the connection channel as JSON
+     and is captured. Channel-mode chunk transfer rides `musubi_upload:<ref>`
+     with raw binary `"chunk"` payloads, which this frame schema cannot
+     express; the upload fixtures therefore use **external-uploader** mode,
+     which also avoids capturing a signed (and so per-run) token. Extending the
+     schema to carry binaries is a separate decision, not made here.
+   - **`version_gap` is captured, not synthesized.** Every frame in it is
+     server-authored; the recorder simply drops one delivered patch, which is
+     exactly what a lost push looks like on the wire. Its `expected_state` is
+     pinned to the state before the gap, because the client must reject the
+     gapped envelope and keep its last good document.
+   - **The replay hydrates before comparing.** `expected_state` is the
+     server's pre-hydration wire root; what the client reads back through
+     `mounted.state().value::<Value>()` is the tree's hydrated projection, and
+     the only difference is the stream slots. The suite therefore substitutes
+     each marker with the array that scenario's `stream_ops` materialize to,
+     hand-derived from `packages/client/src/streams.ts` — the behavioural
+     reference — rather than from this crate's own reconciliation, so the two are
+     still being compared and not merely restated. Upload slots are compared as
+     the inert markers they stay. A fixture store declares
+     `State = serde_json::Value`, so that `value()` is a total function there.
+   - **Two documented asymmetries**, both about frames that are not
+     server-authored state:
+     - `command_errors` contains one `command` frame with **no `name`**, pushed
+       by hand to record the server's malformed-frame reply. No typed client can
+       write it — the name is a `Command::NAME` const — so the replay skips that
+       frame and its reply, and every other frame still has to match.
+     - two scenarios end with client-side teardown the capture cannot contain:
+       a rejected join leaves nobody holding the root, so the root is torn down
+       and its channel left (nothing may rejoin an orphan, §9), and a version
+       gap leaves and re-joins. The replay pins those trailing frames per
+       scenario; every other scenario must write exactly what was recorded and
+       nothing more.
+
+   The 21 scenarios: `initial_mount`, `root_replace_on_rejoin`,
+   `mount_rejected_unknown_root`, `child_mount_unmount`, `version_gap`,
+   `command_noreply_replace`, `command_reply_no_patch`,
+   `command_add_remove_ops`, `command_errors`, `stream_reset`,
+   `stream_insert`, `stream_delete`, `stream_at_variants`,
+   `stream_limit_variants`, `async_loading_ok`, `async_loading_failed`,
+   `event_only_cycle`, `upload_preflight_ok`, `upload_preflight_rejected`,
+   `upload_progress_complete`, `upload_cancel`.
+2. **Pure-unit golden tests**, table-driven, mirroring
+   `test/musubi/codegen/type_script/type_renderer_test.exs` in style:
+   - Patch layer: op allowlist rejection (`move`/`copy`/`test` ⇒
+     `UnsupportedOp`) in `src/envelope.rs`, `TreeError` mapping and atomicity on
+     mid-envelope failure in `src/engine.rs`. Pointer semantics themselves —
+     token unescaping, the array-index rules — are `musubi-state`'s own unit
+     tests, on top of what the wire fixtures exercise.
+   - Stream materialization, now keyed collection reconciliation: the full
+     `at` × `limit` matrix, including the upsert-then-position ordering,
+     `at == 0` trims from the end vs everything else trims from the front,
+     `limit == 0`, and `limit == null` — plus item identity surviving a
+     `reset: true` refresh. In `musubi-state`.
+   - `AsyncResult` deserialization incl. `Opaque` reasons and nested markers.
+   - The two projections (hydrated and wire): markers at every nesting depth,
+     inside arrays, inside async results, and marker-lookalikes (an object with
+     `__musubi_stream__` **plus** another key is *not* a stream slot). In
+     `musubi-state`.
+   - Semantic equality and notification: every row of
+     `docs/rust-reactive-state.md` §9. In `musubi-state`.
+3. **Protocol tests over a scripted transport.** A `MockSocket` implementing
+   `Socket` plus a `ManualTimer` implementing `Timer` — both in the shared rig
+   at `crates/phoenix-channel/tests/common/mod.rs`, which the `musubi-client`
+   suite includes by path — give deterministic
+   coverage of: join/rejoin, join failure reasons, generation guarding,
+   duplicate mount aliasing, drop-at-refcount-0 teardown,
+   version-mismatch recovery (including re-join failure ⇒ keep last good),
+   bulk command rejection on each teardown path, a command reply that is not
+   gated on the patch it caused, heartbeat timeout, and refcount-0 close.
+
+Elixir side: a `Musubi.Codegen.Rust.TypeRenderer` table test cloned from the TS
+one, plus a golden-bundle test over the existing `test/support/typespec_probe.ex`
+fixtures (which already cover streams, `AsyncResult.of(stream(...))`,
+union-of-maps, `Child.state()`, `list(String.t())`, uploads, commands with and
+without payloads, and events).
+
+Not covered: an integration test booting the Elixir example app and driving a
+real socket. The captured fixtures stand in for it, and they are regenerated
+from the live server rather than hand-written.
+
+### 12.4 CI jobs
+
+`.github/workflows/ci.yml` carries a `rust` job (the gpui example stays out of
+CI):
+
+| Job | Command |
+|---|---|
+| test (stable) | `cargo test --workspace` — which includes the layer-1 fixture replay, so a checked-in fixture the client can no longer satisfy fails here |
+| test (MSRV) | the same on toolchain `1.85` — this is the check §1.4 refers to |
+| format | `cargo fmt --all --check` |
+| lint | `cargo clippy --workspace --all-targets -- -D warnings` |
+| runtime-free core | `cargo check` + `cargo tree -i tokio` matching nothing, for **both** `musubi-client` and `musubi-state` (the gpui embedder's configuration) |
+| codegen smoke test | `mix test --only rust` after the cargo tests, on both toolchain legs — the `docs/rust-codegen.md` §6.5 `cargo check` over the rendered probe bundle, which needs both the BEAM and a Rust toolchain and therefore lives here rather than in the Elixir job |
+| fixture drift | `mix musubi.capture_wire`, then `git add --intent-to-add` + `git diff --exit-code` over `crates/musubi-client/tests/fixtures` — a step of the **Elixir** `test` job, not this one, since it needs the BEAM. The `--intent-to-add` is what makes a brand-new scenario's untracked file count as drift. `mix test` asserts the same gate |
+
+---
+
+## 13. Versioning and compatibility
+
+- Pre-1.0, unpublished (§1.3). The crates ship inside the Hex tarball, so
+  **their version is the Hex `musubi` version** — one stream, no pairing table
+  needed. Each crate's `Cargo.toml` `version` is bumped with the Hex release.
+- Any change to the frames in §3–§8 is a breaking change to this crate,
+  regardless of Rust-level semver, and gets a `CHANGELOG` "Wire" heading.
+- The generated file is **not** versioned independently: it is regenerated by
+  the consumer's `mix compile.musubi_rust`, and `--check` in the consumer's CI
+  is what catches drift — exactly the TS story. Since the generated file and
+  the crate both come from the same fetched `deps/musubi`, they cannot skew.
+
+Version-skew enforcement (`MUSUBI_PROTOCOL` consts, wire protocol versions)
+becomes relevant only if the crates are ever published to crates.io, and is not
+implemented.

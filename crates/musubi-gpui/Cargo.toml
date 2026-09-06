@@ -1,0 +1,46 @@
+[package]
+name = "musubi-gpui"
+description = "The gpui adapter for musubi-state: per-view subscription plumbing and an incremental ListState driver"
+version = "0.13.1"
+edition = "2024"
+# Matches musubi-state's MSRV; gpui 0.2.2 declares no `rust-version` and is
+# edition 2024, so 1.85 is the floor for both.
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/fahchen/musubi"
+authors = ["Phil Chen"]
+publish = false
+
+# Detached from the repo-root Cargo workspace on purpose
+# (`docs/rust-reactive-state.md` §5.1). The root manifest excludes this
+# directory and this table stops cargo walking up to it; both halves are needed,
+# or gpui enters the root `Cargo.lock` and `cargo test --workspace` starts
+# building it. Same precedent as `examples/chat_room/desktop`.
+[workspace]
+
+[dependencies]
+# The only Musubi dependency, and deliberately the only one: this crate never
+# depends on `musubi-client`, so gpui cannot reach the client's dependency graph
+# even transitively (§5.1). `to_view` is generic over the notified *value* and
+# never over the handle, which is what lets the client's own out-of-tree handles
+# (`StatusState`, `Upload`) use it from the other side of that line.
+musubi-state = { path = "../musubi-state" }
+
+# UI. crates.io, Apache-2.0, the same pin `examples/chat_room/desktop` and
+# gpui-component 0.5.1 already agree on. Default features, for the same feature
+# unification reason `docs/rust-gpui-example.md` records.
+gpui = "0.2.2"
+
+# The bridge itself. A subscription callback is `Send + Sync` and runs on the
+# actor thread; gpui's `ForegroundExecutor` and `AsyncApp` are `!Send` and its
+# entities are thread-affine, so the hop cannot be "capture the context and
+# schedule" — it is "send the value down a channel the foreground drains".
+# `futures-channel` for that channel, `futures-util` for `StreamExt::next`.
+futures-channel = "0.3"
+futures-util = "0.3"
+
+[dev-dependencies]
+# The same crates.io gpui with its in-process test platform and
+# `TestAppContext`; `cargo build` links neither the feature nor what it pulls.
+gpui = { version = "0.2.2", features = ["test-support"] }
+serde_json = "1"

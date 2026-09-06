@@ -311,6 +311,6 @@ defmodule CartStore do
 end
 ```
 
-On the client, `page.lines[i].attachment` is an `UploadHandle`
+On the client, `store.lines[i].attachment` is an `UploadHandle`
 specific to that line; the server keeps `store_id: ["lines",
 "line-N"]` on every emitted op.

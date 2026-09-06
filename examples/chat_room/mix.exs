@@ -7,7 +7,7 @@ defmodule ChatRoom.MixProject do
       version: "0.1.0",
       elixir: "~> 1.19",
       start_permanent: false,
-      compilers: Mix.compilers() ++ [:musubi_ts],
+      compilers: Mix.compilers() ++ [:musubi_ts, :musubi_rust],
       aliases: aliases(),
       deps: deps()
     ]
@@ -33,15 +33,24 @@ defmodule ChatRoom.MixProject do
   defp aliases do
     [
       server: ["deps.get", "run --no-halt"],
-      ui: [&ui_setup/1, &ui_dev/1]
+      ui: [&ui_setup/1, &ui_dev/1],
+      desktop: [&desktop_run/1]
     ]
   end
 
-  defp ui_setup(_args), do: ui_cmd!("pnpm install")
-  defp ui_dev(_args), do: ui_cmd!("pnpm dev")
+  defp ui_setup(_args), do: cmd!("pnpm install", "ui")
+  defp ui_dev(_args), do: cmd!("pnpm dev", "ui")
 
-  defp ui_cmd!(command) do
-    case Mix.shell().cmd(command, cd: "ui") do
+  # `cargo run` resolves and builds on its own, so there is no `cargo fetch`
+  # step. A cold cache compiles gpui from source: expect a minute or two the
+  # first time, seconds afterwards.
+  defp desktop_run(_args) do
+    Mix.shell().info("Building the gpui client; the first run compiles gpui (~1-2 minutes).")
+    cmd!("cargo run", "desktop")
+  end
+
+  defp cmd!(command, dir) do
+    case Mix.shell().cmd(command, cd: dir) do
       0 -> :ok
       status -> Mix.raise("`#{command}` exited with status #{status}")
     end

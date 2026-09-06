@@ -1,0 +1,111 @@
+{
+  "expected_state": {
+    "__musubi_store_id__": [],
+    "child": {
+      "__musubi_store_id__": [
+        "child"
+      ],
+      "label": "random"
+    },
+    "current_user": "connect-user",
+    "room_id": "random"
+  },
+  "frames": [
+    {
+      "dir": "out",
+      "event": "phx_join",
+      "payload": {
+        "id": "alpha-1",
+        "module": "Musubi.WireCapture.Stores.AlphaRootStore",
+        "params": {
+          "room_id": "general"
+        }
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {
+          "root_id": "Musubi.WireCapture.Stores.AlphaRootStore:alpha-1"
+        },
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 0,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "",
+            "value": {
+              "__musubi_store_id__": [],
+              "child": {
+                "__musubi_store_id__": [
+                  "child"
+                ],
+                "label": "general"
+              },
+              "current_user": "connect-user",
+              "room_id": "general"
+            }
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.AlphaRootStore:alpha-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 1
+      }
+    },
+    {
+      "dir": "out",
+      "event": "command",
+      "payload": {
+        "name": "rename",
+        "payload": {
+          "room_id": "random"
+        },
+        "store_id": []
+      }
+    },
+    {
+      "dir": "in",
+      "event": "phx_reply",
+      "payload": {
+        "response": {},
+        "status": "ok"
+      }
+    },
+    {
+      "dir": "in",
+      "event": "patch",
+      "payload": {
+        "base_version": 1,
+        "events": [],
+        "ops": [
+          {
+            "op": "replace",
+            "path": "/room_id",
+            "value": "random"
+          },
+          {
+            "op": "replace",
+            "path": "/child/label",
+            "value": "random"
+          }
+        ],
+        "root_id": "Musubi.WireCapture.Stores.AlphaRootStore:alpha-1",
+        "stream_ops": [],
+        "type": "patch",
+        "upload_ops": [],
+        "version": 2
+      }
+    }
+  ],
+  "scenario": "command_noreply_replace"
+}

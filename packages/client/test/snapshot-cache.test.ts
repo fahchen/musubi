@@ -198,6 +198,55 @@ describe("snapshot cache invalidation", () => {
     expect(Object.is(snapA1, snapA2)).toBe(false)
     expect(snapA2).toMatchObject({ items: [{ id: "1", label: "fresh" }] })
   })
+
+  // Upload ops mutate the handle in place — no JSON patch op ever touches the
+  // owning store's node — so the snapshot cache has to be invalidated off the
+  // upload ops themselves. Otherwise `notifySubscribers` reports the store as
+  // upload-touched while `snapshot()` hands back the identical object and
+  // `useSyncExternalStore` skips the re-render.
+  test("invalidates upload owner snapshots and their ancestors", async () => {
+    const { channel, connection } = await mountTestRoot()
+
+    channel.emit(
+      "patch",
+      connectionEnvelope("Test.Root:root", 1, 2, [], [], [
+        {
+          op: "add",
+          upload: "avatar",
+          store_id: ["a"],
+          ref: "entry-1",
+          entry: {
+            ref: "entry-1",
+            client_name: "avatar.png",
+            client_size: 1024,
+            client_type: "image/png",
+            progress: 0,
+            status: "pending",
+            errors: []
+          }
+        }
+      ])
+    )
+
+    const root1 = snapshotStore(connection, [])
+    const snapA1 = snapshotStore(connection, ["a"])
+
+    expect(snapA1).toMatchObject({ avatar: { progress: 0 } })
+
+    channel.emit(
+      "patch",
+      connectionEnvelope("Test.Root:root", 2, 3, [], [], [
+        { op: "progress", upload: "avatar", store_id: ["a"], ref: "entry-1", progress: 50 }
+      ])
+    )
+
+    const root2 = snapshotStore(connection, [])
+    const snapA2 = snapshotStore(connection, ["a"])
+
+    expect(Object.is(root1, root2)).toBe(false)
+    expect(Object.is(snapA1, snapA2)).toBe(false)
+    expect(snapA2).toMatchObject({ avatar: { progress: 50 } })
+  })
 })
 
 async function mountTestRoot(): Promise<{
@@ -248,7 +297,8 @@ function connectionEnvelope(
   baseVersion: number,
   version: number,
   ops: PatchEnvelope["ops"],
-  streamOps: PatchEnvelope["stream_ops"]
+  streamOps: PatchEnvelope["stream_ops"],
+  uploadOps: PatchEnvelope["upload_ops"] = []
 ): ConnectionPatchEnvelope {
   return {
     type: "patch",
@@ -257,7 +307,7 @@ function connectionEnvelope(
     version,
     ops,
     stream_ops: streamOps,
-    upload_ops: [],
+    upload_ops: uploadOps,
     events: []
   }
 }
@@ -274,6 +324,9 @@ function rootState(): Record<string, unknown> {
       },
       items: {
         __musubi_stream__: "items"
+      },
+      avatar: {
+        __musubi_upload__: "avatar"
       }
     },
     b: {

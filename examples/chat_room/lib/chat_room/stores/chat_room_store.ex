@@ -18,10 +18,16 @@ defmodule ChatRoom.Stores.ChatRoomStore do
     * `cancel_async/2` from `terminate/2` to abandon in-flight tasks
     * `Phoenix.PubSub.subscribe/2` inside root `mount/2` (BDR-0005:
       application-owned PubSub) and `handle_info/2` dispatch
+    * `upload :attachment` in channel mode plus the `attach` command that
+      consumes it (`docs/uploads.md`): the entry's temp file is moved into an
+      application-owned agent and announced as an ordinary chat message, so
+      the upload leaves the transfer plane entirely once it lands
   """
 
   use Musubi.Store, root: true
 
+  alias ChatRoom.AttachmentState
+  alias ChatRoom.Attachments
   alias ChatRoom.Chat
   alias ChatRoom.MessageState
   alias ChatRoom.OnlineUser
@@ -69,6 +75,24 @@ defmodule ChatRoom.Stores.ChatRoomStore do
 
     reply do
       field :queued, boolean()
+    end
+  end
+
+  # Declared outside `state do` (docs/uploads.md): the framework injects the
+  # `{"__musubi_upload__": "attachment"}` marker into the render output and
+  # drives the handle over `upload_ops`, so no field here composes upload
+  # state by hand. No `upload_external/3` callback is defined, which is what
+  # keeps the entry in channel mode — chunks ride `musubi_upload:<ref>`.
+  upload(:attachment,
+    accept: ~w(.png .jpg .jpeg .gif .txt .md),
+    max_entries: 1,
+    max_file_size: 2_000_000
+  )
+
+  command :attach do
+    reply do
+      field :attached, boolean()
+      field :name, String.t() | nil
     end
   end
 
@@ -148,6 +172,38 @@ defmodule ChatRoom.Stores.ChatRoomStore do
      start_async(socket, :send_message, fn ->
        Chat.send_message(room_id, sender, body)
      end)}
+  end
+
+  # The `docs/uploads.md` completion path. `consume_uploaded_entries/3` may
+  # only run inside a command handler; in channel mode it hands over
+  # `%{path: ...}` for a temp file the runtime deletes as soon as this returns,
+  # so the bytes move into the application-owned agent *here*. Consuming the
+  # last completed entry empties the index, which emits `{op: reset}` and
+  # returns every client's handle to idle.
+  @impl Musubi.Store
+  def handle_command(:attach, _payload, socket) do
+    room_id = socket.assigns.room_id
+    sender = socket.assigns.current_user.name
+
+    {socket, attachments} =
+      consume_uploaded_entries(socket, :attachment, fn %{path: path}, entry ->
+        {:ok, Attachments.put(entry.client_name, entry.client_type, File.read!(path))}
+      end)
+
+    # The row reaches every client — this one included — over the same PubSub
+    # broadcast a typed message takes, so `handle_info/2` does the
+    # `stream_insert/4` and the reply carries no state (BDR-0009).
+    Enum.each(attachments, fn %AttachmentState{name: name} = attachment ->
+      Chat.send_message(room_id, sender, "shared " <> name, attachment)
+    end)
+
+    reply =
+      case attachments do
+        [] -> %{"attached" => false, "name" => nil}
+        [%AttachmentState{name: name} | _rest] -> %{"attached" => true, "name" => name}
+      end
+
+    {:reply, reply, socket}
   end
 
   @spec normalize_name(String.t(), String.t()) :: String.t()

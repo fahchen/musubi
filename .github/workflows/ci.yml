@@ -107,3 +107,136 @@ jobs:
 
       - name: Run tests
         run: mix test
+
+      # docs/rust-client.md §12.4: re-record the Rust client's wire fixtures
+      # and fail if a server-side change made the checked-in ones stale. This
+      # is a step of the Elixir job rather than a job of its own because it
+      # needs the BEAM, and this one already has it.
+      #
+      # `--intent-to-add` first: a brand-new scenario writes an untracked file,
+      # which a plain `git diff` would not see — and the Rust replay suite
+      # cannot see it either, since it never reached the repository.
+      - name: Wire fixture drift
+        if: ${{ matrix.lint }}
+        run: |
+          mix musubi.capture_wire
+          git add --intent-to-add crates/musubi-client/tests/fixtures
+          git diff --exit-code crates/musubi-client/tests/fixtures
+
+  rust:
+    name: Rust (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Edition 2024 needs 1.85; the MSRV leg is the check
+          # `docs/rust-client.md` §1.4 refers to.
+          - toolchain: stable
+            lint: lint
+          - toolchain: "1.85"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: ${{ matrix.lint }}
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        if: ${{ matrix.lint }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `musubi-client` and `musubi-state` must stay runtime-free: the gpui
+      # embedder drives them off its own executor, so tokio may only reach the
+      # `musubi-client-tokio` crate (docs/rust-client.md §12.4,
+      # docs/rust-reactive-state.md §1.3).
+      - name: Runtime-free core
+        if: ${{ matrix.lint }}
+        run: |
+          cargo check -p musubi-client
+          cargo check -p musubi-state
+          ! cargo tree -p musubi-client -i tokio
+          ! cargo tree -p musubi-state -i tokio
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      # docs/rust-codegen.md §6.5: render the codegen bundle from the probe
+      # fixtures and `cargo check` it against `crates/musubi-client`. The test
+      # needs the BEAM to render and cargo to check — this job has cargo, so
+      # the Elixir setup lives here rather than shipping a Rust toolchain to
+      # the Elixir matrix. Runs on both legs: the generated surface must
+      # type-check under stable and the 1.85 MSRV alike.
+      - name: Setup BEAM (codegen smoke test)
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.3"
+          otp-version: "29.0"
+
+      - name: Restore deps + build cache (codegen smoke test)
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: rust-smoke-${{ runner.os }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            rust-smoke-${{ runner.os }}-
+
+      - name: Fetch deps (codegen smoke test)
+        run: mix deps.get
+
+      - name: Codegen compile smoke test
+        run: mix test --only rust
+
+  # `crates/musubi-gpui` is excluded from the root workspace and carries its own
+  # `[workspace]` and `Cargo.lock` (root `Cargo.toml`), so the `rust` job's
+  # `cargo test --workspace` never reaches it. Without a job of its own the
+  # adapter's suite would not run anywhere.
+  gpui:
+    name: gpui adapter (macOS)
+    # gpui links AppKit and compiles Metal shaders through `xcrun`, so this is
+    # the one leg that cannot be ubuntu. Pinned rather than `macos-latest`: the
+    # Xcode that shader build reaches for should not move under it.
+    runs-on: macos-14
+
+    defaults:
+      run:
+        working-directory: crates/musubi-gpui
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      # The detached workspace has to be named: the default would key on the
+      # root `Cargo.lock` and cache the root `target/`, neither of which this
+      # job touches. gpui is a heavy build and a cold one is the whole job
+      # budget, so the cache is not an optimization here.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/musubi-gpui
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test

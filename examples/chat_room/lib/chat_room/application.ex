@@ -8,6 +8,7 @@ defmodule ChatRoom.Application do
     children = [
       {Phoenix.PubSub, name: ChatRoom.PubSub},
       ChatRoom.Chat,
+      ChatRoom.Attachments,
       ChatRoom.Presence,
       ChatRoomWeb.Endpoint
     ]

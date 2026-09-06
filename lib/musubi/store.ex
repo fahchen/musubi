@@ -85,8 +85,9 @@ defmodule Musubi.Store do
   @doc """
   Initializes a freshly-mounted store socket.
 
-  This callback is kept for compatibility with pre-session stores. Prefer
-  `init/1` for child stores and `mount/2` for root-only client params.
+  The alternative spelling of `init/1`: a store defines one or the other, and
+  `init/1` wins when both are defined. Root-only client params arrive through
+  `mount/2`, which runs first.
   """
   @callback mount(socket :: Socket.t()) :: {:ok, Socket.t()}
 

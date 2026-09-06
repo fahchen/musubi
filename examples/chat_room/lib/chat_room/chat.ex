@@ -8,6 +8,7 @@ defmodule ChatRoom.Chat do
 
   use Agent
 
+  alias ChatRoom.AttachmentState
   alias ChatRoom.MessageState
 
   # Keep the example bounded: each room stores and sends at most the latest
@@ -53,18 +54,23 @@ defmodule ChatRoom.Chat do
   @doc """
   Stores and broadcasts a message for `room_id`.
 
+  `attachment` is `nil` for a typed message and an `AttachmentState` for the
+  row the `attach` command appends after consuming an upload entry.
+
   ## Examples
 
       ChatRoom.Chat.send_message("general", "Ada", "hello")
       #=> {:ok, %ChatRoom.MessageState{}}
   """
-  @spec send_message(String.t(), String.t(), String.t()) :: {:ok, MessageState.t()}
-  def send_message(room_id, sender, body)
+  @spec send_message(String.t(), String.t(), String.t(), AttachmentState.t() | nil) ::
+          {:ok, MessageState.t()}
+  def send_message(room_id, sender, body, attachment \\ nil)
       when is_binary(room_id) and is_binary(sender) and is_binary(body) do
     msg = %MessageState{
       id: "msg-" <> Integer.to_string(System.unique_integer([:positive])),
       body: body,
-      sender: sender
+      sender: sender,
+      attachment: attachment
     }
 
     Agent.update(__MODULE__, &store_message(&1, room_id, msg))

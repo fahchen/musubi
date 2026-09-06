@@ -1,0 +1,27 @@
+[package]
+name = "musubi-client"
+description = "Runtime-agnostic Musubi client core: transport, mount and reconnect, commands, events, uploads, and the retained state tree it drives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "musubi_client"
+
+[dependencies]
+futures-channel.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+musubi-state.workspace = true
+phoenix-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true

@@ -1,13 +1,17 @@
-defmodule Musubi.Codegen.TypeScript.ManifestTest do
+defmodule Musubi.Codegen.ManifestTest do
   use ExUnit.Case, async: true
 
-  alias Musubi.Codegen.TypeScript.Manifest
+  alias Musubi.Codegen.Manifest
   alias Musubi.TestSupport.TypespecProbe
   alias Musubi.TestSupport.TypespecProbeChild
+  alias Musubi.TestSupport.TypespecProbeWithAttrs
 
   setup do
     target =
-      Path.join(System.tmp_dir!(), "musubi_ts_manifest_#{:erlang.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "musubi_codegen_manifest_#{:erlang.unique_integer([:positive])}"
+      )
 
     File.mkdir_p!(target)
     on_exit(fn -> File.rm_rf!(target) end)
@@ -65,6 +69,24 @@ defmodule Musubi.Codegen.TypeScript.ManifestTest do
       assert [%{name: :msg}, %{name: :level}] = payload_fields
     end
 
+    test "carries declared attrs through the stamp/read round-trip", %{target: target} do
+      Manifest.stamp(TypespecProbeWithAttrs, "lib/a.ex", target)
+
+      assert [{TypespecProbeWithAttrs, data}] = Manifest.list(target)
+
+      assert [
+               %{name: :room_id, required: true},
+               %{name: :child, required: true},
+               %{name: :locale, required: false, default: "en"},
+               %{name: :since, required: false, default: no_default},
+               %{name: :filter, required: false}
+             ] = data.attrs
+
+      # `attr/3` stores the absent `default:` as a sentinel, so `nil` stays a
+      # legal declared default. It has to survive `term_to_binary/1`.
+      assert no_default == Musubi.DSL.Attr.no_default()
+    end
+
     test "returns [] for missing target dir", %{target: target} do
       File.rm_rf!(target)
       assert Manifest.list(target) == []
@@ -80,6 +102,18 @@ defmodule Musubi.Codegen.TypeScript.ManifestTest do
 
       entries = Manifest.list(target)
       assert [{TypespecProbe, _data}] = entries
+    end
+  end
+
+  describe "renderable_fields/1" do
+    test "preserves order and passes ordinary fields through untouched" do
+      fields = [
+        %{name: :b, type: quote(do: integer()), opts: []},
+        %{name: :__streams__, type: quote(do: map()), opts: []},
+        %{name: :a, type: quote(do: String.t()), opts: []}
+      ]
+
+      assert [%{name: :b}, %{name: :a}] = Manifest.renderable_fields(fields)
     end
   end
 
@@ -110,7 +144,7 @@ defmodule Musubi.Codegen.TypeScript.ManifestTest do
 
   describe "__after_compile__/2" do
     test "stamps modules whose source lives outside test/", %{target: target} do
-      Process.put(:__musubi_ts_target_dir__, target)
+      Process.put(:__musubi_codegen_target_dir__, target)
 
       env = %{TypespecProbe.__env__() | file: "/abs/lib/whatever/typespec_probe.ex"}
 
@@ -121,7 +155,7 @@ defmodule Musubi.Codegen.TypeScript.ManifestTest do
     end
 
     test "skips modules whose source lives under test/", %{target: target} do
-      Process.put(:__musubi_ts_target_dir__, target)
+      Process.put(:__musubi_codegen_target_dir__, target)
 
       env = %Macro.Env{module: TypespecProbe, file: "/abs/test/support/typespec_probe.ex"}
 
@@ -131,7 +165,7 @@ defmodule Musubi.Codegen.TypeScript.ManifestTest do
     end
 
     test "skips modules whose source lives in a top-level test/ file", %{target: target} do
-      Process.put(:__musubi_ts_target_dir__, target)
+      Process.put(:__musubi_codegen_target_dir__, target)
 
       env = %Macro.Env{module: TypespecProbe, file: "/abs/test/something_test.exs"}
 
@@ -140,10 +174,25 @@ defmodule Musubi.Codegen.TypeScript.ManifestTest do
       refute File.exists?(Path.join([target, inspect(TypespecProbe), "state.term"]))
     end
 
+    test "one stamp feeds both codegen targets", %{target: target} do
+      # The single-stamp design: `state.term` is target-neutral, so adding a
+      # renderer must never add a second `@after_compile`.
+      Process.put(:__musubi_codegen_target_dir__, target)
+
+      env = %{TypespecProbe.__env__() | file: "/abs/lib/typespec_probe.ex"}
+      Manifest.__after_compile__(env, "")
+
+      entries = Manifest.list(target)
+
+      assert [{TypespecProbe, _data}] = entries
+      assert Musubi.Codegen.TypeScript.render(entries) =~ ~s|"Musubi.TestSupport.TypespecProbe"|
+      assert Musubi.Codegen.Rust.render(entries) =~ "pub mod typespec_probe {"
+    end
+
     test "expands aliased module references against env.aliases", %{target: target} do
       # Stamp via the real env captured at TypespecProbe's compile time, but
       # rewrite the file path so the test/ filter doesn't skip the write.
-      Process.put(:__musubi_ts_target_dir__, target)
+      Process.put(:__musubi_codegen_target_dir__, target)
 
       env = %{TypespecProbe.__env__() | file: "/abs/lib/typespec_probe.ex"}
       Manifest.__after_compile__(env, "")
@@ -161,6 +210,24 @@ defmodule Musubi.Codegen.TypeScript.ManifestTest do
 
       assert {:__aliases__, _inner_alias_meta, [:Musubi, :TestSupport, :TypespecProbeChild]} =
                inner_alias
+    end
+
+    test "expands aliased module references inside attr types too", %{target: target} do
+      Process.put(:__musubi_codegen_target_dir__, target)
+
+      env = %{TypespecProbeWithAttrs.__env__() | file: "/abs/lib/probe_with_attrs.ex"}
+      Manifest.__after_compile__(env, "")
+
+      [{TypespecProbeWithAttrs, %{attrs: attrs}}] = Manifest.list(target)
+
+      child_attr = Enum.find(attrs, fn %{name: name} -> name == :child end)
+
+      # `attr :child, TypespecProbeChild.t()` — a single-segment alias in the
+      # source, fully qualified after expansion, exactly like a state field.
+      assert {{:., _dot_meta, [alias_node, :t]}, _call_meta, []} = child_attr.type
+
+      assert {:__aliases__, _alias_meta, [:Musubi, :TestSupport, :TypespecProbeChild]} =
+               alias_node
     end
   end
 end

@@ -34,3 +34,9 @@ node_modules/
 /.turbo/
 /coverage/
 *.tsbuildinfo
+
+# Rust workspace artifacts
+/target/
+
+# Tooling state, not project configuration
+/.impeccable/

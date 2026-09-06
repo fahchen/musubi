@@ -8,7 +8,8 @@ not covered here — they stay at their workspace versions.
 
 | Surface | Field | Notes |
 | :-- | :-- | :-- |
-| `mix.exs` | `@version` | The only place the version is declared. `mix.exs:version: @version` reads it. |
+| `mix.exs` | `@version` | The only place the Elixir version is declared. `mix.exs:version: @version` reads it. |
+| `Cargo.toml` (repo root) | `[workspace.package] version` | The Rust crates ship inside the Hex tarball and are versioned in lockstep with it (`docs/rust-client.md` §13); every crate inherits this value. Bump it to match `@version`. |
 | `CHANGELOG.md` | `## [X.Y.Z] — YYYY-MM-DD` section + bottom ref-link table | Adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). |
 | `README.md` | install snippet `{:musubi, "~> X.Y.Z"}` | Conventionally refreshed on every bump. |
 | `guides/getting-started.md` | install snippet | Same. |
@@ -56,10 +57,18 @@ All green. No outstanding PRs you wanted in this release.
 git checkout -b chore/bump-X.Y.Z+1
 ```
 
-### 3. Bump `mix.exs`
+### 3. Bump `mix.exs` and the Cargo workspace
 
 ```elixir
 @version "X.Y.Z+1"
+```
+
+And the same value in the repo-root `Cargo.toml`, which every crate under
+`crates/` inherits:
+
+```toml
+[workspace.package]
+version = "X.Y.Z+1"
 ```
 
 ### 4. Finalize `CHANGELOG.md`
