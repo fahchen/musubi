@@ -257,8 +257,22 @@ impl<T: Clone> Latest<T> {
         // The value travels with the call rather than being re-read: this cell
         // coalesces, so a callback that read `get()` could observe a *later*
         // edge than the one it was called for (§2.4).
+        //
+        // **One subscriber's panic costs only that subscriber's notification**,
+        // the same rule the tree's `Notify` drop follows (`musubi-state`'s
+        // `change.rs`). This loop runs on the actor task, driven by wire input:
+        // letting one unwind would skip every callback after it *and* take the
+        // connection down with it (§4.4). Nothing here is left half-written by
+        // an unwind — the lock is long gone and the loop's own state is one
+        // moved `Vec` — so the catch is per callback and the loop carries on.
         for callback in owed {
-            callback(&edge);
+            let call = std::panic::AssertUnwindSafe(|| callback(&edge));
+
+            if std::panic::catch_unwind(call).is_err() {
+                // The panic hook has already reported the payload; this line is
+                // what makes the *swallow* auditable from the client's own logs.
+                tracing::error!("a status subscriber panicked; dropping its notification");
+            }
         }
     }
 
@@ -698,6 +712,34 @@ mod tests {
 
         assert_eq!(poll(&mut stream), Poll::Ready(Some(MountStatus::Live)));
         assert_eq!(*lock(&seen), [MountStatus::Live]);
+    }
+
+    #[test]
+    fn a_panicking_subscriber_loses_only_its_own_notification() {
+        let cell = Arc::new(Latest::new(Some(MountStatus::Connecting)));
+        let status = StatusState::new(Arc::clone(&cell));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+
+        // Registered first, so it runs first: what must not happen is the loop
+        // stopping here.
+        let _boom = status.subscribe(|_| panic!("this subscriber is broken"));
+        let _watch = status.subscribe(move |status| lock(&record).push(status));
+
+        // The panic hook still reports it; what it must not do is skip the
+        // second subscriber or unwind out of `set_with` and onto the actor task
+        // (§4.4).
+        let hook = std::panic::take_hook();
+
+        std::panic::set_hook(Box::new(|_| {}));
+        cell.set(MountStatus::Live);
+        // The cell is still usable, and the broken subscriber is still filed:
+        // the next edge reaches the survivor all the same.
+        cell.set(MountStatus::Reconnecting);
+        std::panic::set_hook(hook);
+
+        assert_eq!(*lock(&seen), [MountStatus::Live, MountStatus::Reconnecting]);
+        assert_eq!(status.value(), MountStatus::Reconnecting);
     }
 
     #[test]

@@ -536,6 +536,12 @@ impl UploadCell {
     /// (`docs/rust-reactive-state.md` §2.6, §6.4). The value travels with the
     /// call because this cell is a **queue**: "which publish woke me" is not
     /// answerable by re-reading the current value.
+    ///
+    /// **One subscriber's panic costs only that subscriber's notification**, the
+    /// same rule the tree's `Notify` drop follows (`musubi-state`'s
+    /// `change.rs`). The callback loop runs on the actor task, driven by wire
+    /// input: letting one unwind would skip every callback after it *and* take
+    /// the connection down with it (§4.4).
     fn publish(&self, snapshot: UploadHandle) {
         let owed = {
             let mut subscribers = lock(&self.subscribers);
@@ -551,8 +557,17 @@ impl UploadCell {
                 .collect::<Vec<_>>()
         };
 
+        // Nothing here is left half-written by an unwind — the lock is already
+        // released and the loop's own state is one moved `Vec` — so the catch is
+        // per callback and the loop carries on.
         for callback in owed {
-            callback(&snapshot);
+            let call = std::panic::AssertUnwindSafe(|| callback(&snapshot));
+
+            if std::panic::catch_unwind(call).is_err() {
+                // The panic hook has already reported the payload; this line is
+                // what makes the *swallow* auditable from the client's own logs.
+                tracing::error!("an upload subscriber panicked; dropping its notification");
+            }
         }
     }
 
@@ -1475,6 +1490,34 @@ mod tests {
             [10, 40],
             "neither shape sees a publish the other does not"
         );
+    }
+
+    #[test]
+    fn a_panicking_subscriber_loses_only_its_own_notification() {
+        let uploads = Uploads::default();
+        let avatar = uploads.handle(&StoreId::root(), "avatar");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+
+        // Registered first, so it runs first: what must not happen is the loop
+        // stopping here.
+        let _boom = avatar.subscribe(|_| panic!("this subscriber is broken"));
+        let _watch = avatar.subscribe(move |handle| lock(&record).push(handle.progress()));
+
+        // The panic hook still reports it; what it must not do is skip the
+        // second subscriber or unwind out of the fold and onto the actor task
+        // (§4.4).
+        let hook = std::panic::take_hook();
+
+        std::panic::set_hook(Box::new(|_| {}));
+        uploads.apply_ops(&decode(vec![add("u_1", "pending", 10)]));
+        // The registry is still usable, and the broken subscriber is still
+        // filed: the next publish reaches the survivor all the same.
+        uploads.apply_ops(&decode(vec![progress("u_1", 40)]));
+        std::panic::set_hook(hook);
+
+        assert_eq!(*lock(&seen), [10, 40]);
+        assert_eq!(avatar.value().progress(), 40);
     }
 
     #[test]
