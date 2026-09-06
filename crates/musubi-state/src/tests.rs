@@ -1174,6 +1174,130 @@ fn an_upsert_keeps_the_row_node_and_pushes_only_the_field_that_moved() {
 }
 
 #[test]
+fn a_brand_new_row_notifies_the_list_and_neither_the_row_nor_its_siblings() {
+    // Inserting an item is a change to the **container** and to nothing else:
+    // the item node did not change, it did not exist. Nothing dirties a node
+    // `build` created, so a fresh node never enters the settle set and carries
+    // no `Change` at all; a sibling that only kept its slot carries none
+    // either (§9.3). The same statement for a plain array, whose insert takes
+    // the other write path.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "feed": {"messages": {"__musubi_stream__": "messages"}},
+        "list": [{"n": 1}]
+    }));
+    let messages = messages_state(&tree);
+
+    commit(
+        &tree,
+        &[],
+        &[insert_op("old", -1, json!({"id": "old"}), None)],
+    );
+
+    let list = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("list")
+        .expect("list");
+    let sibling = messages.by_key("old").expect("old");
+    let element = list.at(0).expect("list[0]");
+    let log = Log::default();
+    let _collection = log.watch("collection", &messages.as_state());
+    let _sibling = log.watch("sibling", &sibling);
+    let _array = log.watch("array", &list);
+    let _element = log.watch("element", &element);
+
+    let notify = tree
+        .apply(
+            &[add("/list/-", json!({"n": 2}))],
+            &[insert_op("new", -1, json!({"id": "new"}), None)],
+        )
+        .expect("applies");
+    let fresh_row = messages.by_key("new").expect("new").node();
+    let fresh_element = list.at(1).expect("list[1]").node();
+
+    assert!(notify.changes().contains(messages.node()));
+    assert!(notify.changes().contains(list.node()));
+    assert!(!notify.changes().contains(fresh_row));
+    assert!(!notify.changes().contains(fresh_element));
+
+    drop(notify);
+
+    // Exactly the two containers, exactly once each.
+    assert_eq!(log.taken(), ["array", "collection"]);
+    // A node a transaction created starts at revision `1` — it *was* touched by
+    // a transaction — and is not bumped again for arriving.
+    assert_eq!(tree.node(fresh_row).expect("the new row").revision, 1);
+    assert_eq!(
+        tree.node(fresh_element).expect("the new element").revision,
+        1
+    );
+}
+
+#[test]
+fn a_stream_row_adopted_out_by_a_patch_records_the_removal_its_delete_no_longer_can() {
+    // Patch ops run before stream ops (§3.6), so "the render moves a store out
+    // of a stream row, and the same envelope deletes that row" arrives as an
+    // adoption followed by a delete that finds nothing left to delete. The
+    // adoption is what took the row out of the list, so the adoption is what
+    // has to record it: a list adapter replays `collection_edits` and nothing
+    // else (§6.3), and a `Removed` nobody recorded leaves a stale row on screen.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "feed": {"messages": {"__musubi_stream__": "messages"}},
+        "slot": null
+    }));
+    let messages = messages_state(&tree);
+    let row = json!({
+        "__musubi_store_id__": ["a"],
+        "inner": {"__musubi_stream__": "messages"}
+    });
+
+    commit(
+        &tree,
+        &[],
+        &[
+            insert_op("a", -1, row.clone(), None),
+            insert_op("b", -1, json!({"id": "b"}), None),
+            row_insert_op(&["a"], "a1", json!({"id": "a1"})),
+        ],
+    );
+
+    let store = StoreState::from(messages.by_key("a").expect("a"));
+    let node = store.node();
+
+    let notify = tree
+        .apply(&[replace("/slot", row.clone())], &[delete_op("a")])
+        .expect("applies");
+    let edits = notify.changes().collection_edits(messages.node()).to_vec();
+
+    drop(notify);
+
+    assert_is_a_tree(&tree);
+    assert_eq!(keys(&messages), ["b"]);
+    assert_eq!(
+        edits,
+        [CollectionEdit::Removed {
+            item_key: Arc::from("a"),
+            index: 0,
+        }]
+    );
+    // The row left by moving, not by dying: it keeps its node, its items, and
+    // its item key is **not** carried over — a node that left deliberately is
+    // not one an insert for the same key may claim back.
+    assert_eq!(
+        tree.root::<Value>()
+            .field::<Value>("slot")
+            .expect("slot")
+            .node(),
+        node
+    );
+    assert_eq!(
+        store.fields().value(),
+        json!({"__musubi_store_id__": ["a"], "inner": [{"id": "a1"}]})
+    );
+}
+
+#[test]
 fn a_stream_row_that_stops_being_the_store_it_was_does_not_keep_its_node() {
     // The upsert keeps the **node** for a key the list already holds (§3.1) —
     // but a store id is that node's own identity (§3.2), so a row rendered as a
@@ -1779,13 +1903,31 @@ fn one_stream_rendered_under_two_keys_of_one_store_becomes_two_collections() {
 
 /// `levels` levels of nesting: `nest(1)` is a scalar, `nest(2)` is `{"n": 1}`.
 fn nest(levels: usize) -> Value {
-    let mut value = json!(1);
+    nest_around(levels, json!(1))
+}
+
+/// `levels` levels of nesting around `leaf`, the leaf itself counted.
+fn nest_around(levels: usize, leaf: Value) -> Value {
+    let mut value = leaf;
 
     for _ in 1..levels {
         value = json!({ "n": value });
     }
 
     value
+}
+
+/// The pointer that walks `levels` levels down a [`nest`] chain rooted at
+/// `field`: `descend("/deep", 2)` is `/deep/n/n`, the node `2` levels below the
+/// one `/deep` addresses.
+fn descend(field: &str, levels: usize) -> String {
+    let mut path = field.to_owned();
+
+    for _ in 0..levels {
+        path.push_str("/n");
+    }
+
+    path
 }
 
 #[test]
@@ -1866,6 +2008,124 @@ fn a_stream_item_is_measured_against_the_depth_cap_too() {
     commit(&tree, &[], &[insert_op("a", -1, json!({"id": "a"}), None)]);
 
     assert_eq!(keys(&messages_state(&tree)), ["a"]);
+}
+
+/// A tree holding one tall child store and two chains to land it in: `near`
+/// bottoms out inside the cap, `far` does not.
+///
+/// The store's own node sits at depth 1 and its deepest descendant at 201, so
+/// the subtree is 200 levels tall — legal where it stands, and legal to move
+/// anywhere at depth 56 or above.
+fn tall_store_tree() -> StateTree {
+    seeded(json!({
+        "__musubi_store_id__": [],
+        "count": 1,
+        "tall": {"__musubi_store_id__": ["tall"], "n": nest(200)},
+        "near": nest(50),
+        "far": nest(120)
+    }))
+}
+
+#[test]
+fn an_adoption_that_would_compose_past_the_depth_cap_is_refused() {
+    // `build` measures what it creates, but a **matching** subtree never
+    // reaches `build`: adoption re-parents it whole and reconciliation walks
+    // down it through the unchanged fast path. Destination depth plus subtree
+    // height therefore composed straight past the cap, and every recursive read
+    // and every `Drop` below it ran on a chain the cap was supposed to bound.
+    let tree = tall_store_tree();
+    let render = json!({"__musubi_store_id__": ["tall"], "n": nest(200)});
+    let node = tree.store_node(&store_id(&["tall"])).expect("tall");
+    let before = tree.to_wire(tree.root_id());
+    let nodes = tree.len();
+
+    // Landing it 120 levels down would put its deepest node at 320.
+    let error = tree
+        .apply(&[replace(&descend("/far", 119), render.clone())], &[])
+        .expect_err("an adoption past the cap is refused");
+
+    assert!(matches!(error, TreeError::Depth { .. }));
+    assert_eq!(tree.to_wire(tree.root_id()), before);
+    assert_eq!(tree.len(), nodes);
+    assert_eq!(tree.store_node(&store_id(&["tall"])), Some(node));
+
+    commit(&tree, &[replace("/count", json!(2))], &[]);
+
+    assert_eq!(
+        tree.root::<Value>()
+            .field::<i64>("count")
+            .expect("count")
+            .value(),
+        2
+    );
+}
+
+#[test]
+fn an_adoption_that_carries_an_already_dirty_node_past_the_cap_is_refused_before_commit() {
+    // The same composition, with a node inside the moving subtree dirtied by an
+    // earlier op of the same envelope. That node's parent chain is walked again
+    // at commit — after `commit` has taken the arena guard and the journal, so
+    // the rollback is already disarmed and there is nothing left to unwind
+    // into. The refusal has to happen while the transaction can still be
+    // rolled back, which is to say at the write, not at the settle.
+    let tree = tall_store_tree();
+    let before = tree.to_wire(tree.root_id());
+    let nodes = tree.len();
+
+    let error = tree
+        .apply(
+            &[
+                replace(&descend("/tall", 200), json!(2)),
+                replace(
+                    &descend("/far", 119),
+                    json!({"__musubi_store_id__": ["tall"], "n": nest_around(200, json!(2))}),
+                ),
+            ],
+            &[],
+        )
+        .expect_err("an adoption past the cap is refused");
+
+    assert!(matches!(error, TreeError::Depth { .. }));
+    assert_eq!(tree.to_wire(tree.root_id()), before);
+    assert_eq!(tree.len(), nodes);
+}
+
+#[test]
+fn re_adopting_one_subtree_across_envelopes_is_measured_against_the_cap_every_time() {
+    // The move that fits is taken, and taking it does not buy the next one any
+    // slack: every adoption is measured against the tree as it stands, so a
+    // subtree cannot be walked past the cap one legal envelope at a time.
+    let tree = tall_store_tree();
+    let render = json!({"__musubi_store_id__": ["tall"], "n": nest(200)});
+    let node = tree.store_node(&store_id(&["tall"])).expect("tall");
+
+    // 50 levels down: the deepest node lands at 250, inside the cap.
+    commit(
+        &tree,
+        &[replace(&descend("/near", 49), render.clone())],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(tree.store_node(&store_id(&["tall"])), Some(node));
+    // The key it left keeps the addressable `Null` `detach` puts there (§3.2).
+    assert_eq!(
+        tree.root::<Value>()
+            .field::<Value>("tall")
+            .expect("tall")
+            .value(),
+        Value::Null
+    );
+
+    let before = tree.to_wire(tree.root_id());
+
+    let error = tree
+        .apply(&[replace(&descend("/far", 119), render)], &[])
+        .expect_err("the second move is measured against the tree it now has");
+
+    assert!(matches!(error, TreeError::Depth { .. }));
+    assert_eq!(tree.to_wire(tree.root_id()), before);
+    assert_eq!(tree.store_node(&store_id(&["tall"])), Some(node));
 }
 
 // ------------------------------------------------- landing before vacating
@@ -2281,6 +2541,46 @@ fn a_position_rendered_as_a_plain_value_does_not_destroy_the_store_a_later_one_a
 }
 
 #[test]
+fn a_position_rewritten_as_a_plain_value_exchanges_with_the_copy_that_took_its_id() {
+    // The same identity exchange as a marker release, reached without a marker
+    // op: `add` lands a second render of store `a`, and the op that follows
+    // rewrites position 0 as a plain value. Whatever spelling strips
+    // store-ness off the node holding the id, the id stays on the node that
+    // was carrying it (§3.2).
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"__musubi_store_id__": ["a"], "n": 1}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let panel = StoreState::from(rows.at(0).expect("rows[0]"));
+    let node = panel.node();
+
+    commit(
+        &tree,
+        &[
+            add("/rows/1", json!({"__musubi_store_id__": ["a"], "n": 1})),
+            replace("/rows/0", json!({"kind": "banner"})),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(1).expect("rows[1]").node(), node);
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["a"])), Some(node));
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"kind": "banner"}),
+            json!({"__musubi_store_id__": ["a"], "n": 1})
+        ]
+    );
+}
+
+#[test]
 fn a_store_and_a_plain_row_that_swap_places_keep_the_store_node() {
     let tree = seeded(json!({
         "__musubi_store_id__": [],
@@ -2475,10 +2775,11 @@ fn a_reordered_list_of_child_stores_with_fields_keeps_both_nodes_and_both_values
 fn a_row_prepended_before_a_child_store_arrives_as_a_marker_removal() {
     // The literal `Jsonpatch.diff/2` output for `[{store a}]` becoming
     // `[{banner}, {store a}]`: the added row lands first, then the marker and
-    // the fields of row 0 are rewritten in place. Removing the marker makes
-    // that node a plain object — a store node is never rewritten into a
-    // non-store, it unmounts — and the store id ends up on the row that carries
-    // it.
+    // the fields of row 0 are rewritten in place. What comes out is the render:
+    // a plain banner at 0, store `a` at 1, and one id in the index. *Which
+    // node* carries the id is the next test over — a store node is never
+    // rewritten into a non-store, so the marker removal exchanges the two
+    // rather than rewriting either (§3.2).
     let tree = seeded(json!({
         "__musubi_store_id__": [],
         "rows": [{"__musubi_store_id__": ["a"], "n": 1}]
@@ -2512,6 +2813,132 @@ fn a_row_prepended_before_a_child_store_arrives_as_a_marker_removal() {
         Some(rows.at(1).expect("rows[1]").node())
     );
     assert_eq!(tree.store_ids().len(), 2);
+}
+
+#[test]
+fn a_row_prepended_before_a_child_store_keeps_the_store_node_and_its_subscribers() {
+    // The same four ops, read as what they say about **identity**. Store `a` is
+    // rendered in both frames — it never unmounts, so §3.2's promise applies to
+    // it: the node that carried the id keeps it, with its subtree and its
+    // subscribers. The `add` lands a second copy of the id because the marker
+    // that releases the first one has not arrived yet; when it does, the copy
+    // and the original exchange slots, exactly as a reorder does (§3.2).
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"__musubi_store_id__": ["a"], "n": 1}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let panel = StoreState::from(rows.at(0).expect("rows[0]"));
+    let node = panel.node();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let _watch = panel.subscribe(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+
+    commit(
+        &tree,
+        &[
+            add("/rows/1", json!({"__musubi_store_id__": ["a"], "n": 1})),
+            remove("/rows/0/n"),
+            remove("/rows/0/__musubi_store_id__"),
+            add("/rows/0/kind", json!("banner")),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(1).expect("rows[1]").node(), node);
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["a"])), Some(node));
+    // Store `a`'s own value came out of the envelope as it went in, so the
+    // subscriber that survived is not woken at all: `n: 1` left and came back
+    // inside one transaction (§9.2).
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        panel.fields().value(),
+        json!({"__musubi_store_id__": ["a"], "n": 1})
+    );
+}
+
+#[test]
+fn a_refused_op_after_an_identity_exchange_puts_both_nodes_back() {
+    // The exchange is two parent writes and a re-registration, so it has to
+    // journal like every other mutation: a later op that cannot apply rolls the
+    // whole envelope back, exchange included (§9.2).
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"__musubi_store_id__": ["a"], "n": 1}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let node = rows.at(0).expect("rows[0]").node();
+    let before = tree.to_wire(tree.root_id());
+    let nodes = tree.len();
+
+    let error = tree
+        .apply(
+            &[
+                add("/rows/1", json!({"__musubi_store_id__": ["a"], "n": 1})),
+                remove("/rows/0/n"),
+                remove("/rows/0/__musubi_store_id__"),
+                remove("/rows/9"),
+            ],
+            &[],
+        )
+        .expect_err("the last op cannot apply");
+
+    assert!(matches!(error, TreeError::Index { .. }));
+    assert_is_a_tree(&tree);
+    assert_eq!(tree.to_wire(tree.root_id()), before);
+    assert_eq!(tree.len(), nodes);
+    assert_eq!(rows.at(0).expect("rows[0]").node(), node);
+    assert_eq!(tree.store_node(&store_id(&["a"])), Some(node));
+}
+
+#[test]
+fn a_marker_release_that_exchanges_two_keys_of_one_object_keeps_both_nodes() {
+    // The exchange between two slots of the **same** parent, which is where a
+    // write that thinks it displaced the node it wrote over gets it wrong: the
+    // node is still that parent's, one key along. A store rendered twice under
+    // one object gives the second sighting a node of its own (§3.2), and the
+    // marker removal that follows is what says which of the two is the store.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "obj": {"a": {"__musubi_store_id__": ["x"], "n": 1}, "b": null}
+    }));
+    let obj = tree.root::<Value>().field::<Value>("obj").expect("obj");
+    let panel = StoreState::from(obj.field::<Value>("a").expect("a"));
+    let node = panel.node();
+
+    commit(
+        &tree,
+        &[
+            replace(
+                "/obj",
+                json!({
+                    "a": {"__musubi_store_id__": ["x"], "n": 1},
+                    "b": {"__musubi_store_id__": ["x"], "n": 1}
+                }),
+            ),
+            remove("/obj/a/__musubi_store_id__"),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(obj.field::<Value>("b").expect("b").node(), node);
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(node));
+    assert_eq!(
+        obj.value(),
+        json!({"a": {"n": 1}, "b": {"__musubi_store_id__": ["x"], "n": 1}})
+    );
 }
 
 #[test]
@@ -2592,11 +3019,10 @@ fn a_reordered_list_of_stream_bearing_child_stores_keeps_every_item_of_both_stre
 }
 
 #[test]
-fn a_row_prepended_before_a_stream_bearing_child_store_keeps_its_items() {
+fn a_row_prepended_before_a_stream_bearing_child_store_keeps_its_node_and_its_items() {
     // The prepend shape with a stream under the row that moves. Store `a` is
     // rendered in both frames — it never unmounts — so BDR-0011's fresh-mount
-    // reset does not apply to it and its items have to arrive at whatever node
-    // ends up carrying its id.
+    // reset does not apply to it: it keeps its node, and its items stay on it.
     let tree = seeded(json!({
         "__musubi_store_id__": [],
         "rows": [{"__musubi_store_id__": ["a"], "messages": {"__musubi_stream__": "messages"}}]
@@ -2605,6 +3031,7 @@ fn a_row_prepended_before_a_stream_bearing_child_store_keeps_its_items() {
         .root::<Value>()
         .field::<Vec<Value>>("rows")
         .expect("rows");
+    let node = rows.at(0).expect("rows[0]").node();
 
     commit(
         &tree,
@@ -2643,10 +3070,8 @@ fn a_row_prepended_before_a_stream_bearing_child_store_keeps_its_items() {
             })
         ]
     );
-    assert_eq!(
-        tree.store_node(&store_id(&["a"])),
-        Some(rows.at(1).expect("rows[1]").node())
-    );
+    assert_eq!(rows.at(1).expect("rows[1]").node(), node);
+    assert_eq!(tree.store_node(&store_id(&["a"])), Some(node));
     assert_eq!(tree.store_ids().len(), 2);
 
     commit(

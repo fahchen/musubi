@@ -85,6 +85,12 @@ struct Journal {
     /// at commit if nothing claims them.
     carry: HashMap<(NodeId, String), NodeId>,
     carry_order: Vec<(NodeId, String)>,
+    /// The store ids this transaction landed on a node it **built** from
+    /// nothing, and where. §3.2's duplicate rule puts one here whenever a
+    /// render carries an id twice; the marker op that resolves the duplicate
+    /// then reads it back — see
+    /// [`exchange_for_reland`](Transaction::exchange_for_reland).
+    rebuilt: HashMap<StoreId, NodeId>,
     edits: HashMap<NodeId, Vec<CollectionEdit>>,
     /// The dirty set: every node whose value has to be recomputed at commit,
     /// against the value it held when this transaction first reached it. Depth
@@ -160,9 +166,20 @@ impl<'a> Transaction<'a> {
 
     /// Settle the dirty set bottom-up, diff, bump revisions, collect
     /// subscribers, release the lock. Nothing here can fail.
+    ///
+    /// **Nothing here may panic, either.** Taking the guard and the journal
+    /// disarms the rollback, so from that line on there is no unwind path that
+    /// leaves the tree whole: a panic would strand a half-committed structure
+    /// behind a poisoned lock that [`StateTreeInner::lock`] deliberately
+    /// re-opens. Any check that can refuse belongs at the write boundary, where
+    /// the journal still rolls back — the depth cap is the one that does — and
+    /// the walks below are written to bail rather than assert.
+    ///
+    /// [`StateTreeInner::lock`]: crate::tree::StateTreeInner::lock
     #[must_use = "dropping the Notify is what runs the subscribers"]
     pub fn commit(mut self) -> Notify {
-        // Taking the guard is what tells `Drop` the work was kept.
+        // Taking the guard is what tells `Drop` the work was kept: every line
+        // below this one runs with the rollback disarmed.
         let mut guard = self.arena.take().expect(OPEN);
         let arena = &mut *guard;
         let mut journal = std::mem::take(&mut self.journal);
@@ -898,7 +915,7 @@ impl<'a> Transaction<'a> {
                             && self.arena_ref().nodes.contains_key(found)
                             && !self.is_ancestor(found, parent)
                         {
-                            self.adopt(parent, found);
+                            self.adopt(parent, found)?;
                             self.reconcile(found, value, owner, depth)?;
 
                             return Ok(found);
@@ -915,7 +932,7 @@ impl<'a> Transaction<'a> {
             Shape::Collection { name }
                 if !existing.is_some_and(|node| self.is_collection(node, name)) =>
             {
-                if let Some(found) = self.adopt_collection(parent, existing, owner, name) {
+                if let Some(found) = self.adopt_collection(parent, existing, owner, name)? {
                     self.reconcile(found, value, owner, depth)?;
 
                     return Ok(found);
@@ -925,9 +942,17 @@ impl<'a> Transaction<'a> {
         }
 
         match existing {
-            // A child store the render no longer puts here: it unmounts, and
-            // the plain value that replaced it gets a node of its own.
-            Some(id) if self.is_store_node(id) => self.build(Some(parent), value, owner, depth),
+            // A child store the render no longer puts here. Either the id it
+            // carried has already been re-landed on a node this same
+            // transaction built — in which case the two exchange slots and the
+            // original keeps the id — or the store unmounts and the plain value
+            // that replaced it gets a node of its own.
+            Some(id) if self.is_store_node(id) => {
+                match self.exchange_for_reland(parent, id, value, owner, depth)? {
+                    Some(taken) => Ok(taken),
+                    None => self.build(Some(parent), value, owner, depth),
+                }
+            }
             Some(id) => {
                 self.reconcile(id, value, owner, depth)?;
 
@@ -935,6 +960,188 @@ impl<'a> Transaction<'a> {
             }
             None => self.build(Some(parent), value, owner, depth),
         }
+    }
+
+    /// The identity exchange §3.2 owes a store that is rendered on both sides
+    /// of a marker release.
+    ///
+    /// `Musubi.Diff` prepends a plain row before a store row as the four ops
+    /// `[add /rows/1 {store a, ...}, remove /rows/0/n,
+    /// remove /rows/0/__musubi_store_id__, add /rows/0/kind "banner"]`. The
+    /// copy **lands before** the original is stripped, so the copy cannot adopt:
+    /// at that moment the render genuinely carries the id twice, and §3.2's
+    /// duplicate rule correctly gives the second sighting a node of its own
+    /// rather than blanking the slot the first stands in.
+    ///
+    /// The marker removal is what resolves the ambiguity. It says the node that
+    /// *was* store `a` is a plain object now — and the id it carried is already
+    /// standing on a node this transaction built from nothing. Store `a` was
+    /// rendered in both frames, so it never unmounted, and §3.2 owes it its
+    /// `NodeId`, its subtree, its stream collections and its subscribers. Left
+    /// to the plain rule ("a store the render no longer puts here unmounts"),
+    /// every one of those dies while the copy inherits the id — the JSON and
+    /// the store index come out right and every live handle on a store that was
+    /// continuously rendered reads as dead.
+    ///
+    /// So the two exchange slots: the original moves into the copy's slot and
+    /// reconciles to the copy's value — re-adopting on the way whatever that
+    /// build took from it, its collections first of all — while the copy takes
+    /// the original's slot and is rebuilt as the plain value the op is writing.
+    /// Nothing is holding the copy: it has existed only since this transaction
+    /// opened. This is the same exchange a reorder inside one parent already
+    /// performs (§3.2, "同一父节点内的移位则是交换"), reached from the other
+    /// direction.
+    ///
+    /// `None` — and the caller builds a fresh node, exactly as before — when
+    /// there is nothing to exchange with, when either node is not standing in
+    /// the slot it claims, when the swap would close a parent cycle, or when it
+    /// would carry a subtree past the depth cap. Refusing costs one store its
+    /// `NodeId`; it never costs the tree its shape.
+    fn exchange_for_reland(
+        &mut self,
+        parent: NodeId,
+        node: NodeId,
+        value: &Value,
+        owner: &StoreId,
+        depth: usize,
+    ) -> Result<Option<NodeId>, TreeError> {
+        let Some(store_id) = self.arena_ref().store_id_of(node) else {
+            return Ok(None);
+        };
+        let Some(copy) = self.journal.rebuilt.get(&store_id).copied() else {
+            return Ok(None);
+        };
+
+        // The index has to still name the copy: an id landed twice and then
+        // moved on again is not a re-landing of *this* node's id.
+        if copy == node || self.arena_ref().stores.get(&store_id) != Some(&copy) {
+            return Ok(None);
+        }
+
+        let (Some(here), Some(there)) = (
+            self.arena_ref()
+                .nodes
+                .get(node)
+                .and_then(|data| data.parent),
+            self.arena_ref()
+                .nodes
+                .get(copy)
+                .and_then(|data| data.parent),
+        ) else {
+            return Ok(None);
+        };
+
+        // Both have to be standing in the slot their parent link claims — a
+        // node whose parent is still building it is not exchangeable — and
+        // neither may land under its own descendant, which is the cycle
+        // adoption refuses for the same reason (§3.2).
+        if here != parent
+            || !self.holds(here, node)
+            || !self.holds(there, copy)
+            || self.is_ancestor(node, there)
+            || self.is_ancestor(copy, here)
+            || !self.fits(there, node)
+            || !self.fits(here, copy)
+            // An async node's two slots are not a child list (§3.3):
+            // `rewire_async_slot` finds the slot a write is filling by looking
+            // for the node it displaced, and an exchange *between* `result` and
+            // `reason` would leave it looking in the other one. Not a shape
+            // worth carrying: it needs an async node whose two slots are two
+            // renders of one store id.
+            || (here == there && matches!(self.container_of(here), Container::Async { .. }))
+        {
+            return Ok(None);
+        }
+
+        // What the copy was built to be, read back as a value: a `Collection`
+        // projects to its bare marker (§3.1), so reconciling the original
+        // against this adopts the live collection — items and all — back onto
+        // it, rather than describing a list the wire never carries.
+        let rendered = self.arena_ref().semantic_deep(copy).to_wire();
+        let landed = self.arena_ref().owner_of(there);
+        let settled = self.arena_ref().depth(there) + 1;
+
+        self.swap_slots(node, copy);
+        // The index follows the node that keeps the id, and it has to be
+        // pointing at it *before* the copy is rebuilt: `unregister` only drops
+        // an entry that still names the node it is unregistering.
+        self.set_store(store_id, Some(node));
+        self.reconcile(node, &rendered, &landed, settled)?;
+        self.rebuild(copy, value, owner, depth)?;
+
+        Ok(Some(copy))
+    }
+
+    /// Whether `parent`'s kind actually holds `child` — the half of the parent
+    /// link a node cannot answer for on its own, and the only way to tell a
+    /// node that *moved inside* this parent from one this parent dropped.
+    ///
+    /// Scanned, not collected: this is asked once per field write that
+    /// displaced something, and materializing the sibling list to answer it
+    /// would copy every key of a hundred-field store to compare one pointer.
+    fn holds(&self, parent: NodeId, child: NodeId) -> bool {
+        match self.arena_ref().nodes.get(parent).map(|node| &node.kind) {
+            Some(NodeKind::Array(children)) => children.contains(&child),
+            Some(NodeKind::Object(fields) | NodeKind::Store { fields, .. }) => {
+                fields.values().any(|node| *node == child)
+            }
+            Some(NodeKind::Collection { items, .. }) => {
+                items.iter().any(|(_, node)| *node == child)
+            }
+            Some(NodeKind::Async { result, reason, .. }) => *result == child || *reason == child,
+            _ => false,
+        }
+    }
+
+    /// Exchanges two nodes' slots.
+    ///
+    /// The two kind writes happen back to back with nothing in between:
+    /// `touch`, the dirty walks and the ancestor checks are all done before the
+    /// first one, so no walk, no allocation and no borrow of the arena can
+    /// observe the instant when one parent would hold the other's child. "No
+    /// node is reachable from two parents" therefore holds at every point a
+    /// reader could reach.
+    fn swap_slots(&mut self, one: NodeId, other: NodeId) {
+        let (Some(here), Some(there)) = (
+            self.arena_ref().nodes.get(one).and_then(|data| data.parent),
+            self.arena_ref()
+                .nodes
+                .get(other)
+                .and_then(|data| data.parent),
+        ) else {
+            return;
+        };
+
+        self.touch(one);
+        self.touch(other);
+        self.touch_and_dirty(here);
+        self.touch_and_dirty(there);
+
+        let arena = self.arena();
+
+        if here == there {
+            // One parent, one pass: two sequential replacements would put the
+            // first node back where the second one just came from.
+            rewire(&mut arena.nodes[here].kind, |id| {
+                if id == one {
+                    other
+                } else if id == other {
+                    one
+                } else {
+                    id
+                }
+            });
+        } else {
+            rewire(&mut arena.nodes[here].kind, |id| {
+                if id == one { other } else { id }
+            });
+            rewire(&mut arena.nodes[there].kind, |id| {
+                if id == other { one } else { id }
+            });
+        }
+
+        arena.nodes[one].parent = Some(there);
+        arena.nodes[other].parent = Some(here);
     }
 
     /// Re-parents the collection filed under `(owner, name)` onto `parent`, if
@@ -962,20 +1169,22 @@ impl<'a> Transaction<'a> {
         existing: Option<NodeId>,
         owner: &StoreId,
         name: &str,
-    ) -> Option<NodeId> {
+    ) -> Result<Option<NodeId>, TreeError> {
         let key = (owner.clone(), name.to_owned());
-        let found = self.arena_ref().collections.get(&key).copied()?;
+        let Some(found) = self.arena_ref().collections.get(&key).copied() else {
+            return Ok(None);
+        };
+        let Some(held_by) = self.arena_ref().nodes.get(found).map(|node| node.parent) else {
+            return Ok(None);
+        };
 
-        if Some(found) == existing
-            || self.arena_ref().nodes.get(found)?.parent == Some(parent)
-            || self.is_ancestor(found, parent)
-        {
-            return None;
+        if Some(found) == existing || held_by == Some(parent) || self.is_ancestor(found, parent) {
+            return Ok(None);
         }
 
-        self.adopt(parent, found);
+        self.adopt(parent, found)?;
 
-        Some(found)
+        Ok(Some(found))
     }
 
     fn reconcile_fields(
@@ -1224,7 +1433,7 @@ impl<'a> Transaction<'a> {
         }
 
         if let Some(node) = displaced {
-            self.release_if_still_mine(parent, node);
+            self.release_if_dropped(parent, node);
         }
 
         Ok(())
@@ -1282,7 +1491,9 @@ impl<'a> Transaction<'a> {
         };
 
         self.touch_and_dirty(id);
-        self.release(was);
+        // As in `stream_insert`: the node this slot held is only ours to
+        // release while it is still parented here.
+        self.release_if_still_mine(id, was);
         self.arena().nodes[id].kind = NodeKind::Async {
             status,
             result: if result == was { now } else { result },
@@ -1415,6 +1626,15 @@ impl<'a> Transaction<'a> {
         let index = insertion_index(at, items.len());
         let entry = match existing {
             Some((key, node)) => {
+                // A row that came back off the carry-over table re-enters the
+                // tree here rather than through `build`, so it is measured
+                // against the cap like every other subtree that arrives. A row
+                // that never left its collection answers this for free — same
+                // slot, same depth (see [`fits`](Self::fits)).
+                if !self.fits(collection, node) {
+                    return Err(TreeError::Depth { limit: MAX_DEPTH });
+                }
+
                 self.touch(node);
                 self.arena().nodes[node].parent = Some(collection);
 
@@ -1424,8 +1644,11 @@ impl<'a> Transaction<'a> {
                 // not keep that store's node (§3.2).
                 let settled = self.reconcile_child(collection, Some(node), item, &owner, depth)?;
 
+                // Only if it is still ours to release: reconciliation may have
+                // moved this very node into another slot rather than replacing
+                // it, and a node that moved is not a node that was removed.
                 if settled != node {
-                    self.release(node);
+                    self.release_if_still_mine(collection, node);
                 }
 
                 (key, settled)
@@ -1607,6 +1830,14 @@ impl<'a> Transaction<'a> {
 
         self.install(id, value, owner, depth)?;
 
+        // A store id this transaction put on a node of its own making. Only a
+        // node from here is exchangeable: one that was *rebuilt* in place still
+        // carries whatever subscribers it had before, and they are owed the
+        // value that node's slot renders.
+        if let Some(store_id) = self.arena_ref().store_id_of(id) {
+            self.journal.rebuilt.insert(store_id, id);
+        }
+
         Ok(id)
     }
 
@@ -1721,9 +1952,61 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Whether re-parenting `node` under `parent` keeps its whole subtree
+    /// inside the depth cap.
+    ///
+    /// # The invariant, and why it has to hold mid-transaction
+    ///
+    /// **No live node sits more than [`MAX_DEPTH`] levels below its root** —
+    /// its document root, or itself while it is detached. Every recursive walk
+    /// over a subtree (`semantic_deep`, both projections,
+    /// `subtree_post_order`, `Drop`) runs on the caller's stack and would abort
+    /// the *process* rather than unwind if that ever stopped being true, so it
+    /// has to hold at every point inside a transaction and not merely at
+    /// commit: heights change *within* one envelope, as earlier ops build and
+    /// adopt.
+    ///
+    /// [`build`](Self::build) keeps it for a subtree that arrives from the
+    /// wire, one node at a time. This keeps it for a subtree that is already
+    /// standing: adoption re-parents it whole, and the descendants that match
+    /// the incoming value come back through reconciliation's unchanged fast
+    /// path without ever reaching `build`. Destination depth composes with
+    /// subtree height, and 100 + 200 is past a cap neither half broke.
+    ///
+    /// Given the invariant, one comparison answers most moves for free: a
+    /// subtree landing at a slot **no deeper** than the one it holds cannot put
+    /// any of its nodes deeper than it already had them. That is every reorder,
+    /// every prepend and every carried-over row re-entering the collection it
+    /// left — the shapes that actually arrive — so the walk is reserved for a
+    /// move that genuinely goes deeper, where a violation is possible at all.
+    fn fits(&self, parent: NodeId, node: NodeId) -> bool {
+        let arena = self.arena_ref();
+        let target = arena.depth(parent) + 1;
+
+        if target > MAX_DEPTH {
+            return false;
+        }
+
+        if target <= arena.depth(node) {
+            return true;
+        }
+
+        arena.height_within(node, MAX_DEPTH - target)
+    }
+
     /// Re-parents an existing store node, resurrecting it if this transaction
     /// had already detached it.
-    fn adopt(&mut self, parent: NodeId, node: NodeId) {
+    ///
+    /// Refused — and the whole envelope with it — when the move would carry the
+    /// subtree past the depth cap. Building a fresh node instead is not an
+    /// option here: a store's `Collection` children project to a bare marker,
+    /// so the rebuild would silently drop every stream item the subtree holds
+    /// (§3.1).
+    fn adopt(&mut self, parent: NodeId, node: NodeId) -> Result<(), TreeError> {
+        if !self.fits(parent, node) {
+            return Err(TreeError::Depth { limit: MAX_DEPTH });
+        }
+
         self.touch(node);
         self.unpend(node);
 
@@ -1740,6 +2023,8 @@ impl<'a> Transaction<'a> {
         // because a parent this same op is still building has nothing to
         // compare against and would otherwise never be recomputed (§2.3).
         self.mark_dirty(parent);
+
+        Ok(())
     }
 
     /// Removes one child from its parent's kind, so no node is ever reachable
@@ -1793,7 +2078,25 @@ impl<'a> Transaction<'a> {
                 // A stream's item list is keyed, not positional: a key whose
                 // node left is a key that is gone, and `stream_ops` are what put
                 // one back (§3.1).
-                items.retain(|(_, node)| *node != child);
+                //
+                // It leaves as a recorded `Removed`, exactly as a `delete`
+                // would. Patch ops run before stream ops (§3.6), so "the render
+                // moves a store out of a stream row, and the same envelope
+                // deletes that row" reaches the delete with the key already
+                // gone — and a list adapter replays `collection_edits` and
+                // nothing else (§6.3), so an unrecorded removal is a row that
+                // stays on screen.
+                //
+                // The key does **not** enter the carry-over table. That table
+                // exists so an `insert` can reclaim a node the same transaction
+                // took *out of the list* (§3.1); this node did not leave the
+                // list, it left for somewhere else in the tree, and handing it
+                // back to an insert would parent it twice.
+                if let Some(index) = items.iter().position(|(_, node)| *node == child) {
+                    let (item_key, _) = items.remove(index);
+
+                    self.record_edit(parent, CollectionEdit::Removed { item_key, index });
+                }
 
                 NodeKind::Collection { name, owner, items }
             }
@@ -1858,6 +2161,21 @@ impl<'a> Transaction<'a> {
         if owner == Some(parent) {
             self.release(child);
         }
+    }
+
+    /// Releases the node one **finished** write displaced — unless the parent
+    /// is still holding it in another of its own slots, which is what an
+    /// exchange between two of them leaves behind (§3.2).
+    ///
+    /// Only for a caller that has already written the parent's kind. The
+    /// rebuild paths ask [`release_displaced`](Self::release_displaced)
+    /// instead, which is handed the child list the parent is *about* to take.
+    fn release_if_dropped(&mut self, parent: NodeId, child: NodeId) {
+        if self.holds(parent, child) {
+            return;
+        }
+
+        self.release_if_still_mine(parent, child);
     }
 
     /// Releases every child a rebuild displaced: the ones the parent held when
@@ -2115,6 +2433,36 @@ impl Drop for Transaction<'_> {
     }
 }
 
+/// Rewrites every child slot of one kind through `map`.
+///
+/// The one place a node's children are re-pointed without being reconciled:
+/// [`swap_slots`](Transaction::swap_slots) exchanges two nodes and nothing
+/// about either parent's shape changes.
+fn rewire(kind: &mut NodeKind, map: impl Fn(NodeId) -> NodeId) {
+    match kind {
+        NodeKind::Array(children) => {
+            for child in children {
+                *child = map(*child);
+            }
+        }
+        NodeKind::Object(fields) | NodeKind::Store { fields, .. } => {
+            for child in fields.values_mut() {
+                *child = map(*child);
+            }
+        }
+        NodeKind::Collection { items, .. } => {
+            for (_, child) in items {
+                *child = map(*child);
+            }
+        }
+        NodeKind::Async { result, reason, .. } => {
+            *result = map(*result);
+            *reason = map(*reason);
+        }
+        _ => {}
+    }
+}
+
 /// The node a position may reconcile into: the one that was there, unless
 /// another position in this same rebuild has already taken it.
 ///
@@ -2210,8 +2558,16 @@ fn rewrite_store_id(
 /// waiting on its value, and its own children still answer `1` and settle first.
 ///
 /// Iterative, and capped: a parent chain that does not reach a root would
-/// otherwise recurse until the stack ran out, and this runs inside `commit`,
-/// which cannot fail.
+/// otherwise recurse until the stack ran out.
+///
+/// The cap **bails**; it does not assert. This runs inside `commit`, which has
+/// already taken the arena guard and the journal — so the rollback is disarmed
+/// and an unwind from here would leave the tree half-committed behind a
+/// poisoned lock, which is a worse outcome than the mis-ordered settle a bail
+/// costs. Nothing constructs a chain this long: the depth cap covers adoption
+/// (see [`fits`](Transaction::fits)) as well as `build`, so the composition
+/// that used to reach it is refused at the write, where the journal still rolls
+/// back cleanly.
 fn depth_of(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, u32>) -> u32 {
     let mut chain = Vec::new();
     let mut cursor = Some(id);
@@ -2224,7 +2580,6 @@ fn depth_of(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, u32>) -> u32 {
         }
 
         if chain.len() > MAX_DEPTH + 1 {
-            debug_assert!(false, "a parent chain longer than the depth cap");
             break;
         }
 

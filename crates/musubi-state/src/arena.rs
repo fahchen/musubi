@@ -262,6 +262,40 @@ impl Arena {
         StoreId::root()
     }
 
+    /// Whether every node of a subtree sits within `budget` levels of its own
+    /// root.
+    ///
+    /// The composition half of the depth cap (§3.2): `build` measures one node
+    /// at a time, which bounds a subtree that arrives from the wire, but a
+    /// subtree that is **re-parented** arrives whole and its matching
+    /// descendants never reach `build` at all. Destination depth plus this
+    /// answer is what the write boundary refuses on.
+    ///
+    /// Iterative, and stops at the first node past the budget: a move that is
+    /// about to be refused pays `budget` levels, not the subtree. `walked` is
+    /// what keeps a broken tree from costing exponential work in the branches a
+    /// cycle would repeat.
+    pub(crate) fn height_within(&self, id: NodeId, budget: usize) -> bool {
+        let mut stack = vec![(id, 0usize)];
+        let mut walked = HashSet::new();
+
+        while let Some((current, level)) = stack.pop() {
+            if level > budget {
+                return false;
+            }
+
+            if !walked.insert(current) {
+                continue;
+            }
+
+            for child in self.children(current) {
+                stack.push((child, level + 1));
+            }
+        }
+
+        true
+    }
+
     /// How far below the root a node sits. `0` for the root and for any node
     /// this transaction has detached.
     ///
@@ -405,6 +439,10 @@ impl Arena {
     /// `walked` is what keeps this from recursing forever if the tree it is
     /// handed ever stops being one — a node reached twice is visited once, so a
     /// broken invariant costs a missing notification rather than the stack.
+    /// It does **not** assert: this runs inside `commit`, past the point where
+    /// the guard and the journal were taken, so an unwind from here would leave
+    /// a half-committed tree behind a poisoned lock with no rollback left to
+    /// run.
     pub(crate) fn subtree_post_order(
         &self,
         id: NodeId,
@@ -412,8 +450,6 @@ impl Arena {
         walked: &mut HashSet<NodeId>,
     ) {
         if !walked.insert(id) {
-            debug_assert!(false, "a node reachable from two parents");
-
             return;
         }
 
