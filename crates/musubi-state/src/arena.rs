@@ -5,14 +5,14 @@
 //! caller's callback — that is [`Notify`](crate::Notify)'s job, after the lock
 //! is released (§2.6).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
 use slotmap::SlotMap;
 
 use crate::change::{Change, CollectionEdit};
-use crate::node::{Node, NodeId, NodeKind, Semantic, SemanticValue};
+use crate::node::{AsyncStatus, Node, NodeId, NodeKind, Semantic, SemanticValue};
 use crate::subscription::SubscriberId;
 use crate::wire::StoreId;
 
@@ -24,6 +24,18 @@ pub(crate) type Callback = Arc<dyn Fn(Change, &[CollectionEdit]) + Send + Sync>;
 
 /// The key a collection is indexed by: its owning store plus its declared name.
 pub(crate) type CollectionKey = (StoreId, String);
+
+/// The deepest a node may sit below the root, and therefore the longest parent
+/// chain any walk up the tree can meet.
+///
+/// The tree is built from wire input, and depth composes across ops and across
+/// envelopes: `serde_json`'s own 128-level nesting limit bounds one document,
+/// not a hundred `add`s at successively deeper paths. Every recursive walk over
+/// a subtree — semantic equality, the two projections, `Drop` — would then abort
+/// the **process** on stack exhaustion rather than unwinding, so the cap is
+/// enforced where nodes are created and every walker is written to survive a
+/// broken one.
+pub(crate) const MAX_DEPTH: usize = 256;
 
 /// One retained node, as the arena holds it.
 pub(crate) struct NodeData {
@@ -100,12 +112,74 @@ impl Arena {
     }
 
     /// The child ids of an array or a collection, in list order.
+    ///
+    /// One snapshot, for the callers that genuinely need the whole list — an
+    /// iterator that must not hold the lock while a consumer subscribes. Every
+    /// caller that addresses **one** child goes through [`child_at`],
+    /// [`child_by_item_key`] or [`child_count`] instead, none of which
+    /// allocates: `at(i)` is the crate's own answer to reading a whole list, and
+    /// it would be no answer at all if it cost one copy of the list per element.
+    ///
+    /// [`child_at`]: Self::child_at
+    /// [`child_by_item_key`]: Self::child_by_item_key
+    /// [`child_count`]: Self::child_count
     pub(crate) fn ordered_children(&self, id: NodeId) -> Vec<NodeId> {
         match self.nodes.get(id).map(|node| &node.kind) {
             Some(NodeKind::Array(items)) => items.clone(),
             Some(NodeKind::Collection { items, .. }) => {
                 items.iter().map(|(_, child)| *child).collect()
             }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The child one array index or list position addresses, without
+    /// materializing the list.
+    pub(crate) fn child_at(&self, id: NodeId, index: usize) -> Option<NodeId> {
+        match &self.nodes.get(id)?.kind {
+            NodeKind::Array(items) => items.get(index).copied(),
+            NodeKind::Collection { items, .. } => items.get(index).map(|(_, child)| *child),
+            _ => None,
+        }
+    }
+
+    /// The child a collection files under one item key (§3.1).
+    pub(crate) fn child_by_item_key(&self, id: NodeId, item_key: &str) -> Option<NodeId> {
+        match &self.nodes.get(id)?.kind {
+            NodeKind::Collection { items, .. } => items
+                .iter()
+                .find(|(key, _)| &**key == item_key)
+                .map(|(_, child)| *child),
+            _ => None,
+        }
+    }
+
+    /// How many children an array or a collection holds. `0` for every other
+    /// kind, which is what a `len()` on a node that is not a list reads.
+    pub(crate) fn child_count(&self, id: NodeId) -> usize {
+        match self.nodes.get(id).map(|node| &node.kind) {
+            Some(NodeKind::Array(items)) => items.len(),
+            Some(NodeKind::Collection { items, .. }) => items.len(),
+            _ => 0,
+        }
+    }
+
+    /// A collection's item keys, in list order.
+    pub(crate) fn item_keys(&self, id: NodeId) -> Vec<Arc<str>> {
+        match self.nodes.get(id).map(|node| &node.kind) {
+            Some(NodeKind::Collection { items, .. }) => {
+                items.iter().map(|(key, _)| key.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A collection's `(item_key, child)` pairs, in list order. The keyed
+    /// counterpart of [`ordered_children`](Self::ordered_children), and taken
+    /// once per iterator for the same reason.
+    pub(crate) fn ordered_items(&self, id: NodeId) -> Vec<(Arc<str>, NodeId)> {
+        match self.nodes.get(id).map(|node| &node.kind) {
+            Some(NodeKind::Collection { items, .. }) => items.clone(),
             _ => Vec::new(),
         }
     }
@@ -125,6 +199,40 @@ impl Arena {
         }
     }
 
+    /// Whether a node is JSON `null` — or gone, which reads the same way to the
+    /// two views that ask (`State<Option<T>>` and an async `result`).
+    pub(crate) fn is_null(&self, id: NodeId) -> bool {
+        matches!(
+            self.nodes.get(id).map(|node| &node.kind),
+            None | Some(NodeKind::Null)
+        )
+    }
+
+    /// One async node's status (§3.3), which is the node's own semantics rather
+    /// than a child.
+    pub(crate) fn async_status(&self, id: NodeId) -> Option<AsyncStatus> {
+        match &self.nodes.get(id)?.kind {
+            NodeKind::Async { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// The id a store node is filed under, without its fields.
+    pub(crate) fn store_id_of(&self, id: NodeId) -> Option<StoreId> {
+        match &self.nodes.get(id)?.kind {
+            NodeKind::Store { store_id, .. } => Some(store_id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Both halves of an upload slot's key (§3.4).
+    pub(crate) fn upload_key(&self, id: NodeId) -> Option<(StoreId, Arc<str>)> {
+        match &self.nodes.get(id)?.kind {
+            NodeKind::UploadSlot { name, owner } => Some((owner.clone(), name.clone())),
+            _ => None,
+        }
+    }
+
     /// The nearest enclosing store of a node's **children** — the node's own id
     /// when it is a store node, otherwise the nearest one above it.
     ///
@@ -134,9 +242,12 @@ impl Arena {
     pub(crate) fn owner_of(&self, id: NodeId) -> StoreId {
         let mut cursor = Some(id);
 
-        while let Some(current) = cursor {
+        for _ in 0..=MAX_DEPTH + 1 {
+            let Some(current) = cursor else {
+                return StoreId::root();
+            };
             let Some(node) = self.nodes.get(current) else {
-                break;
+                return StoreId::root();
             };
 
             if let NodeKind::Store { store_id, .. } = &node.kind {
@@ -146,7 +257,34 @@ impl Arena {
             cursor = node.parent;
         }
 
+        debug_assert!(false, "a parent chain longer than the depth cap");
+
         StoreId::root()
+    }
+
+    /// How far below the root a node sits. `0` for the root and for any node
+    /// this transaction has detached.
+    ///
+    /// The write paths get this for free from the pointer they walked — one
+    /// token is one level — so this is for the callers that reach a node
+    /// through an index instead: the stream ops, which resolve
+    /// `(store_id, stream)` and never a pointer (§3.1).
+    pub(crate) fn depth(&self, id: NodeId) -> usize {
+        let mut cursor = self.nodes.get(id).and_then(|node| node.parent);
+        let mut depth = 0;
+
+        while let Some(current) = cursor {
+            depth += 1;
+
+            if depth > MAX_DEPTH + 1 {
+                debug_assert!(false, "a parent chain longer than the depth cap");
+                break;
+            }
+
+            cursor = self.nodes.get(current).and_then(|node| node.parent);
+        }
+
+        depth
     }
 
     /// One node's semantic value, computed from its children's **cached**
@@ -263,9 +401,24 @@ impl Arena {
     ///
     /// The order removal notification is delivered in, and the order slots are
     /// freed in.
-    pub(crate) fn subtree_post_order(&self, id: NodeId, into: &mut Vec<NodeId>) {
+    ///
+    /// `walked` is what keeps this from recursing forever if the tree it is
+    /// handed ever stops being one — a node reached twice is visited once, so a
+    /// broken invariant costs a missing notification rather than the stack.
+    pub(crate) fn subtree_post_order(
+        &self,
+        id: NodeId,
+        into: &mut Vec<NodeId>,
+        walked: &mut HashSet<NodeId>,
+    ) {
+        if !walked.insert(id) {
+            debug_assert!(false, "a node reachable from two parents");
+
+            return;
+        }
+
         for child in self.children(id) {
-            self.subtree_post_order(child, into);
+            self.subtree_post_order(child, into, walked);
         }
 
         if self.nodes.contains_key(id) {

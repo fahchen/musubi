@@ -23,7 +23,7 @@ use slotmap::Key as _;
 
 use crate::change::{Change, CollectionEdit};
 use crate::error::ReadError;
-use crate::node::{AsyncStatus, NodeId, NodeKind};
+use crate::node::{AsyncStatus, NodeId};
 use crate::subscription::Subscription;
 use crate::tree::StateTree;
 use crate::wire::{AsyncError, AsyncResult, StoreField, StoreId, UploadSlot};
@@ -203,7 +203,7 @@ impl<T: DeserializeOwned> State<T> {
 impl<T> State<Vec<T>> {
     /// How many elements the array holds. `0` when the node is not an array.
     pub fn len(&self) -> usize {
-        self.tree.inner().lock().ordered_children(self.node).len()
+        self.tree.inner().lock().child_count(self.node)
     }
 
     /// Whether the array is empty.
@@ -216,14 +216,12 @@ impl<T> State<Vec<T>> {
     /// Named `at` rather than `get` so navigation and materialization never
     /// share a verb (§2.4): `at` hands back a handle, `value` hands back a
     /// value.
+    ///
+    /// One index, one lookup: this is the read the crate points a render loop at
+    /// instead of materializing the whole list (§10.1), so it indexes the node's
+    /// own storage rather than copying it.
     pub fn at(&self, index: usize) -> Option<State<T>> {
-        let child = self
-            .tree
-            .inner()
-            .lock()
-            .ordered_children(self.node)
-            .get(index)
-            .copied()?;
+        let child = self.tree.inner().lock().child_at(self.node, index)?;
 
         Some(State::new(self.tree.clone(), child))
     }
@@ -266,10 +264,7 @@ impl<T> State<Option<T>> {
 
     /// Whether the node is JSON `null`.
     pub fn is_none(&self) -> bool {
-        matches!(
-            self.tree.node(self.node).map(|node| node.kind),
-            None | Some(NodeKind::Null)
-        )
+        self.tree.inner().lock().is_null(self.node)
     }
 }
 
@@ -311,24 +306,17 @@ impl<T> StreamState<T> {
 
     /// Item keys in list order.
     pub fn keys(&self) -> Vec<Arc<str>> {
-        match self.0.tree.node(self.0.node).map(|node| node.kind) {
-            Some(NodeKind::Collection { items, .. }) => {
-                items.into_iter().map(|(key, _)| key).collect()
-            }
-            _ => Vec::new(),
-        }
+        self.0.tree.inner().lock().item_keys(self.0.node)
     }
 
     /// The item with this key. Identity survives repositioning (§3.1).
     pub fn by_key(&self, item_key: &str) -> Option<State<T>> {
-        let items = match self.0.tree.node(self.0.node).map(|node| node.kind) {
-            Some(NodeKind::Collection { items, .. }) => items,
-            _ => return None,
-        };
-        let node = items
-            .into_iter()
-            .find(|(key, _)| &**key == item_key)
-            .map(|(_, node)| node)?;
+        let node = self
+            .0
+            .tree
+            .inner()
+            .lock()
+            .child_by_item_key(self.0.node, item_key)?;
 
         Some(State::new(self.0.tree.clone(), node))
     }
@@ -339,12 +327,12 @@ impl<T> StreamState<T> {
     }
 
     /// `(item_key, item)` in list order — what a keyed list adapter renders.
+    ///
+    /// One snapshot under the lock, as [`State::iter`] takes: the iterator holds
+    /// no lock, so a consumer may `subscribe()` while iterating.
     pub fn iter(&self) -> impl Iterator<Item = (Arc<str>, State<T>)> + use<T> {
         let tree = self.0.tree.clone();
-        let items = match tree.node(self.0.node).map(|node| node.kind) {
-            Some(NodeKind::Collection { items, .. }) => items,
-            _ => Vec::new(),
-        };
+        let items = tree.inner().lock().ordered_items(self.0.node);
 
         items
             .into_iter()
@@ -509,10 +497,7 @@ impl<S> From<State<S>> for StoreState<S> {
     /// The conversion a generated child-store accessor ends its chain with
     /// (§4.3), and the one place the store id is read.
     fn from(state: State<S>) -> Self {
-        let store_id = match state.tree.node(state.node).map(|node| node.kind) {
-            Some(NodeKind::Store { store_id, .. }) => Some(store_id),
-            _ => None,
-        };
+        let store_id = state.tree.inner().lock().store_id_of(state.node);
 
         Self { state, store_id }
     }
@@ -551,22 +536,23 @@ impl<T> AsyncState<T> {
     /// one status that promises nothing — so this alone cannot tell a dead
     /// handle from a running task. [`is_live`](State::is_live) is what does.
     pub fn status(&self) -> AsyncStatus {
-        match self.0.tree.node(self.0.node).map(|node| node.kind) {
-            Some(NodeKind::Async { status, .. }) => status,
+        self.0
+            .tree
+            .inner()
+            .lock()
+            .async_status(self.0.node)
             // A node that is gone, or was re-rendered as something else, reads
             // as loading — the one status that promises nothing.
-            _ => AsyncStatus::Loading,
-        }
+            .unwrap_or(AsyncStatus::Loading)
     }
 
-    /// The `result` subtree. `None` when the wire `result` is `null`.
+    /// The `result` subtree. `None` when the wire `result` is `null`, and
+    /// `None` for a result node that is gone — there is no subtree to hand back
+    /// either way, and [`is_live`](State::is_live) is what tells the two apart.
     pub fn result(&self) -> Option<State<T>> {
         let result: State<T> = self.0.field("result")?;
 
-        if matches!(
-            result.tree.node(result.node).map(|node| node.kind),
-            Some(NodeKind::Null)
-        ) {
+        if result.tree.inner().lock().is_null(result.node) {
             return None;
         }
 
@@ -662,10 +648,7 @@ impl UploadSlotState {
     /// (§2.1), so a slot declared inside a child store reports that child's id
     /// rather than the root's.
     pub fn key(&self) -> Option<(StoreId, Arc<str>)> {
-        match self.0.tree.node(self.0.node).map(|node| node.kind) {
-            Some(NodeKind::UploadSlot { name, owner }) => Some((owner, name)),
-            _ => None,
-        }
+        self.0.tree.inner().lock().upload_key(self.0.node)
     }
 
     /// The slot's marker, materialized.

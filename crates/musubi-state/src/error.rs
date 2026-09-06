@@ -23,6 +23,17 @@ pub enum TreeError {
         /// The RFC 6901 pointer, as it arrived.
         path: String,
     },
+    /// The value would have nested a node past the tree's depth cap.
+    ///
+    /// Depth composes across ops and across envelopes, and every recursive walk
+    /// over a subtree runs on the caller's stack — so this is refused at the
+    /// write boundary, where the transaction still rolls back cleanly, rather
+    /// than discovered as a stack overflow, which aborts the process.
+    #[error("the tree cannot nest deeper than {limit} levels")]
+    Depth {
+        /// The cap the value would have exceeded.
+        limit: usize,
+    },
     /// The transaction was applied to a tree that `close` had already ended.
     #[error("the tree is closed")]
     Closed,

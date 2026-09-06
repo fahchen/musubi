@@ -553,6 +553,10 @@ pub enum TreeError {
     Pointer { path: String, reason: &'static str },
     /// An array index was out of bounds, or not a valid RFC 6901 index token.
     Index { path: String },
+    /// 这个值会让某个节点嵌套到树的深度上限(256 层)之外。深度会跨 op、跨信封
+    /// 累加,而遍历子树的递归走的是调用方的栈——所以它在写入边界被拒绝(此时事务
+    /// 还能干净地回滚),而不是等到栈溢出、直接 abort 掉进程。
+    Depth { limit: usize },
     /// The transaction was applied to a tree that `close` had already ended.
     Closed,
 }
@@ -1074,7 +1078,7 @@ impl<T> StreamState<T> {
 pub struct StoreState<S> { ... }
 
 impl<S> StoreState<S> {
-    pub fn store_id(&self) -> StoreId;
+    pub fn store_id(&self) -> Option<StoreId>;
     /// The child's own shape, for the generated `Ext` trait to navigate.
     pub fn fields(&self) -> State<S>;
 
@@ -1380,7 +1384,8 @@ only”,而每条 op 都携带 `store_id`、`stream` 和 `item_key`,树上那个
 所以 `{id: "a", body: "hi"}` → `{id: "a", body: "edited"}` 只会推动 `body` 子
 节点,`id` 原封不动。视图持有的、指向行 `a` 的 `State<MessageState>` 依旧有效,
 保留它的订阅者,并且只因 `body` 而收到通知,别的什么都不会。这一点严格优于
-TypeScript 客户端,后者会重建整个对象。
+TypeScript 客户端,后者会重建整个对象。唯一的例外:行值的 store id 变了——
+upsert 同样服从 §3.2 的身份规则,一个不再是原来那个 store 的行不保留原来的节点。
 
 **诠释——按事务的结转表(carry-over table)。** 在一个事务期间从集合中移除的
 节点,会被放进一张以 `item_key` 为键的表里,直到事务结算;对某个已结转 key 的
@@ -1413,6 +1418,14 @@ key,delete 绝不会排在 insert 之前。因此结转表针对的是 `reset` �
 `CollectionEdit::Moved { item_key, from, to }`,其余给 `Inserted`/`Removed`,
 reset 给 `Reset`。这就是支撑 `musubi-gpui` 的两项能力中的第二项(§5.1)。
 
+**流槽位按 `(owner, name)` 收养,与 store 按 id 收养同构。** 一个 store 在同一
+信封内被第二次渲染(§3.2 的重复规则给第二次目击一个新节点)时,新节点里的流
+marker 若立起一个空 `Collection`,就会顶掉 `(store_id, stream)` 索引里那个还装着
+条目的活节点——随后原节点卸载,条目陪葬,而 store 从未真正卸载过,BDR-0011 的
+清零根本不适用。所以调和一个流 marker 时,先按 `(owner, name)` 查活的 collection
+节点,命中即收养(同样拒绝双亲与环),未命中才新建。每周期都会重到的普通
+marker 重渲染仍走"未变"快路,不付索引查询。
+
 **一条 op 找不到槽位就被丢弃。** 解析走的是树的 `(store_id, stream) -> NodeId`
 索引;索引里没有,或者指向一个已经不在场的节点,这条 op 什么也不做。**不记录
 日志**:`musubi-state` 没有 `tracing` 依赖(§1.3),为一行日志请回一条依赖会给
@@ -1433,6 +1446,41 @@ crate 头一条“无运行时”承诺开一个例外(与 §3.2 那处偏离同
 重新挂到新的父节点下并调和进去,未命中则新建一个。store id 由服务端编写、在一个
 root 内唯一,所以查找不可能有歧义;出现重复即是服务端 bug,第二次出现按新节点
 处理。
+
+**身份即节点,反向同样成立。** 收养只发生在"同一个 id 回来了"的时候;一个槽位
+上的 store 节点绝不会被原地改写成*另一个* store 或一个普通值。传入值带着不同的
+id,或者不再是 store,旧节点整体卸出(它的句柄从此读作已死,`is_live() ==
+false`),槽位拿到一个新节点。没有这条规则,`replace /panel {store b}` 会复用
+store a 的 `NodeId`:一个活着的 `StoreState` 缓存着 a 的 id,节点却渲染着 b 的
+字段——`command_on` 悄悄打错目标,恰是 §3.4 立誓删除的那类结果。这条规则对
+每一条写路径成立:路径级的 `add`/`replace`、数组移位、`stream_insert` 的
+upsert(§3.1 的例外),以及下文的 marker op,全部经由同一个逐父节点的调和入口。
+
+**收养有第三种"按新节点处理"的情形:祖先。** 一个 store 被渲染进它自己的子树
+(`add /a/inner/self {store X}`,而 X 就是 `/a`)时,收养会把节点挂成自己的
+祖先,产生父链环——`mark_dirty` 沿父链走根,环意味着持锁死旋。所以收养前沿新
+父节点的祖先链走一遍(O(深度)),命中即按重复 id 的同一套结构性处理:新键拿
+新节点,既有节点原地不动。同族防线:`mark_dirty`、`owner_of`、`depth_of`、
+`subtree_post_order` 都带步进上限,未来任何不变量破裂降级为一个错误,而不是一个
+楔死的进程;树深在写入边界封顶(`TreeError::Depth`,上限 256),使所有递归的
+读路径与析构一并有界。
+
+**detach 留下可寻址的占位。** `Musubi.Diff` 对"store 在两个既有键之间移动"先发
+落点、后发腾位:`[replace /b {"w": {store p}}, replace /a nil]`。收养把节点从
+`/a` 摘走时,若把键一并删掉,同一信封的下一条 op 就解析失败、整包回滚——一个
+合法的服务端帧不可以被拒收。所以从对象字段摘走节点时,源键改指一个新建的 Null
+普通节点;服务端总会在信封稍后腾位,终态一致,万一没有,漂移检查会抓住。同一
+父节点内的移位则是*交换*:被顶掉的节点接过收养腾出的槽——这正是一次重排保住
+两个节点的机制。信封结束时无人认领的占位节点一律释放。
+
+**指向 marker 内部的 pointer op 是合法的,按身份变更处理。** 服务端 diff 把
+渲染后的 JSON 文档当普通文档做 diff,所以 child store 的普通列表重排会发出
+`replace /rows/0/__musubi_store_id__/0 "b"`,前插会发出
+`remove /rows/0/__musubi_store_id__`——TypeScript 参考客户端对着打平文档直接
+就能应用,这些形状因此是合约合法的。树上这个键被剥进了 `NodeKind::Store`,
+所以 walk 特判:寻址到 store 节点的 `__musubi_store_id__` 时,改动 id 向量就是
+改动身份,走与上文完全相同的索引/认领/收养机制——替换元素 = 换 id;整键
+`remove` = 节点降为普通值;整键 `add` = 挂载子 store。
 
 **偏离(记录方式,不是行为)。** 原文写的是“会以 `warn!` 记录”。`musubi-state`
 没有 `tracing` 依赖(§1.3),而为了一行日志请回一条依赖,换来的是 crate 头一条
@@ -3382,6 +3430,29 @@ impl ChatWindow {
 普查的结论不会改变答案。将来若某个页面把一个大列表按位置拼接、并被 profile 指认
 为热点,正确的修法也不是在通用运行时里猜身份,而是让服务端为那个字段声明
 `stream`——那是 Musubi 里本来就为此存在的工具,而且它带来的是真身份,不是猜的。
+
+**修订——`add` / `remove` 是结构 op,搬的是节点,不是值。** 上面这条决定原样
+适用于**等价**(`Array` 按同下标比较)与**整列 `replace`**:位置 *k* 就是服务端
+放在位置 *k* 的东西,`reconcile_array` 逐字实现它。但 `add /list/i` 不是同一句
+陈述——RFC 6902 把它定义为一次插入,服务端的差分已经把“这里多了一个元素”说完
+了,所以把尾部整体右移一格是**照着念**,不是从两条 op 里猜出一次移动(理由 1
+说的正是不要猜)。因此 `add`/`remove` 之后:数组节点自己变更并通知(它的语义就是
+子节点语义的有序序列),只是挪了位的元素不变更、不通知,并保留自己的 `NodeId`、
+子树与订阅者。
+
+把尾部的**值**逐个改写(每个位置调和它前驱的值)是原先的实现,换掉它有两条
+硬理由,都不是风格问题:
+
+1. **它是有损的,而且是静默的。** `Collection` 的 wire 投影就是那个裸 marker
+   ——流内容只走 `stream_ops`,从不进入值(§3.1)——所以一个流槽位经由
+   `semantic_deep().to_wire()` 右移一格之后,出来的是一个**空**集合,集合索引还
+   指向这个空的。
+2. **它的代价是每 op 两份尾部深拷贝**,而且全程持有 arena 锁:release 模式下,
+   一个 2.1 KB 信封里的 50 条 op 打在 20 000 元素的数组上,把客户端楔住 1.99 秒。
+
+下标身份要成立,就得让下标处的节点改持前驱的值,也就必然是 O(尾部) 次子树
+深拷贝;没有便宜的做法。子 store 早就已经是搬节点而不是改写(§3.2 的收养),
+所以搬节点同时也让数组里的每一种元素表现一致。
 
 ### 9.2 事务
 

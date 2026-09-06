@@ -70,13 +70,15 @@ impl ChangeSet {
         Self { changed, edits }
     }
 
-    /// Every node whose semantic value changed: first the nodes still in the
-    /// tree, children before parents, then the nodes this transaction removed,
-    /// again children before parents.
+    /// Every node whose semantic value changed: first the ones this transaction
+    /// settled, children before parents, then the ones it removed and had not
+    /// already settled, again children before parents.
     ///
-    /// The two runs are not interleaved — a removed child is detached before it
-    /// is notified, so it has no depth in the tree the settled nodes were sorted
-    /// by (§9.3).
+    /// A node that changed **and** then left the tree in the same transaction —
+    /// `[replace /a/n 5, remove /a]` — is in the first run rather than the
+    /// second: it was settled before it was detached, and either way it is
+    /// reported exactly once. What the split buys is that a node still in the
+    /// tree is never ordered against one that has no depth left in it (§9.3).
     pub fn changed(&self) -> &[NodeId] {
         &self.changed
     }

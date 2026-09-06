@@ -6,13 +6,14 @@
 //! on: the pointer walk, structural sharing, the carry-over table and the
 //! lock discipline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::arena::MAX_DEPTH;
 use crate::change::CollectionEdit;
 use crate::error::{ReadError, TreeError};
 use crate::node::{AsyncStatus, NodeId, NodeKind, Semantic, SemanticValue};
@@ -55,6 +56,18 @@ fn insert_op(item_key: &str, at: i64, item: Value, limit: Option<i64>) -> Stream
         at,
         item,
         limit,
+    }
+}
+
+/// An append onto the `messages` stream of one **child** store.
+fn row_insert_op(segments: &[&str], item_key: &str, item: Value) -> StreamOp {
+    StreamOp::Insert {
+        stream: "messages".to_owned(),
+        store_id: store_id(segments),
+        item_key: item_key.to_owned(),
+        at: -1,
+        item,
+        limit: None,
     }
 }
 
@@ -108,6 +121,68 @@ impl Log {
 
         taken
     }
+}
+
+/// Applies on a worker thread, so a regression that spins **holding the arena
+/// lock** — the shape a parent cycle used to have — fails this test instead of
+/// wedging the whole run.
+fn apply_within(tree: &StateTree, ops: &[PatchOp]) -> Result<(), TreeError> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = tree.clone();
+    let ops = ops.to_vec();
+
+    std::thread::spawn(move || {
+        let outcome = worker.apply(&ops, &[]).map(drop);
+
+        let _ = sender.send(outcome);
+    });
+
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the transaction was expected to finish rather than spin under the lock")
+}
+
+/// Every node reachable from the root, and the three assertions §3.2 rests on:
+/// the tree is a tree — no node is reachable twice, none is its own ancestor,
+/// and the arena holds nothing the root cannot reach.
+fn assert_is_a_tree(tree: &StateTree) -> Vec<NodeId> {
+    let arena = tree.inner().lock();
+    let mut seen = HashSet::new();
+    let mut stack = vec![arena.root];
+    let mut nodes = Vec::new();
+
+    while let Some(id) = stack.pop() {
+        assert!(seen.insert(id), "node {id:?} is reachable from two parents");
+        assert!(nodes.len() < 10_000, "the walk from the root does not end");
+
+        nodes.push(id);
+        stack.extend(arena.children(id));
+    }
+
+    for id in &nodes {
+        let mut cursor = arena.nodes[*id].parent;
+        let mut steps = 0;
+
+        while let Some(current) = cursor {
+            assert_ne!(current, *id, "node {id:?} is its own ancestor");
+
+            steps += 1;
+
+            assert!(steps <= MAX_DEPTH + 1, "node {id:?} has no root above it");
+
+            cursor = arena.nodes[current].parent;
+        }
+    }
+
+    // A committed transaction frees everything it detached, the null
+    // placeholders adoption left behind included.
+    assert_eq!(
+        nodes.len(),
+        arena.nodes.len(),
+        "the arena holds nodes the root cannot reach"
+    );
+
+    nodes
 }
 
 /// One node's cached semantic value.
@@ -900,6 +975,105 @@ fn a_limit_trim_removes_the_overflow_row_and_kills_its_node() {
     );
 }
 
+#[test]
+fn a_trim_of_several_rows_reports_them_in_removal_order_from_either_end() {
+    // The overflow leaves in one `drain` / `split_off` rather than one
+    // `Vec::remove` per row — the row-by-row form cost O(n·k) and took 116 ms
+    // for a single op against a 20 000-row list. What a list adapter replays is
+    // the edit sequence (§6.3), so it is the edit sequence that has to be
+    // identical: each index is the one its row held at the moment it was taken
+    // out, which for a front trim is always `0` and for a back trim counts down.
+    let front = {
+        let tree = streaming_tree();
+        let messages = messages_state(&tree);
+
+        commit(
+            &tree,
+            &[],
+            &[
+                insert_op("a", -1, json!({"id": "a"}), None),
+                insert_op("b", -1, json!({"id": "b"}), None),
+                insert_op("c", -1, json!({"id": "c"}), None),
+                insert_op("d", -1, json!({"id": "d"}), None),
+            ],
+        );
+
+        let notify = tree
+            .apply(&[], &[insert_op("e", -1, json!({"id": "e"}), Some(-2))])
+            .expect("applies");
+        let edits = notify.changes().collection_edits(messages.node()).to_vec();
+
+        drop(notify);
+
+        assert_eq!(keys(&messages), ["d", "e"]);
+
+        edits
+    };
+
+    assert_eq!(
+        front[1..],
+        [
+            CollectionEdit::Removed {
+                item_key: Arc::from("a"),
+                index: 0,
+            },
+            CollectionEdit::Removed {
+                item_key: Arc::from("b"),
+                index: 0,
+            },
+            CollectionEdit::Removed {
+                item_key: Arc::from("c"),
+                index: 0,
+            },
+        ]
+    );
+
+    let back = {
+        let tree = streaming_tree();
+        let messages = messages_state(&tree);
+
+        commit(
+            &tree,
+            &[],
+            &[
+                insert_op("a", -1, json!({"id": "a"}), None),
+                insert_op("b", -1, json!({"id": "b"}), None),
+                insert_op("c", -1, json!({"id": "c"}), None),
+                insert_op("d", -1, json!({"id": "d"}), None),
+            ],
+        );
+
+        let notify = tree
+            .apply(&[], &[insert_op("e", 0, json!({"id": "e"}), Some(-2))])
+            .expect("applies");
+        let edits = notify.changes().collection_edits(messages.node()).to_vec();
+
+        drop(notify);
+
+        assert_eq!(keys(&messages), ["e", "a"]);
+
+        edits
+    };
+
+    assert_eq!(
+        back[1..],
+        [
+            CollectionEdit::Removed {
+                item_key: Arc::from("d"),
+                index: 4,
+            },
+            CollectionEdit::Removed {
+                item_key: Arc::from("c"),
+                index: 3,
+            },
+            CollectionEdit::Removed {
+                item_key: Arc::from("b"),
+                index: 2,
+            },
+        ]
+    );
+}
+
 // -------------------------------------------------------- keyed reconciliation
 
 #[test]
@@ -997,6 +1171,55 @@ fn an_upsert_keeps_the_row_node_and_pushes_only_the_field_that_moved() {
     assert_eq!(messages.by_key("a").expect("a").node(), node);
     assert_eq!(log.taken(), ["body"]);
     assert_eq!(id.revision(), id_revision);
+}
+
+#[test]
+fn a_stream_row_that_stops_being_the_store_it_was_does_not_keep_its_node() {
+    // The upsert keeps the **node** for a key the list already holds (§3.1) —
+    // but a store id is that node's own identity (§3.2), so a row rendered as a
+    // different child store is a different node, and the handle that read the
+    // old id when it was made reads as gone rather than addressing the new one.
+    let tree = streaming_tree();
+    let messages = messages_state(&tree);
+
+    commit(
+        &tree,
+        &[],
+        &[insert_op(
+            "a",
+            -1,
+            json!({"__musubi_store_id__": ["row", "a"], "n": 1}),
+            None,
+        )],
+    );
+
+    let row = StoreState::from(messages.by_key("a").expect("a"));
+    let node = row.node();
+
+    assert_eq!(tree.store_node(&store_id(&["row", "a"])), Some(node));
+
+    commit(
+        &tree,
+        &[],
+        &[insert_op(
+            "a",
+            -1,
+            json!({"__musubi_store_id__": ["row", "b"], "n": 1}),
+            None,
+        )],
+    );
+
+    let fresh = StoreState::from(messages.by_key("a").expect("a"));
+
+    assert_is_a_tree(&tree);
+    assert_ne!(fresh.node(), node);
+    assert!(!row.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["row", "a"])), None);
+    assert_eq!(
+        tree.store_node(&store_id(&["row", "b"])),
+        Some(fresh.node())
+    );
+    assert_eq!(keys(&messages), ["a"]);
 }
 
 #[test]
@@ -1401,6 +1624,1113 @@ fn a_node_reparented_after_it_was_dirtied_settles_before_its_new_ancestors() {
     );
 }
 
+// ------------------------------------------------- adoption keeps a tree a tree
+
+#[test]
+fn a_store_rendered_under_its_own_descendant_gets_a_node_of_its_own() {
+    // Adoption reparents; adopting a node under something it already contains
+    // would close a parent cycle, and every walk up the tree — `mark_dirty`'s
+    // included, which runs holding the arena lock — would then never reach a
+    // root. §3.2's duplicate rule is the answer: a new node, not a new parent.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "a": {"__musubi_store_id__": ["X"], "inner": {"k": 1}}
+    }));
+    let outer = tree.root::<Value>().field::<Value>("a").expect("a");
+
+    apply_within(
+        &tree,
+        &[add(
+            "/a/inner/self",
+            json!({"__musubi_store_id__": ["X"], "inner": {"k": 2}}),
+        )],
+    )
+    .expect("the op applies rather than spinning");
+
+    assert_is_a_tree(&tree);
+
+    let nested = outer
+        .field::<Value>("inner")
+        .and_then(|inner| inner.field::<Value>("self"))
+        .expect("/a/inner/self");
+
+    assert_ne!(nested.node(), outer.node());
+    assert!(outer.is_live());
+    assert_eq!(
+        nested.value(),
+        json!({"__musubi_store_id__": ["X"], "inner": {"k": 2}})
+    );
+}
+
+#[test]
+fn a_store_rendered_as_a_child_of_itself_gets_a_node_of_its_own() {
+    // The one-level form of the same cycle: the parent the value lands under
+    // *is* the node its id names.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "a": {"__musubi_store_id__": ["p"], "n": 1}
+    }));
+    let panel = tree.root::<Value>().field::<Value>("a").expect("a");
+
+    apply_within(
+        &tree,
+        &[
+            replace("/a/n", json!(2)),
+            add("/a/child", json!({"__musubi_store_id__": ["p"], "n": 3})),
+        ],
+    )
+    .expect("the ops apply rather than spinning");
+
+    assert_is_a_tree(&tree);
+
+    let child = panel.field::<Value>("child").expect("/a/child");
+
+    assert_ne!(child.node(), panel.node());
+    assert_eq!(
+        panel.value(),
+        json!({
+            "__musubi_store_id__": ["p"],
+            "n": 2,
+            "child": {"__musubi_store_id__": ["p"], "n": 3}
+        })
+    );
+}
+
+#[test]
+fn a_bare_marker_rendered_under_its_own_subtree_leaves_that_subtree_standing() {
+    // The variant that did not hang: adoption reparented the ancestor under its
+    // own descendant and then reconciled it into an empty store, taking the
+    // whole subtree — and the root's key with it — while reporting success.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "a": {"__musubi_store_id__": ["X"], "inner": {"k": 1}}
+    }));
+
+    apply_within(
+        &tree,
+        &[add("/a/inner/self", json!({"__musubi_store_id__": ["X"]}))],
+    )
+    .expect("the op applies");
+
+    assert_is_a_tree(&tree);
+    assert_eq!(
+        tree.root::<Value>().value(),
+        json!({
+            "__musubi_store_id__": [],
+            "a": {
+                "__musubi_store_id__": ["X"],
+                "inner": {"k": 1, "self": {"__musubi_store_id__": ["X"]}}
+            }
+        })
+    );
+}
+
+#[test]
+fn one_stream_rendered_under_two_keys_of_one_store_becomes_two_collections() {
+    // A collection is adopted by `(owner, name)` the way a store is adopted by
+    // its id, so the duplicate rule has to hold for it too: one render naming
+    // the same stream twice is a server bug, and the second sighting gets a node
+    // of its own rather than becoming a second parent for the first.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "panel": {
+            "__musubi_store_id__": ["panel"],
+            "messages": {"__musubi_stream__": "messages"}
+        }
+    }));
+
+    commit(
+        &tree,
+        &[],
+        &[row_insert_op(&["panel"], "m1", json!({"id": "m1"}))],
+    );
+
+    let panel = tree.root::<Value>().field::<Value>("panel").expect("panel");
+    let messages = panel
+        .field::<Vec<Value>>("messages")
+        .expect("messages")
+        .node();
+
+    commit(
+        &tree,
+        &[add(
+            "/panel/mirror",
+            json!({"__musubi_stream__": "messages"}),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_ne!(
+        panel.field::<Vec<Value>>("mirror").expect("mirror").node(),
+        messages
+    );
+    assert_eq!(
+        panel.value(),
+        json!({
+            "__musubi_store_id__": ["panel"],
+            "messages": [{"id": "m1"}],
+            "mirror": []
+        })
+    );
+}
+
+// --------------------------------------------------------------- the depth cap
+
+/// `levels` levels of nesting: `nest(1)` is a scalar, `nest(2)` is `{"n": 1}`.
+fn nest(levels: usize) -> Value {
+    let mut value = json!(1);
+
+    for _ in 1..levels {
+        value = json!({ "n": value });
+    }
+
+    value
+}
+
+#[test]
+fn a_value_that_would_nest_past_the_depth_cap_is_refused_and_the_tree_stays_usable() {
+    // The cap is on the **tree**, not on one document: `serde_json`'s own
+    // nesting limit bounds a single `value`, and an `add` at a successively
+    // deeper path composes depth across ops and across envelopes. Past the stack
+    // the recursive walks run on, that is a `SIGABRT` — not a panic, so nothing
+    // catches it and the journal never rolls back.
+    let tree = seeded(json!({"count": 1}));
+    let mut path = String::new();
+
+    // Exactly at the cap: the deepest node sits `MAX_DEPTH` levels below the
+    // root, one op at a time.
+    for _ in 0..MAX_DEPTH {
+        path.push_str("/n");
+
+        commit(&tree, &[add(&path, json!({}))], &[]);
+    }
+
+    let before = tree.to_wire(tree.root_id());
+    let nodes = tree.len();
+
+    path.push_str("/n");
+
+    let error = tree
+        .apply(&[add(&path, json!({}))], &[])
+        .expect_err("one level past the cap is refused");
+
+    assert!(matches!(error, TreeError::Depth { .. }));
+    // Refusing rolls the transaction back like any other failure, and the tree
+    // is exactly what it was.
+    assert_eq!(tree.to_wire(tree.root_id()), before);
+    assert_eq!(tree.len(), nodes);
+
+    commit(&tree, &[replace("/count", json!(2))], &[]);
+
+    assert_eq!(
+        tree.root::<Value>()
+            .field::<i64>("count")
+            .expect("count")
+            .value(),
+        2
+    );
+}
+
+#[test]
+fn one_value_is_measured_against_the_same_cap_as_a_run_of_ops() {
+    let tree = StateTree::new();
+
+    // `nest(MAX_DEPTH + 1)` puts its deepest node exactly at the cap: the
+    // outermost level is the root, at depth 0.
+    commit(&tree, &[replace("", nest(MAX_DEPTH + 1))], &[]);
+
+    assert!(
+        tree.apply(&[replace("", nest(MAX_DEPTH + 2))], &[])
+            .is_err()
+    );
+    assert!(
+        tree.apply(&[], &[insert_op("a", -1, nest(MAX_DEPTH + 2), None)],)
+            .is_ok(),
+        "a stream op for a slot this tree does not have is still dropped, not refused"
+    );
+}
+
+#[test]
+fn a_stream_item_is_measured_against_the_depth_cap_too() {
+    let tree = streaming_tree();
+
+    // The collection sits two levels down, so its items start at three.
+    let error = tree
+        .apply(&[], &[insert_op("a", -1, nest(MAX_DEPTH), None)])
+        .expect_err("an item deeper than the cap is refused");
+
+    assert!(matches!(error, TreeError::Depth { .. }));
+    assert!(messages_state(&tree).is_empty());
+
+    commit(&tree, &[], &[insert_op("a", -1, json!({"id": "a"}), None)]);
+
+    assert_eq!(keys(&messages_state(&tree)), ["a"]);
+}
+
+// ------------------------------------------------- landing before vacating
+
+#[test]
+fn a_store_that_lands_before_its_old_key_is_vacated_keeps_its_node() {
+    // The literal `Musubi.Diff` output for a child store that moved between two
+    // keys that both exist: the op that **lands** it comes first, and the one
+    // that vacates its old slot comes second. Detaching the node used to delete
+    // the source key outright, so the second op could not resolve and a
+    // legitimate server frame was rejected whole.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "a": {"__musubi_store_id__": ["p"], "n": 1},
+        "b": {}
+    }));
+    let panel = StoreState::from(tree.root::<Value>().field::<Value>("a").expect("a"));
+    let node = panel.node();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let _watch = panel.subscribe(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+
+    commit(
+        &tree,
+        &[
+            add("/b/w", json!({"__musubi_store_id__": ["p"], "n": 1})),
+            replace("/a", json!(null)),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(tree.store_node(&store_id(&["p"])), Some(node));
+    assert_eq!(
+        tree.root::<Value>().value(),
+        json!({
+            "__musubi_store_id__": [],
+            "a": null,
+            "b": {"w": {"__musubi_store_id__": ["p"], "n": 1}}
+        })
+    );
+    assert!(panel.fields().is_live());
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    // The subscription registered before the move is still the moved node's.
+    commit(&tree, &[replace("/b/w/n", json!(2))], &[]);
+
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_vacated_key_the_render_drops_altogether_is_removable() {
+    // The other half of the same shape: when the new render has no key at all
+    // where the store used to be, `Musubi.Diff` emits `remove`, and that has to
+    // resolve against the placeholder the move left behind.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "a": {"__musubi_store_id__": ["p"], "n": 1},
+        "b": {}
+    }));
+    let node = tree.root::<Value>().field::<Value>("a").expect("a").node();
+
+    commit(
+        &tree,
+        &[
+            add("/b/w", json!({"__musubi_store_id__": ["p"], "n": 1})),
+            remove("/a"),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(tree.store_node(&store_id(&["p"])), Some(node));
+    assert_eq!(
+        tree.root::<Value>().value(),
+        json!({
+            "__musubi_store_id__": [],
+            "b": {"w": {"__musubi_store_id__": ["p"], "n": 1}}
+        })
+    );
+}
+
+// ----------------------------------------------- replace is a child-level write
+
+#[test]
+fn a_replace_that_lands_a_store_living_elsewhere_moves_its_node() {
+    // §3.2's headline promise, on the op shape the server actually emits for a
+    // child store that moved between two slots: `replace` used to reconcile the
+    // node the pointer resolved to *directly*, so it never consulted the store
+    // index and built a second node for a store that already had one.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "panel": {"__musubi_store_id__": ["x"], "n": 1},
+        "slot": null
+    }));
+    let panel = StoreState::from(tree.root::<Value>().field::<Value>("panel").expect("panel"));
+    let total = panel.fields().field::<i64>("n").expect("n");
+    let (node, total_node, nodes) = (panel.node(), total.node(), tree.len());
+    let log = Log::default();
+    let _watch = log.watch("n", &total);
+
+    commit(
+        &tree,
+        &[
+            replace("/slot", json!({"__musubi_store_id__": ["x"], "n": 1})),
+            replace("/panel", json!(null)),
+        ],
+        &[],
+    );
+
+    let moved = tree.root::<Value>().field::<Value>("slot").expect("slot");
+
+    assert_is_a_tree(&tree);
+    assert_eq!(moved.node(), node);
+    assert_eq!(total.node(), total_node);
+    assert!(log.taken().is_empty());
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(node));
+    assert_eq!(tree.store_ids().len(), 2);
+    assert_eq!(tree.len(), nodes);
+    assert_eq!(
+        tree.root::<Value>().value(),
+        json!({
+            "__musubi_store_id__": [],
+            "panel": null,
+            "slot": {"__musubi_store_id__": ["x"], "n": 1}
+        })
+    );
+}
+
+#[test]
+fn a_store_removed_and_landed_again_in_one_envelope_keeps_its_node() {
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "left": {"__musubi_store_id__": ["x"], "n": 1},
+        "right": null
+    }));
+    let panel = StoreState::from(tree.root::<Value>().field::<Value>("left").expect("left"));
+    let node = panel.node();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let _watch = panel.subscribe(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+
+    commit(
+        &tree,
+        &[
+            remove("/left"),
+            replace("/right", json!({"__musubi_store_id__": ["x"], "n": 1})),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(
+        tree.root::<Value>()
+            .field::<Value>("right")
+            .expect("right")
+            .node(),
+        node
+    );
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(node));
+    // The node moved; it was never removed, so nothing was told.
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_slot_given_a_different_store_id_does_not_reuse_the_old_store_node() {
+    // A store node's identity *is* its id: reusing the node would leave a live
+    // `StoreState` — which reads its id once, at handle creation (§3.2) —
+    // pointed at a node that has since become some other store, so
+    // `command_on` would dispatch at the wrong target and read the wrong
+    // fields.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "panel": {"__musubi_store_id__": ["a"], "n": 1}
+    }));
+    let panel = StoreState::from(tree.root::<Value>().field::<Value>("panel").expect("panel"));
+
+    assert_eq!(panel.store_id(), Some(store_id(&["a"])));
+
+    commit(
+        &tree,
+        &[replace(
+            "/panel",
+            json!({"__musubi_store_id__": ["b"], "n": 2}),
+        )],
+        &[],
+    );
+
+    let fresh = StoreState::from(tree.root::<Value>().field::<Value>("panel").expect("panel"));
+
+    assert!(!panel.fields().is_live());
+    assert_ne!(fresh.node(), panel.node());
+    assert_eq!(fresh.store_id(), Some(store_id(&["b"])));
+    assert_eq!(tree.store_node(&store_id(&["a"])), None);
+    assert_eq!(tree.store_node(&store_id(&["b"])), Some(fresh.node()));
+
+    // The same id is the same store, and keeps everything.
+    commit(
+        &tree,
+        &[replace(
+            "/panel",
+            json!({"__musubi_store_id__": ["b"], "n": 3}),
+        )],
+        &[],
+    );
+
+    assert_eq!(
+        tree.root::<Value>()
+            .field::<Value>("panel")
+            .expect("panel")
+            .node(),
+        fresh.node()
+    );
+    assert!(fresh.fields().is_live());
+}
+
+#[test]
+fn a_stream_item_may_take_a_store_an_earlier_patch_op_placed() {
+    // Two things at once. The claimed set is scoped to **one op**, patch or
+    // stream: a stream op that inherited the previous patch op's claims would
+    // refuse to adopt and build a second node for a store that already has one.
+    // And the key the adoption vacates stays in the render rather than being
+    // deleted out of its parent behind the server's back.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "slot": null,
+        "messages": {"__musubi_stream__": "messages"}
+    }));
+
+    commit(
+        &tree,
+        &[replace(
+            "/slot",
+            json!({"__musubi_store_id__": ["x"], "n": 1}),
+        )],
+        &[insert_op(
+            "a",
+            -1,
+            json!({"id": "a", "panel": {"__musubi_store_id__": ["x"], "n": 1}}),
+            None,
+        )],
+    );
+
+    let nodes = assert_is_a_tree(&tree);
+    let messages = StreamState::from(
+        tree.root::<Value>()
+            .field::<Vec<Value>>("messages")
+            .expect("messages"),
+    );
+    let row = messages.by_key("a").expect("a");
+    let panel = row.field::<Value>("panel").expect("panel");
+
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(panel.node()));
+    assert_eq!(tree.store_ids().len(), 2);
+    assert_eq!(nodes.len(), tree.len());
+    assert_eq!(
+        tree.root::<Value>().value(),
+        json!({
+            "__musubi_store_id__": [],
+            "slot": null,
+            "messages": [{"id": "a", "panel": {"__musubi_store_id__": ["x"], "n": 1}}]
+        })
+    );
+}
+
+// ------------------------------------------------- positional rewrites
+
+#[test]
+fn an_add_that_renders_a_store_a_second_time_gives_the_newcomer_its_own_node() {
+    // `[{store a}]` + `add /rows/1 {store a}` is what `Musubi.Diff` emits when
+    // a plain row is prepended before a store row. The prefix keeps the node it
+    // has, so the positional rewrite must not also hand it to the new position:
+    // one `NodeId` in two slots is a tree that is not a tree.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"__musubi_store_id__": ["a"], "n": 1}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let first = rows.at(0).expect("rows[0]").node();
+
+    commit(
+        &tree,
+        &[add(
+            "/rows/1",
+            json!({"__musubi_store_id__": ["a"], "n": 1}),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.at(0).expect("rows[0]").node(), first);
+    assert_ne!(rows.at(1).expect("rows[1]").node(), first);
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"__musubi_store_id__": ["a"], "n": 1}),
+            json!({"__musubi_store_id__": ["a"], "n": 1})
+        ]
+    );
+}
+
+#[test]
+fn an_add_before_a_store_row_shifts_it_right_and_keeps_its_node() {
+    // The right-to-left rewrite (§3.2): every position takes its predecessor's
+    // value, so the store has to be claimed by the position it moves *into*
+    // before the position it moves out of is rewritten.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [
+            {"kind": "banner"},
+            {"__musubi_store_id__": ["a"], "n": 1},
+            {"__musubi_store_id__": ["b"], "n": 2}
+        ]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let panel = StoreState::from(rows.at(1).expect("rows[1]"));
+    let (first, second) = (panel.node(), rows.at(2).expect("rows[2]").node());
+
+    commit(&tree, &[add("/rows/0", json!({"kind": "header"}))], &[]);
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(2).expect("rows[2]").node(), first);
+    assert_eq!(rows.at(3).expect("rows[3]").node(), second);
+    assert!(panel.fields().is_live());
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"kind": "header"}),
+            json!({"kind": "banner"}),
+            json!({"__musubi_store_id__": ["a"], "n": 1}),
+            json!({"__musubi_store_id__": ["b"], "n": 2})
+        ]
+    );
+}
+
+#[test]
+fn a_remove_before_a_store_row_shifts_it_left_and_keeps_its_node() {
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"kind": "header"}, {"kind": "banner"}, {"__musubi_store_id__": ["a"], "n": 1}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let panel = StoreState::from(rows.at(2).expect("rows[2]"));
+    let node = panel.node();
+
+    commit(&tree, &[remove("/rows/0")], &[]);
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(1).expect("rows[1]").node(), node);
+    assert!(panel.fields().is_live());
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"kind": "banner"}),
+            json!({"__musubi_store_id__": ["a"], "n": 1})
+        ]
+    );
+}
+
+#[test]
+fn a_position_rendered_as_a_plain_value_does_not_destroy_the_store_a_later_one_adopts() {
+    // A whole-list `replace` where a plain row is prepended: position 0's value
+    // is not a store, and rewriting the store node standing there in place
+    // would unregister it — so position 1 would find nothing to adopt and build
+    // a copy, while a live handle read the banner out of what used to be its
+    // store.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"__musubi_store_id__": ["panel"], "n": 1}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let panel = StoreState::from(rows.at(0).expect("rows[0]"));
+    let node = panel.node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/rows",
+            json!([{"banner": true}, {"__musubi_store_id__": ["panel"], "n": 1}]),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(1).expect("rows[1]").node(), node);
+    assert_ne!(rows.at(0).expect("rows[0]").node(), node);
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["panel"])), Some(node));
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"banner": true}),
+            json!({"__musubi_store_id__": ["panel"], "n": 1})
+        ]
+    );
+}
+
+#[test]
+fn a_store_and_a_plain_row_that_swap_places_keep_the_store_node() {
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"__musubi_store_id__": ["panel"], "n": 1}, {"banner": true}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let node = rows.at(0).expect("rows[0]").node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/rows",
+            json!([{"banner": true}, {"__musubi_store_id__": ["panel"], "n": 1}]),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(1).expect("rows[1]").node(), node);
+    assert_eq!(tree.store_node(&store_id(&["panel"])), Some(node));
+}
+
+// ------------------------------------------------- settling what was adopted
+
+#[test]
+fn a_parent_built_around_an_adopted_child_settles_after_it() {
+    // The adopted node arrives with the value it had *before* this transaction
+    // — its cache is deliberately stale until commit settles it — and the
+    // parent being built around it computes its own value from that cache. If
+    // the fresh parent never enters the dirty set, it keeps the stale value for
+    // good: the kinds say `total: 5` and every read says `total: 1`.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "p": {"__musubi_store_id__": ["p"], "total": 1}
+    }));
+
+    commit(
+        &tree,
+        &[
+            replace("/p/total", json!(5)),
+            add(
+                "/q",
+                json!({"w": {"__musubi_store_id__": ["p"], "total": 5}}),
+            ),
+            remove("/p"),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(
+        tree.root::<Value>().value(),
+        json!({
+            "__musubi_store_id__": [],
+            "q": {"w": {"__musubi_store_id__": ["p"], "total": 5}}
+        })
+    );
+}
+
+#[test]
+fn a_node_dirtied_after_it_was_adopted_settles_every_one_of_its_new_ancestors() {
+    // The mark_dirty walk runs to the root every time rather than stopping at
+    // the first node already in the dirty set: `inner` is dirtied *after* the
+    // store was adopted, so its new ancestors — the store's own already-dirty
+    // node among them — are the only thing standing between the settled value
+    // and the root.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "p": {"__musubi_store_id__": ["p"], "total": 1, "inner": {"n": 1}}
+    }));
+
+    commit(
+        &tree,
+        &[
+            replace("/p/total", json!(5)),
+            add(
+                "/q",
+                json!({
+                    "w": {"__musubi_store_id__": ["p"], "total": 5, "inner": {"n": 2}}
+                }),
+            ),
+            remove("/p"),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(
+        tree.root::<Value>().value(),
+        json!({
+            "__musubi_store_id__": [],
+            "q": {"w": {"__musubi_store_id__": ["p"], "total": 5, "inner": {"n": 2}}}
+        })
+    );
+}
+
+// ------------------------------------------------------------- the store marker
+
+#[test]
+fn a_reordered_list_of_child_stores_arrives_as_marker_ops_and_keeps_both_nodes() {
+    // `Jsonpatch.diff/2` descends into `__musubi_store_id__` like any other
+    // key, so a reorder of two child stores arrives as ops *into the marker*.
+    // The tree keeps the id on the node rather than in the field map, so these
+    // have to be read as what they are — a change of identity — and routed
+    // through adoption, or a legitimate server frame is rejected whole.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"__musubi_store_id__": ["a"]}, {"__musubi_store_id__": ["b"]}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let (first, second) = (
+        rows.at(0).expect("rows[0]").node(),
+        rows.at(1).expect("rows[1]").node(),
+    );
+
+    commit(
+        &tree,
+        &[
+            replace("/rows/1/__musubi_store_id__/0", json!("a")),
+            replace("/rows/0/__musubi_store_id__/0", json!("b")),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(0).expect("rows[0]").node(), second);
+    assert_eq!(rows.at(1).expect("rows[1]").node(), first);
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"__musubi_store_id__": ["b"]}),
+            json!({"__musubi_store_id__": ["a"]})
+        ]
+    );
+    assert_eq!(tree.store_node(&store_id(&["a"])), Some(first));
+    assert_eq!(tree.store_node(&store_id(&["b"])), Some(second));
+}
+
+#[test]
+fn a_reordered_list_of_child_stores_with_fields_keeps_both_nodes_and_both_values() {
+    // The same reorder when the rows carry fields: four ops, the field writes
+    // interleaved with the marker writes, exactly as `Jsonpatch.diff/2` emits
+    // them.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [
+            {"__musubi_store_id__": ["a"], "label": "A"},
+            {"__musubi_store_id__": ["b"], "label": "B"}
+        ]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let (first, second) = (
+        rows.at(0).expect("rows[0]").node(),
+        rows.at(1).expect("rows[1]").node(),
+    );
+
+    commit(
+        &tree,
+        &[
+            replace("/rows/1/label", json!("A")),
+            replace("/rows/1/__musubi_store_id__/0", json!("a")),
+            replace("/rows/0/label", json!("B")),
+            replace("/rows/0/__musubi_store_id__/0", json!("b")),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(0).expect("rows[0]").node(), second);
+    assert_eq!(rows.at(1).expect("rows[1]").node(), first);
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"__musubi_store_id__": ["b"], "label": "B"}),
+            json!({"__musubi_store_id__": ["a"], "label": "A"})
+        ]
+    );
+    assert_eq!(tree.store_node(&store_id(&["a"])), Some(first));
+    assert_eq!(tree.store_node(&store_id(&["b"])), Some(second));
+}
+
+#[test]
+fn a_row_prepended_before_a_child_store_arrives_as_a_marker_removal() {
+    // The literal `Jsonpatch.diff/2` output for `[{store a}]` becoming
+    // `[{banner}, {store a}]`: the added row lands first, then the marker and
+    // the fields of row 0 are rewritten in place. Removing the marker makes
+    // that node a plain object — a store node is never rewritten into a
+    // non-store, it unmounts — and the store id ends up on the row that carries
+    // it.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"__musubi_store_id__": ["a"], "n": 1}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+
+    commit(
+        &tree,
+        &[
+            add("/rows/1", json!({"__musubi_store_id__": ["a"], "n": 1})),
+            remove("/rows/0/n"),
+            remove("/rows/0/__musubi_store_id__"),
+            add("/rows/0/kind", json!("banner")),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"kind": "banner"}),
+            json!({"__musubi_store_id__": ["a"], "n": 1})
+        ]
+    );
+    assert_eq!(
+        tree.store_node(&store_id(&["a"])),
+        Some(rows.at(1).expect("rows[1]").node())
+    );
+    assert_eq!(tree.store_ids().len(), 2);
+}
+
+#[test]
+fn a_reordered_list_of_stream_bearing_child_stores_keeps_every_item_of_both_streams() {
+    // The reorder shape again, with a stream under each row. A marker op
+    // re-expresses the identity change as a value write built from
+    // `semantic_deep().to_wire()`, and a `Collection`'s wire projection is its
+    // bare marker — items travel in `stream_ops` and never in a value (§3.1).
+    // Both rows move by adoption, so the bare marker lands on the collection
+    // that is already there and says nothing about what it holds.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [
+            {"__musubi_store_id__": ["a"], "messages": {"__musubi_stream__": "messages"}},
+            {"__musubi_store_id__": ["b"], "messages": {"__musubi_stream__": "messages"}}
+        ]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let (first, second) = (
+        rows.at(0).expect("rows[0]").node(),
+        rows.at(1).expect("rows[1]").node(),
+    );
+
+    commit(
+        &tree,
+        &[],
+        &[
+            row_insert_op(&["a"], "a1", json!({"id": "a1"})),
+            row_insert_op(&["a"], "a2", json!({"id": "a2"})),
+            row_insert_op(&["b"], "b1", json!({"id": "b1"})),
+        ],
+    );
+
+    commit(
+        &tree,
+        &[
+            replace("/rows/1/__musubi_store_id__/0", json!("a")),
+            replace("/rows/0/__musubi_store_id__/0", json!("b")),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(0).expect("rows[0]").node(), second);
+    assert_eq!(rows.at(1).expect("rows[1]").node(), first);
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"__musubi_store_id__": ["b"], "messages": [{"id": "b1"}]}),
+            json!({
+                "__musubi_store_id__": ["a"],
+                "messages": [{"id": "a1"}, {"id": "a2"}]
+            })
+        ]
+    );
+    assert_eq!(tree.store_node(&store_id(&["a"])), Some(first));
+    assert_eq!(tree.store_node(&store_id(&["b"])), Some(second));
+
+    // The collection index is keyed by `(store_id, stream)`, so the next item
+    // for store `a` has to land in the list that moved rather than in one
+    // nothing can reach.
+    commit(
+        &tree,
+        &[],
+        &[row_insert_op(&["a"], "a3", json!({"id": "a3"}))],
+    );
+
+    assert_eq!(
+        rows.at(1).expect("rows[1]").value(),
+        json!({
+            "__musubi_store_id__": ["a"],
+            "messages": [{"id": "a1"}, {"id": "a2"}, {"id": "a3"}]
+        })
+    );
+}
+
+#[test]
+fn a_row_prepended_before_a_stream_bearing_child_store_keeps_its_items() {
+    // The prepend shape with a stream under the row that moves. Store `a` is
+    // rendered in both frames — it never unmounts — so BDR-0011's fresh-mount
+    // reset does not apply to it and its items have to arrive at whatever node
+    // ends up carrying its id.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"__musubi_store_id__": ["a"], "messages": {"__musubi_stream__": "messages"}}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+
+    commit(
+        &tree,
+        &[],
+        &[
+            row_insert_op(&["a"], "a1", json!({"id": "a1"})),
+            row_insert_op(&["a"], "a2", json!({"id": "a2"})),
+        ],
+    );
+
+    commit(
+        &tree,
+        &[
+            add(
+                "/rows/1",
+                json!({
+                    "__musubi_store_id__": ["a"],
+                    "messages": {"__musubi_stream__": "messages"}
+                }),
+            ),
+            remove("/rows/0/messages"),
+            remove("/rows/0/__musubi_store_id__"),
+            add("/rows/0/kind", json!("banner")),
+        ],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"kind": "banner"}),
+            json!({
+                "__musubi_store_id__": ["a"],
+                "messages": [{"id": "a1"}, {"id": "a2"}]
+            })
+        ]
+    );
+    assert_eq!(
+        tree.store_node(&store_id(&["a"])),
+        Some(rows.at(1).expect("rows[1]").node())
+    );
+    assert_eq!(tree.store_ids().len(), 2);
+
+    commit(
+        &tree,
+        &[],
+        &[row_insert_op(&["a"], "a3", json!({"id": "a3"}))],
+    );
+
+    assert_eq!(
+        rows.at(1).expect("rows[1]").value(),
+        json!({
+            "__musubi_store_id__": ["a"],
+            "messages": [{"id": "a1"}, {"id": "a2"}, {"id": "a3"}]
+        })
+    );
+}
+
+#[test]
+fn adding_a_marker_mounts_a_child_store_and_removing_it_unmounts_one() {
+    let tree = seeded(json!({"__musubi_store_id__": [], "panel": {"n": 1}}));
+    let root = tree.root::<Value>();
+    let plain = root.field::<Value>("panel").expect("panel").node();
+
+    commit(
+        &tree,
+        &[add("/panel/__musubi_store_id__", json!(["panel"]))],
+        &[],
+    );
+
+    let mounted = StoreState::from(root.field::<Value>("panel").expect("panel"));
+
+    assert_ne!(mounted.node(), plain);
+    assert_eq!(mounted.store_id(), Some(store_id(&["panel"])));
+    assert_eq!(tree.store_node(&store_id(&["panel"])), Some(mounted.node()));
+
+    // A segment appended to the id is a different store.
+    commit(
+        &tree,
+        &[add("/panel/__musubi_store_id__/-", json!("0"))],
+        &[],
+    );
+
+    assert_eq!(tree.store_node(&store_id(&["panel"])), None);
+    assert_eq!(tree.store_ids().len(), 2);
+
+    commit(&tree, &[remove("/panel/__musubi_store_id__")], &[]);
+
+    assert_eq!(tree.store_ids(), [StoreId::root()]);
+    assert_eq!(
+        tree.root::<Value>().value(),
+        json!({"__musubi_store_id__": [], "panel": {"n": 1}})
+    );
+}
+
+#[test]
+fn a_malformed_store_marker_op_is_refused_and_rolls_the_envelope_back() {
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "panel": {"__musubi_store_id__": ["a"], "n": 1},
+        "scalar": 1
+    }));
+    let before = tree.to_wire(tree.root_id());
+
+    for op in [
+        // A store id is an array of strings, and one of its elements is a
+        // string.
+        replace("/panel/__musubi_store_id__", json!("a")),
+        replace("/panel/__musubi_store_id__/0", json!(7)),
+        // Out of range, and one level too deep.
+        replace("/panel/__musubi_store_id__/3", json!("b")),
+        remove("/panel/__musubi_store_id__/3"),
+        replace("/panel/__musubi_store_id__/0/deeper", json!("b")),
+        // Nothing but an object or a child store carries one.
+        add("/scalar/__musubi_store_id__", json!(["s"])),
+    ] {
+        assert!(
+            tree.apply(std::slice::from_ref(&op), &[]).is_err(),
+            "expected {op:?} to be refused"
+        );
+    }
+
+    assert_eq!(tree.to_wire(tree.root_id()), before);
+}
+
 // ---------------------------------------------------------------- the pointer
 
 #[test]
@@ -1477,7 +2807,17 @@ fn the_pointer_walk_refuses_what_it_cannot_address() {
 }
 
 #[test]
-fn an_add_at_an_index_shifts_the_values_because_index_is_the_identity() {
+fn an_add_at_an_index_inserts_and_moves_the_elements_after_it() {
+    // §9.1 reads a plain array's identity off the index, and a whole-list
+    // `replace` still honours that to the letter (the tests just above). An
+    // `add /list/0` is a different statement: RFC 6902 defines it as an
+    // insertion, so the tail is moved rather than rewritten — the element that
+    // was at 0 keeps its node, its value and its subscribers, and lands at 1.
+    //
+    // This is what the rewrite-the-values shift was traded for: that one copied
+    // every element from the index to the end through a JSON round-trip, twice,
+    // under the arena lock, and dropped the items of any stream slot it moved
+    // (see `a_stream_slot_an_array_shift_moves_keeps_its_items`).
     let tree = seeded(json!({"list": ["a", "b"]}));
     let list = tree
         .root::<Value>()
@@ -1488,33 +2828,141 @@ fn an_add_at_an_index_shifts_the_values_because_index_is_the_identity() {
     let log = Log::default();
     let _zero = log.watch("0", &first);
     let _one = log.watch("1", &second);
+    let _list = log.watch("list", &list);
 
     commit(&tree, &[add("/list/0", json!("new"))], &[]);
 
-    // §9.1's owner decision: the client does not infer that "a" moved to index
-    // 1. Index *is* the identity, so every later index changed value and every
-    // later index is told.
-    assert_eq!(log.taken(), ["0", "1"]);
+    // The list changed — its semantic is the ordered sequence of its children's
+    // (§9.1) — and no element did, because none of them holds a different value
+    // than it held.
+    assert_eq!(log.taken(), ["list"]);
     assert_eq!(list.value(), ["new", "a", "b"]);
-    assert_eq!(first.node(), list.at(0).expect("index 0").node());
-    assert_eq!(first.value(), "new");
-    assert_eq!(second.value(), "a");
+    assert_eq!(first.node(), list.at(1).expect("index 1").node());
+    assert_eq!(second.node(), list.at(2).expect("index 2").node());
+    assert_eq!(first.value(), "a");
+    assert_eq!(second.value(), "b");
+    assert_ne!(list.at(0).expect("index 0").node(), first.node());
+    assert_eq!(list.at(0).expect("index 0").value(), "new");
 }
 
 #[test]
-fn a_remove_at_an_index_shifts_the_values_back_and_kills_the_last_slot() {
+fn a_remove_at_an_index_kills_that_node_and_moves_the_rest() {
+    // The mirror: `remove /list/0` takes out the node at 0, and the elements
+    // after it keep theirs.
     let tree = seeded(json!({"list": ["a", "b", "c"]}));
     let list = tree
         .root::<Value>()
         .field::<Vec<String>>("list")
         .expect("list");
+    let first = list.at(0).expect("index 0");
     let last = list.at(2).expect("index 2");
 
     commit(&tree, &[remove("/list/0")], &[]);
 
+    assert_is_a_tree(&tree);
     assert_eq!(list.value(), ["b", "c"]);
-    assert!(!last.is_live());
+    assert!(!first.is_live());
+    assert!(last.is_live());
+    assert_eq!(last.node(), list.at(1).expect("index 1").node());
     assert_eq!(list.at(0).expect("index 0").value(), "b");
+}
+
+#[test]
+fn the_elements_an_array_shift_moves_keep_their_nodes_and_their_subscribers() {
+    let tree = seeded(json!({"list": ["a", "b", "c"]}));
+    let list = tree
+        .root::<Value>()
+        .field::<Vec<String>>("list")
+        .expect("list");
+    let watched = list.at(2).expect("index 2");
+    let node = watched.node();
+    let log = Log::default();
+    let _c = log.watch("c", &watched);
+
+    commit(&tree, &[add("/list/0", json!("new"))], &[]);
+
+    // A move is not a change: the row still holds "c".
+    assert!(log.taken().is_empty());
+    assert_eq!(list.at(3).expect("index 3").node(), node);
+    assert_eq!(watched.value(), "c");
+
+    // And the subscription taken before the shift is still live on that row.
+    commit(&tree, &[replace("/list/3", json!("c2"))], &[]);
+
+    assert_eq!(log.taken(), ["c"]);
+    assert_eq!(watched.value(), "c2");
+    assert_eq!(list.value(), ["new", "a", "b", "c2"]);
+}
+
+#[test]
+fn a_stream_slot_an_array_shift_moves_keeps_its_items() {
+    // The lossy half of the old value-rewrite shift. A `Collection`'s wire
+    // projection is its bare marker — stream contents travel in `stream_ops`
+    // and never in a value (§3.1) — so a stream slot pushed one slot right
+    // through `to_wire()` came out the other side as an *empty* collection, and
+    // the collection index pointed at the empty one. Shifting the node instead
+    // is what makes the slot survive being moved.
+    let tree = seeded(json!({"rows": [{"__musubi_stream__": "messages"}]}));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+
+    commit(
+        &tree,
+        &[],
+        &[insert_op(
+            "msg-1",
+            -1,
+            json!({"id": "1", "body": "one"}),
+            None,
+        )],
+    );
+
+    let slot = rows.at(0).expect("rows[0]").node();
+
+    commit(&tree, &[add("/rows/0", json!({"kind": "header"}))], &[]);
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(1).expect("rows[1]").node(), slot);
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"kind": "header"}),
+            json!([{"id": "1", "body": "one"}])
+        ]
+    );
+
+    // The collection index still resolves to the moved node, so the next stream
+    // op lands in the same list rather than in a slot nothing can reach.
+    commit(
+        &tree,
+        &[],
+        &[insert_op(
+            "msg-2",
+            -1,
+            json!({"id": "2", "body": "two"}),
+            None,
+        )],
+    );
+
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"kind": "header"}),
+            json!([{"id": "1", "body": "one"}, {"id": "2", "body": "two"}])
+        ]
+    );
+
+    // And the same, shifting back left.
+    commit(&tree, &[remove("/rows/0")], &[]);
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.at(0).expect("rows[0]").node(), slot);
+    assert_eq!(
+        rows.value(),
+        [json!([{"id": "1", "body": "one"}, {"id": "2", "body": "two"}])]
+    );
 }
 
 // ------------------------------------------------------------- subscriptions
@@ -1690,9 +3138,29 @@ fn navigation_never_fails_and_an_absent_key_yields_a_handle_that_reads_as_gone()
 
     assert!(!missing.is_live());
     assert!(matches!(missing.try_value(), Err(ReadError::Gone)));
+    assert_eq!(missing.revision(), 0);
     // Chaining off a dead handle is dead, not a panic.
     assert!(!missing.child::<i64>("deeper").is_live());
     assert_eq!(root.child::<i64>("row").value(), 1);
+
+    // The null key is a slot no node can ever occupy, so subscribing to it
+    // registers an inert token: nothing ever calls it, and dropping it finds
+    // nothing to unregister from.
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let subscription = missing.subscribe(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+
+    commit(&tree, &[replace("", json!({"row": 2, "nope": 3}))], &[]);
+
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // A key the tree has since grown does not resurrect a handle bound to the
+    // null slot; it is a fresh `child()` that finds the new node.
+    assert!(!missing.is_live());
+    assert!(root.child::<i64>("nope").is_live());
+
+    drop(subscription);
 
     drop(tree.close());
 
