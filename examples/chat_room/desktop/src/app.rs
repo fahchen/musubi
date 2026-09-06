@@ -892,10 +892,10 @@ impl ChatWindow {
                 "Presence unavailable",
                 reason_text(&presence.expect("matched above").reason().value()),
             ),
-            Some((AsyncStatus::Ok, None)) => user_rows(&[], false),
+            Some((AsyncStatus::Ok, None)) => user_rows(None, false),
             // Stale rows, dimmed, beat blanking the panel while a reconnect
             // re-seeds it — the browser client drops straight to the note.
-            Some((status, Some(users))) => user_rows(&users.value(), status != AsyncStatus::Ok),
+            Some((status, Some(users))) => user_rows(Some(&users), status != AsyncStatus::Ok),
         };
 
         panel.child(body).into_any_element()
@@ -1540,7 +1540,17 @@ fn error_panel(text: impl Into<SharedString>, detail: impl Into<SharedString>) -
 
 /// `<ul class="users">`. Short enough not to need virtualizing, capped and
 /// scrollable like the browser client's `max-height`.
-fn user_rows(users: &[OnlineUser], dimmed: bool) -> AnyElement {
+///
+/// `None` is the "resolved, but the server sent no collection" arm — the same
+/// empty container, so the panel's geometry does not jump.
+///
+/// The rows are **navigated, not materialized**. `value()` on the collection
+/// handle would hydrate every user on every frame, and `render` is the one path
+/// that is unconditional — the anti-pattern `docs/rust-reactive-state.md` §10.1
+/// names outright ("reading a whole list where `at()` / `by_key()` would read a
+/// row"). `iter()` snapshots the child ids under the tree lock once and hands
+/// back handles; each row then reads only the two leaves it draws.
+fn user_rows(users: Option<&State<Vec<OnlineUser>>>, dimmed: bool) -> AnyElement {
     div()
         .id("online-users")
         .flex()
@@ -1549,40 +1559,57 @@ fn user_rows(users: &[OnlineUser], dimmed: bool) -> AnyElement {
         .max_h(px(USERS_MAX_H))
         .overflow_y_scroll()
         .when(dimmed, |column| column.opacity(0.55))
-        .children(users.iter().map(|user| {
+        .children(
+            users
+                .into_iter()
+                .flat_map(|users| users.iter())
+                .map(user_row),
+        )
+        .into_any_element()
+}
+
+/// `<li>` in the presence list: avatar, name, id.
+///
+/// One row in, two leaves read. A leaf that fails to read means the node moved
+/// between the id snapshot and this read; the row is dropped and the next frame
+/// agrees — the rule [`message_row`] already follows for the message list.
+fn user_row(user: State<OnlineUser>) -> AnyElement {
+    let (Ok(name), Ok(id)) = (user.name().try_value(), user.id().try_value()) else {
+        return div().into_any_element();
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(USER_GAP))
+        .p(px(USER_PAD))
+        .rounded(px(RADIUS))
+        .bg(color(ROW))
+        .child(avatar(&name, AVATAR, GOLD, INK))
+        .child(
             div()
                 .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(USER_GAP))
-                .p(px(USER_PAD))
-                .rounded(px(RADIUS))
-                .bg(color(ROW))
-                .child(avatar(&user.name, AVATAR, GOLD, INK))
+                .flex_col()
+                .w(px(USER_TEXT_W))
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
+                        // Definite, not stretched: see the geometry block at the
+                        // top of this file.
                         .w(px(USER_TEXT_W))
-                        .child(
-                            div()
-                                // Definite, not stretched: see the geometry
-                                // block at the top of this file.
-                                .w(px(USER_TEXT_W))
-                                .font_weight(FontWeight::BOLD)
-                                .truncate()
-                                .child(user.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .w(px(USER_TEXT_W))
-                                .text_size(px(TEXT_SMALL))
-                                .text_color(color(MUTED))
-                                .truncate()
-                                .child(user.id.clone()),
-                        ),
+                        .font_weight(FontWeight::BOLD)
+                        .truncate()
+                        .child(name),
                 )
-        }))
+                .child(
+                    div()
+                        .w(px(USER_TEXT_W))
+                        .text_size(px(TEXT_SMALL))
+                        .text_color(color(MUTED))
+                        .truncate()
+                        .child(id),
+                ),
+        )
         .into_any_element()
 }
 
