@@ -1603,13 +1603,15 @@ impl<'a> Transaction<'a> {
             _ => return Ok(()),
         };
         let depth = self.arena_ref().depth(collection) + 1;
-        let mut items = self.items(collection);
+        // The node this key already stands on — the upsert keeps it. Nothing
+        // else of this read survives the reconcile below: see the read-back
+        // further down.
+        let mut existing = self
+            .items(collection)
+            .into_iter()
+            .find(|(key, _)| &**key == item_key);
 
         self.touch_and_dirty(collection);
-
-        // Remove first: the index is resolved against the post-removal length.
-        let from = items.iter().position(|(key, _)| &**key == item_key);
-        let mut existing = from.map(|index| items.remove(index));
 
         if existing.is_none() {
             // §3.1's carry-over: a `reset` followed by re-inserts is the most
@@ -1623,7 +1625,6 @@ impl<'a> Transaction<'a> {
             existing = carried.map(|node| (Arc::from(item_key), node));
         }
 
-        let index = insertion_index(at, items.len());
         let entry = match existing {
             Some((key, node)) => {
                 // A row that came back off the carry-over table re-enters the
@@ -1659,6 +1660,27 @@ impl<'a> Transaction<'a> {
                 (Arc::from(item_key), node)
             }
         };
+
+        // Read the list back rather than writing one snapshotted before the
+        // reconcile. Building the incoming item may have adopted a store that
+        // was standing in another row of *this* collection, and `detach` took
+        // that row out of the list and recorded its `Removed` on the way
+        // (§3.2). A snapshot taken before that put the row straight back, and
+        // one node would then stand in two slots — the field that adopted it
+        // and a row that no longer exists.
+        //
+        // It is also what keeps the edit sequence replayable (§6.3): every
+        // index below is resolved against the list as the adapter has it at
+        // this point, with the removals the reconcile already reported applied.
+        let mut items = self.items(collection);
+        // Remove first: the index is resolved against the post-removal length.
+        let from = items.iter().position(|(key, _)| &**key == item_key);
+
+        if let Some(index) = from {
+            items.remove(index);
+        }
+
+        let index = insertion_index(at, items.len());
 
         items.insert(index, entry.clone());
 

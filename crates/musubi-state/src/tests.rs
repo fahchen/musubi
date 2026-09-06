@@ -185,6 +185,26 @@ fn assert_is_a_tree(tree: &StateTree) -> Vec<NodeId> {
     nodes
 }
 
+/// How far below the root the deepest node the root can reach sits.
+fn deepest(tree: &StateTree) -> usize {
+    let arena = tree.inner().lock();
+    let mut stack = vec![(arena.root, 0usize)];
+    let mut deepest = 0;
+
+    while let Some((id, depth)) = stack.pop() {
+        deepest = deepest.max(depth);
+
+        stack.extend(
+            arena
+                .children(id)
+                .into_iter()
+                .map(|child| (child, depth + 1)),
+        );
+    }
+
+    deepest
+}
+
 /// One node's cached semantic value.
 fn semantic(tree: &StateTree, id: NodeId) -> SemanticValue {
     tree.node(id).expect("the node is live").semantic
@@ -1298,6 +1318,70 @@ fn a_stream_row_adopted_out_by_a_patch_records_the_removal_its_delete_no_longer_
 }
 
 #[test]
+fn an_insert_that_adopts_a_row_of_its_own_list_does_not_put_that_row_back() {
+    // `Musubi.Stream` emits `resets ++ inserts ++ deletes` in that order
+    // (`lib/musubi/stream.ex`), so "row `b` now nests the store row `a` was"
+    // arrives as an insert that adopts out of this very collection, followed by
+    // the delete of the key it emptied. The adoption takes `a` out of the live
+    // item list and records the `Removed` for it; an insert that wrote back an
+    // item list snapshotted *before* it reconciled put `a` straight back, and
+    // the store node was then reachable from two parents — the row `b` field
+    // that adopted it and the row `a` that should no longer exist — until the
+    // delete carried it out and commit freed it under `b`.
+    let tree = streaming_tree();
+    let messages = messages_state(&tree);
+    let row = json!({"__musubi_store_id__": ["a"], "n": 1});
+
+    commit(&tree, &[], &[insert_op("a", -1, row.clone(), None)]);
+
+    let store = StoreState::from(messages.by_key("a").expect("a"));
+    let node = store.node();
+
+    let notify = tree
+        .apply(
+            &[],
+            &[
+                insert_op("b", -1, json!({"id": "b", "nested": row}), None),
+                delete_op("a"),
+            ],
+        )
+        .expect("applies");
+    let edits = notify.changes().collection_edits(messages.node()).to_vec();
+
+    drop(notify);
+
+    assert_is_a_tree(&tree);
+    assert_eq!(keys(&messages), ["b"]);
+    // The store left the list by moving, not by dying: it keeps its node and
+    // its index entry, and it stands in exactly one slot.
+    assert!(store.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["a"])), Some(node));
+
+    let landed = messages.by_key("b").expect("b");
+
+    assert_eq!(
+        landed.value(),
+        json!({"id": "b", "nested": {"__musubi_store_id__": ["a"], "n": 1}})
+    );
+    // The adoption's `Removed` is recorded before the `Inserted`, so the index
+    // the insert reports is the one it takes in the post-removal list (§3.1).
+    assert_eq!(
+        edits,
+        [
+            CollectionEdit::Removed {
+                item_key: Arc::from("a"),
+                index: 0,
+            },
+            CollectionEdit::Inserted {
+                item_key: Arc::from("b"),
+                index: 0,
+                node: landed.node(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn a_stream_row_that_stops_being_the_store_it_was_does_not_keep_its_node() {
     // The upsert keeps the **node** for a key the list already holds (§3.1) —
     // but a store id is that node's own identity (§3.2), so a row rendered as a
@@ -2126,6 +2210,207 @@ fn re_adopting_one_subtree_across_envelopes_is_measured_against_the_cap_every_ti
     assert!(matches!(error, TreeError::Depth { .. }));
     assert_eq!(tree.to_wire(tree.root_id()), before);
     assert_eq!(tree.store_node(&store_id(&["tall"])), Some(node));
+}
+
+/// A tree whose one array row is a store carrying a 200-level subtree: its node
+/// sits at depth 2 and its deepest descendant at 202, so the subtree is 200
+/// levels tall and legal to land anywhere at depth 55 or above.
+fn tall_row_tree() -> StateTree {
+    seeded(json!({
+        "__musubi_store_id__": [],
+        "count": 1,
+        "rows": [{"__musubi_store_id__": ["a"], "n": nest(200)}]
+    }))
+}
+
+/// The envelope [`exchange_for_reland`] answers, with the copy landed `levels`
+/// below the array: `add` renders store `a` a second time — an array `add`
+/// leaves every element it shifts standing, so §3.2's duplicate rule gives the
+/// newcomer a node of its own — and the marker removal that follows says the
+/// node that *was* the store is a plain object now.
+fn reland_below(tree: &StateTree, levels: usize) -> Result<(), TreeError> {
+    tree.apply(
+        &[
+            add(
+                "/rows/1",
+                nest_around(levels, json!({"__musubi_store_id__": ["a"], "n": 1})),
+            ),
+            remove("/rows/0/__musubi_store_id__"),
+        ],
+        &[],
+    )
+    .map(drop)
+}
+
+#[test]
+fn an_identity_exchange_that_would_carry_the_original_down_past_the_cap_is_refused() {
+    // The exchange re-parents **both** nodes, so both halves are measured before
+    // it happens. This is the original's half: it lands in the copy's slot
+    // carrying whatever subtree it is standing on — which is the one the
+    // *previous* envelope left it, not the one this render describes, because
+    // the marker removal that prunes it comes after the swap.
+    //
+    // Refusing costs store `a` its `NodeId` and nothing else: the envelope is
+    // **not** refused, because the write the exchange is part of has a plain
+    // value to fall back on. That asymmetry is deliberate — `adopt` has nothing
+    // to fall back on and errors, this has and does not (§3.2).
+    //
+    // So it is the identity, not the committed depth, that the guard decides:
+    // the swap is followed immediately by the reconcile that prunes, so the
+    // over-cap subtree would exist only *inside* the transaction — which is
+    // exactly where the recursive walks run, and exactly the window `fits` is
+    // documented to close.
+    let tree = tall_row_tree();
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let panel = StoreState::from(rows.at(0).expect("rows[0]"));
+    let node = panel.node();
+    // What the marker removal writes into the slot: the store's own value
+    // without its id, which is one level taller than the chain under `n`.
+    let released = nest(201);
+
+    // 40 levels down: the original's 200 would land at 241, inside the cap. The
+    // exchange is taken, and §3.2's promise holds — the store that was rendered
+    // on both sides of the marker release keeps its node.
+    reland_below(&tree, 40).expect("applies");
+
+    assert_is_a_tree(&tree);
+    assert!(deepest(&tree) <= MAX_DEPTH);
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["a"])), Some(node));
+    // It moved to the copy's slot and took the copy's value; the plain object
+    // the marker removal wrote stayed behind on the copy's node.
+    assert_eq!(
+        panel.fields().value(),
+        json!({"__musubi_store_id__": ["a"], "n": 1})
+    );
+    assert_ne!(rows.at(0).expect("rows[0]").node(), node);
+    assert_eq!(rows.at(0).expect("rows[0]").value(), released);
+
+    // The same envelope, 60 levels down: the original's 200 would put its
+    // deepest node at 261. Refused, and the store takes the ordinary unmount —
+    // the slot it was standing in is rebuilt as the plain value the op wrote.
+    let tree = tall_row_tree();
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let panel = StoreState::from(rows.at(0).expect("rows[0]"));
+    let node = panel.node();
+
+    reland_below(&tree, 60).expect("applies");
+
+    assert_is_a_tree(&tree);
+    assert!(deepest(&tree) <= MAX_DEPTH);
+    assert!(!panel.fields().is_live());
+    assert_ne!(tree.store_node(&store_id(&["a"])), Some(node));
+    // The shape is intact either way: `/rows/0` renders exactly the value the
+    // marker removal asked for, and the copy is what carries the id now.
+    assert_eq!(rows.at(0).expect("rows[0]").value(), released);
+    assert_eq!(rows.len(), 2);
+
+    commit(&tree, &[replace("/count", json!(2))], &[]);
+
+    assert_eq!(
+        tree.root::<Value>()
+            .field::<i64>("count")
+            .expect("count")
+            .value(),
+        2
+    );
+}
+
+/// The same shape with the two sightings the other way round. One render
+/// carries store `x` twice: the first key adopts the standing node `levels`
+/// down, and the second is the duplicate §3.2 hands a node of its own — built
+/// `height` levels tall, one step below `/wide`. The marker removal that
+/// follows asks for the exchange, and this time it is the **copy** that would
+/// compose past the cap on its way down to where the original stands.
+fn reland_above(levels: usize, height: usize) -> (StateTree, StoreState<Value>) {
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "count": 1,
+        "wide": {"x": {"__musubi_store_id__": ["x"], "n": 1}}
+    }));
+    let panel = StoreState::from(
+        tree.root::<Value>()
+            .field::<Value>("wide")
+            .expect("wide")
+            .field::<Value>("x")
+            .expect("x"),
+    );
+
+    commit(
+        &tree,
+        &[
+            replace(
+                "/wide",
+                json!({
+                    "a": nest_around(levels, json!({"__musubi_store_id__": ["x"], "n": 1})),
+                    "b": {"__musubi_store_id__": ["x"], "n": nest(height)}
+                }),
+            ),
+            remove(&format!(
+                "{}/__musubi_store_id__",
+                descend("/wide/a", levels - 1)
+            )),
+        ],
+        &[],
+    );
+
+    (tree, panel)
+}
+
+#[test]
+fn an_identity_exchange_that_would_carry_the_copy_down_past_the_cap_is_refused() {
+    // The copy's half. `build` measured it where it was built, which says
+    // nothing about the slot the exchange would move it into — and here that
+    // slot is 150 levels down, where a 150-level copy composes to 301.
+    //
+    // 50 levels: the copy lands at 201, inside the cap, and the exchange is
+    // taken — store `x` keeps the node it has been standing on.
+    let (tree, panel) = reland_above(150, 50);
+    let node = panel.node();
+
+    assert_is_a_tree(&tree);
+    assert!(deepest(&tree) <= MAX_DEPTH);
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(node));
+    assert_eq!(
+        tree.root::<Value>()
+            .field::<Value>("wide")
+            .expect("wide")
+            .field::<Value>("b")
+            .expect("b")
+            .node(),
+        node
+    );
+
+    // 150 levels: refused, and store `x` unmounts the ordinary way. The slot it
+    // held is the plain value the marker removal wrote, and the id is the
+    // copy's now.
+    let (tree, panel) = reland_above(150, 150);
+    let node = panel.node();
+    let wide = tree.root::<Value>().field::<Value>("wide").expect("wide");
+
+    assert_is_a_tree(&tree);
+    assert!(deepest(&tree) <= MAX_DEPTH);
+    assert!(!panel.fields().is_live());
+    assert_ne!(tree.store_node(&store_id(&["x"])), Some(node));
+    assert_eq!(
+        tree.store_node(&store_id(&["x"])),
+        Some(wide.field::<Value>("b").expect("b").node())
+    );
+    assert_eq!(
+        wide.field::<Value>("a")
+            .expect("a")
+            .field::<Value>("n")
+            .expect("n")
+            .value(),
+        nest(150)
+    );
 }
 
 // ------------------------------------------------- landing before vacating
