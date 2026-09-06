@@ -63,6 +63,19 @@ enum Container {
     Leaf,
 }
 
+/// Which of an async node's two slots a write is filling (§3.3).
+///
+/// Named rather than inferred. The slots are not a child list, so there is no
+/// position to write into: the only other way to tell them apart is to look for
+/// the node the write displaced, and reconciliation may have moved that node
+/// into the *other* slot — or out of the node altogether — before the write
+/// lands.
+#[derive(Clone, Copy)]
+enum AsyncSlot {
+    Result,
+    Reason,
+}
+
 /// One index mutation, and the value it displaced.
 enum IndexUndo {
     Store(StoreId, Option<NodeId>),
@@ -449,9 +462,9 @@ impl<'a> Transaction<'a> {
                 self.array_add(parent, &children, index, value, &owner, depth)
             }
             Container::Async { result, reason } => {
-                let slot = match key.as_str() {
-                    "result" => result,
-                    "reason" => reason,
+                let (slot, node) = match key.as_str() {
+                    "result" => (AsyncSlot::Result, result),
+                    "reason" => (AsyncSlot::Reason, reason),
                     // RFC 6902 `add` onto an existing key is a replace, and
                     // `status` is the node's own semantics rather than a child.
                     ASYNC_STATUS_KEY => return self.set_async_status(parent, value, path),
@@ -463,7 +476,7 @@ impl<'a> Transaction<'a> {
                     }
                 };
 
-                let settled = self.reconcile_child(parent, Some(slot), value, &owner, depth)?;
+                let settled = self.reconcile_child(parent, Some(node), value, &owner, depth)?;
 
                 self.rewire_async_slot(parent, slot, settled);
 
@@ -689,9 +702,9 @@ impl<'a> Transaction<'a> {
                 self.put_index(parent, &children, index, value, &owner, depth + 1)
             }
             Container::Async { result, reason } => {
-                let slot = match key {
-                    "result" => result,
-                    "reason" => reason,
+                let (slot, node) = match key {
+                    "result" => (AsyncSlot::Result, result),
+                    "reason" => (AsyncSlot::Reason, reason),
                     _ => {
                         return Err(TreeError::Pointer {
                             path: path.to_owned(),
@@ -699,7 +712,7 @@ impl<'a> Transaction<'a> {
                         });
                     }
                 };
-                let settled = self.reconcile_child(parent, Some(slot), value, &owner, depth + 1)?;
+                let settled = self.reconcile_child(parent, Some(node), value, &owner, depth + 1)?;
 
                 self.rewire_async_slot(parent, slot, settled);
 
@@ -830,12 +843,18 @@ impl<'a> Transaction<'a> {
                 let settled =
                     self.reconcile_child(id, Some(result), incoming_result, owner, depth + 1)?;
 
-                self.rewire_async_slot(id, result, settled);
+                self.rewire_async_slot(id, AsyncSlot::Result, settled);
 
+                // Read back: filling `result` may have adopted the node that was
+                // standing in `reason`, and the snapshot still names it. That
+                // node is somebody else's child now, so reconciling the reason
+                // value into it would write the reason over a subtree the render
+                // asked to keep — and hand one node to two slots.
+                let reason = self.async_slot(id, AsyncSlot::Reason).unwrap_or(reason);
                 let settled =
                     self.reconcile_child(id, Some(reason), incoming_reason, owner, depth + 1)?;
 
-                self.rewire_async_slot(id, reason, settled);
+                self.rewire_async_slot(id, AsyncSlot::Reason, settled);
             }
             _ => self.rebuild(id, value, owner, depth)?,
         }
@@ -989,8 +1008,8 @@ impl<'a> Transaction<'a> {
     /// the original's slot and is rebuilt as the plain value the op is writing.
     /// Nothing is holding the copy: it has existed only since this transaction
     /// opened. This is the same exchange a reorder inside one parent already
-    /// performs (§3.2, "同一父节点内的移位则是交换"), reached from the other
-    /// direction.
+    /// performs (§3.2, "a move inside one parent is an exchange"), reached from
+    /// the other direction.
     ///
     /// `None` — and the caller builds a fresh node, exactly as before — when
     /// there is nothing to exchange with, when either node is not standing in
@@ -1042,12 +1061,11 @@ impl<'a> Transaction<'a> {
             || self.is_ancestor(copy, here)
             || !self.fits(there, node)
             || !self.fits(here, copy)
-            // An async node's two slots are not a child list (§3.3):
-            // `rewire_async_slot` finds the slot a write is filling by looking
-            // for the node it displaced, and an exchange *between* `result` and
-            // `reason` would leave it looking in the other one. Not a shape
-            // worth carrying: it needs an async node whose two slots are two
-            // renders of one store id.
+            // An exchange between one async node's own two slots (§3.3) is not
+            // a shape worth carrying: it needs an async node whose `result` and
+            // `reason` are two renders of one store id. Refusing costs that
+            // store its `NodeId` and nothing else, which is what every other
+            // refusal here costs.
             || (here == there && matches!(self.container_of(here), Container::Async { .. }))
         {
             return Ok(None);
@@ -1089,6 +1107,27 @@ impl<'a> Transaction<'a> {
                 items.iter().any(|(_, node)| *node == child)
             }
             Some(NodeKind::Async { result, reason, .. }) => *result == child || *reason == child,
+            _ => false,
+        }
+    }
+
+    /// Whether this node's live fields are exactly `fields` — the test a
+    /// rebuilt map is written back on.
+    ///
+    /// Under a borrow, like [`holds`](Self::holds): the answer decides one
+    /// write, and cloning the map to compare it would copy every key of a
+    /// hundred-field store per envelope.
+    fn holds_fields(&self, id: NodeId, fields: &BTreeMap<Arc<str>, NodeId>) -> bool {
+        match self.arena_ref().nodes.get(id).map(|node| &node.kind) {
+            Some(NodeKind::Object(live) | NodeKind::Store { fields: live, .. }) => live == fields,
+            _ => false,
+        }
+    }
+
+    /// The positional counterpart of [`holds_fields`](Self::holds_fields).
+    fn holds_positions(&self, id: NodeId, positions: &[NodeId]) -> bool {
+        match self.arena_ref().nodes.get(id).map(|node| &node.kind) {
+            Some(NodeKind::Array(live)) => live == positions,
             _ => false,
         }
     }
@@ -1203,7 +1242,17 @@ impl<'a> Transaction<'a> {
                 continue;
             }
 
-            let existing = old.get(key.as_str()).copied();
+            // The node standing under this key **now**, not the one the
+            // snapshot has: an earlier key of this same rewrite may have
+            // adopted it away — `{b: {hole: {store x}}, z: {store x}}` over a
+            // node whose `z` *is* store `x` — and `detach` then left a `Null`
+            // placeholder in the slot it vacated (§3.2). Reconciling against
+            // the snapshot handed the incoming value a node that is no longer
+            // this parent's child: `new` put it back under `z` while it also
+            // stood under `b`, and when the two happened to compare equal the
+            // write was skipped altogether and the placeholder `release_displaced`
+            // had just freed stayed in the committed map.
+            let existing = self.arena_ref().child_by_key(id, key);
             let child = self.reconcile_child(id, existing, value, owner, depth + 1)?;
             // Reuse the interned key when the node already had it: one fewer
             // allocation per field per envelope.
@@ -1219,7 +1268,14 @@ impl<'a> Transaction<'a> {
 
         self.release_displaced(id, &before, &kept);
 
-        if &new != old {
+        // Compared against the map this node holds **now**, not the snapshot the
+        // loop started from. An adoption during the loop rewrote one of these
+        // very slots to the `Null` placeholder `detach` leaves behind, and
+        // `release_displaced` has just freed it; a rebuilt map that happened to
+        // equal the snapshot would skip the write and commit that placeholder as
+        // a child. Nothing is lost when the two agree: whatever moved the live
+        // map already dirtied this node on its way through `detach`.
+        if !self.holds_fields(id, &new) {
             self.touch_and_dirty(id);
 
             let kind = match store {
@@ -1255,7 +1311,17 @@ impl<'a> Transaction<'a> {
         let mut claimed = HashSet::new();
 
         for (index, value) in values.iter().enumerate() {
-            let existing = unclaimed(old.get(index).copied(), &claimed);
+            // The node standing at this position **now** — the same read-back
+            // `reconcile_fields` does, per element rather than per key. An
+            // earlier position may have adopted a store out of a later one, and
+            // `detach` left a `Null` placeholder there (§3.2); the snapshot
+            // still names the node that moved, and reconciling it here would
+            // hand one node to two slots.
+            //
+            // `child_at` and not a fresh child list: this is asked once per
+            // element, and materializing the list per element would make a
+            // rewrite of a 20 000-element array quadratic.
+            let existing = unclaimed(self.arena_ref().child_at(id, index), &claimed);
             let child = self.reconcile_child(id, existing, value, owner, depth + 1)?;
 
             claimed.insert(child);
@@ -1349,7 +1415,11 @@ impl<'a> Transaction<'a> {
 
         self.release_displaced(id, old, &kept);
 
-        if new != old {
+        // Against the live list rather than `old`, for the reason
+        // [`reconcile_fields`](Self::reconcile_fields) spells out: a list that
+        // matches the snapshot may still not match what an adoption left
+        // standing in the node.
+        if !self.holds_positions(id, &new) {
             self.touch_and_dirty(id);
             self.arena().nodes[id].kind = NodeKind::Array(new);
         }
@@ -1404,7 +1474,17 @@ impl<'a> Transaction<'a> {
         // parent — the shape a reorder of two child stores arrives in. The node
         // this write displaced takes that key, so both keep their identity; the
         // null `detach` left there is dropped (§3.2).
+        //
+        // Only while this parent is still the one holding that node. One value
+        // can adopt twice — `{store standing at /a, inner: {store standing at
+        // /b}}` written to `/b` moves both — and the node this write would hand
+        // the vacated key is then somebody else's child already. Re-installing
+        // it there would put one node in two slots.
         let vacated = before.and_then(|fields| {
+            if !existing.is_some_and(|node| self.holds(parent, node)) {
+                return None;
+            }
+
             fields
                 .iter()
                 .find(|(name, node)| **node == child && &***name != key)
@@ -1413,15 +1493,22 @@ impl<'a> Transaction<'a> {
 
         self.touch_and_dirty(parent);
 
-        let mut displaced = existing;
+        let mut displaced = None;
 
         // In place: `touch` above already holds the snapshot rollback replays,
         // so writing one key does not need a second copy of the map.
         if let NodeKind::Object(fields) | NodeKind::Store { fields, .. } =
             &mut self.arena().nodes[parent].kind
         {
+            // What the write **took out**, not what the read before the
+            // reconcile found. The value being built may have adopted the node
+            // that was standing under this very key, in which case `detach` put
+            // its `Null` placeholder here and that is what this overwrites. The
+            // store itself moved and is released by nobody; reporting it here
+            // instead left the placeholder in the arena with no parent holding
+            // it.
             match fields.get_mut(key) {
-                Some(slot) => *slot = child,
+                Some(slot) => displaced = Some(std::mem::replace(slot, child)),
                 None => {
                     fields.insert(Arc::from(key), child);
                 }
@@ -1458,13 +1545,29 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
 
-        let mut new = old.to_vec();
+        // Read the positions back rather than rewriting a snapshot taken before
+        // the reconcile — the pattern `array_add` already uses. Building the
+        // value may have adopted a store standing anywhere in this same array,
+        // under another position or inside one's subtree, and `detach` left an
+        // addressable `Null` in the slot it vacated (§3.2). The snapshot still
+        // names the node that moved, so writing it back gave that node two
+        // parents.
+        //
+        // The positions still line up. Only two things can have rewritten this
+        // node's list during the reconcile: `detach`, which replaces a slot
+        // rather than closing it up, and `exchange_for_reland`, which swaps two
+        // of them. Neither changes the length, and nothing can rebuild the
+        // parent itself — adoption refuses to reparent a node under its own
+        // descendant, so the value being built cannot reach back up to here.
+        let mut new = self.arena_ref().ordered_children(parent);
 
         new[index] = child;
 
         // As in `put_field`: a store adopted out of another position of this
         // same array is a reorder, and the node this write displaced takes the
-        // position it left rather than a null placeholder.
+        // position it left rather than the null placeholder standing in it.
+        // Located against `old`, because that placeholder is what the live list
+        // has there now.
         if let Some(vacated) = old.iter().position(|node| *node == child) {
             new[vacated] = existing;
         }
@@ -1474,13 +1577,30 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
-    /// Points an async node's `result` or `reason` at the node reconciliation
-    /// settled on, when adoption moved it.
-    fn rewire_async_slot(&mut self, id: NodeId, was: NodeId, now: NodeId) {
-        if was == now {
-            return;
+    /// The node one async slot is holding, read live.
+    fn async_slot(&self, id: NodeId, slot: AsyncSlot) -> Option<NodeId> {
+        match &self.arena_ref().nodes.get(id)?.kind {
+            NodeKind::Async { result, reason, .. } => Some(match slot {
+                AsyncSlot::Result => *result,
+                AsyncSlot::Reason => *reason,
+            }),
+            _ => None,
         }
+    }
 
+    /// Points one of an async node's two slots at the node reconciliation
+    /// settled on.
+    ///
+    /// The slot is named by the caller and what it displaced is read back here,
+    /// rather than the other way round. Building the incoming value may have
+    /// adopted the node that was standing in this slot — the shape
+    /// `replace /feed/result {wrap: {store the slot already holds}}` arrives in
+    /// — and `detach` then left a `Null` placeholder in its place (§3.2).
+    /// Matching on the displaced node found it in neither slot and wrote
+    /// nothing, stranding the value that had just been built; when the adoption
+    /// came out of the *other* slot it was worse, and the write landed in the
+    /// wrong one.
+    fn rewire_async_slot(&mut self, id: NodeId, slot: AsyncSlot, now: NodeId) {
         let NodeKind::Async {
             status,
             result,
@@ -1489,15 +1609,30 @@ impl<'a> Transaction<'a> {
         else {
             return;
         };
+        let was = match slot {
+            AsyncSlot::Result => result,
+            AsyncSlot::Reason => reason,
+        };
+
+        if was == now {
+            return;
+        }
 
         self.touch_and_dirty(id);
         // As in `stream_insert`: the node this slot held is only ours to
         // release while it is still parented here.
         self.release_if_still_mine(id, was);
-        self.arena().nodes[id].kind = NodeKind::Async {
-            status,
-            result: if result == was { now } else { result },
-            reason: if reason == was { now } else { reason },
+        self.arena().nodes[id].kind = match slot {
+            AsyncSlot::Result => NodeKind::Async {
+                status,
+                result: now,
+                reason,
+            },
+            AsyncSlot::Reason => NodeKind::Async {
+                status,
+                result,
+                reason: now,
+            },
         };
     }
 

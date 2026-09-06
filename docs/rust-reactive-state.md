@@ -1838,6 +1838,22 @@ rejects one more: the move takes the subtree past the depth cap. A rejection
 only makes one store lose its `NodeId`; it does not make the tree lose its
 shape.
 
+**A patch op positions its write against the children that the reconcile left,
+not against the children that it read.** To build an incoming value can adopt a
+store out of a sibling slot of the same parent node. `detach` then takes that
+node out of the live children of the parent and puts an addressable null in its
+place. A write that rebuilt the parent from a snapshot taken before the
+reconcile put the adopted node back, and one node then stood in two slots. This
+rule holds for a positional write, for a whole-object rewrite and for a
+whole-list rewrite alike. The test that asks whether a rebuilt child list has
+changed asks it against the live children for the same reason: a list that
+matches the snapshot can still fail to match what the adoption left standing.
+
+The exchange that a reorder gets applies only while the parent still holds the
+node that the write displaces. One value can adopt two times, and the node that
+the exchange would move into the vacated key can already be a child of the value
+that the op writes.
+
 **Deviation (the record method, not the behaviour).** The original text said
 that the tree logs with `warn!`. `musubi-state` has no `tracing` dependency
 (§1.3), and to bring back a dependency for one log line buys an exception to the
@@ -1904,6 +1920,13 @@ together with `StoreField<S>`, and §1.3 records the reason: §2.4 signs
 list of the specification (`docs/rust-codegen.md` §4.5) is unchanged word for
 word, and no consumer path changes. The tree still uses only `AsyncStatus` to
 decide equivalence; what moved is three pure value types, not semantics.
+
+**A write into an async slot lands in the slot that the pointer names.** The two
+slots are not a child list, so there is no position to write into. The node that
+a write displaces is not a reliable name for its slot either: to build the
+incoming value can adopt that node into the other slot, or out of the async node
+altogether. A write that matched on the displaced node then wrote into the wrong
+slot, or into no slot at all.
 
 ### 3.4 Upload slots
 

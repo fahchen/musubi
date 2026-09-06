@@ -1983,6 +1983,315 @@ fn one_stream_rendered_under_two_keys_of_one_store_becomes_two_collections() {
     );
 }
 
+#[test]
+fn a_field_rewrite_that_adopts_a_store_out_of_a_later_key_does_not_put_it_back() {
+    // An object rewrite walks its keys in sorted order, so `b` — whose value
+    // nests store `x` — is reconciled before `z`, which is the key `x` is
+    // standing in. The adoption takes `x` out of `z` and leaves the `Null` §3.2
+    // owes the op that vacates it; the snapshot the loop started from still
+    // names `x` under `z`, and reconciling against it took the store's identity
+    // fast path. The rebuilt map then compared *equal* to the snapshot, so the
+    // write was skipped and `z` kept the placeholder `release_displaced` had
+    // just released — a child id commit freed out from under the map.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "wide": {"z": {"__musubi_store_id__": ["x"], "n": 1}, "b": {"hole": 1}}
+    }));
+    let wide = tree.root::<Value>().field::<Value>("wide").expect("wide");
+    let panel = StoreState::from(wide.field::<Value>("z").expect("z"));
+    let node = panel.node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/wide",
+            json!({
+                "b": {"hole": {"__musubi_store_id__": ["x"], "n": 1}},
+                "z": {"__musubi_store_id__": ["x"], "n": 1}
+            }),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    // The first sighting adopts and keeps the node; the second is the duplicate
+    // §3.2 hands a node of its own, and the index follows the one built last.
+    assert!(panel.fields().is_live());
+    assert_eq!(
+        wide.field::<Value>("b")
+            .expect("b")
+            .field::<Value>("hole")
+            .expect("hole")
+            .node(),
+        node
+    );
+
+    let copy = wide.field::<Value>("z").expect("z").node();
+
+    assert_ne!(copy, node);
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(copy));
+    assert_eq!(
+        wide.value(),
+        json!({
+            "b": {"hole": {"__musubi_store_id__": ["x"], "n": 1}},
+            "z": {"__musubi_store_id__": ["x"], "n": 1}
+        })
+    );
+}
+
+#[test]
+fn a_field_rewrite_that_settles_back_onto_its_snapshot_still_writes_the_live_map() {
+    // The other half of the same call site: the write-back *guard* was also
+    // asked against the snapshot. A collection is adopted by its `(owner, name)`
+    // key rather than by a store id (§3.1), and there is no per-op claim on that
+    // key, so one render naming a stream twice adopts it twice — `b` takes it
+    // out of `z`, leaving the `Null` placeholder, and `z` takes it straight back
+    // out of `b`. The rebuilt map therefore came out *equal* to the snapshot,
+    // the write was skipped, and the map kept the placeholder that
+    // `release_displaced` had released one line earlier — a child id commit then
+    // freed while the node still pointed at it.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "wide": {"z": {"__musubi_stream__": "messages"}, "b": {}}
+    }));
+
+    commit(
+        &tree,
+        &[],
+        &[insert_op("m1", -1, json!({"id": "m1"}), None)],
+    );
+
+    let wide = tree.root::<Value>().field::<Value>("wide").expect("wide");
+    let stream = StreamState::from(wide.field::<Vec<Value>>("z").expect("z"));
+    let node = stream.node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/wide",
+            json!({
+                "b": {"inner": {"__musubi_stream__": "messages"}},
+                "z": {"__musubi_stream__": "messages"}
+            }),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    // The stream node itself is untouched by any of this: it moved twice and
+    // kept its items both times.
+    assert!(tree.node(node).is_some());
+    assert_eq!(wide.field::<Vec<Value>>("z").expect("z").node(), node);
+    assert_eq!(
+        wide.field::<Vec<Value>>("z").expect("z").value(),
+        [json!({"id": "m1"})]
+    );
+    // Which of the two keys ends up holding it is decided by `adopt_collection`
+    // alone, and it has no per-op claim to consult: the *last* sighting wins,
+    // and the key the stream was taken back out of keeps the placeholder as a
+    // plain `null`. That asymmetry with the store rule is not what this test
+    // guards — what it guards is that the node the map commits is a live one.
+    assert_eq!(
+        wide.value(),
+        json!({"b": {"inner": null}, "z": [{"id": "m1"}]})
+    );
+}
+
+#[test]
+fn a_key_rewrite_that_adopts_what_that_key_held_releases_the_placeholder() {
+    // A one-key write reconciles into the node that key is holding, and this
+    // value nests that very store — so the build adopts it and `detach` puts its
+    // `Null` placeholder under this same key. The write then overwrites the key
+    // in place, which is right, but the node it reported as displaced was the
+    // one it *read* beforehand rather than the one it actually overwrote: the
+    // store had moved and was correctly spared, and the placeholder was dropped
+    // out of the map with nobody left holding it.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "a": {"__musubi_store_id__": ["x"], "n": 1},
+        "b": 1
+    }));
+    let root = tree.root::<Value>();
+    let panel = StoreState::from(root.field::<Value>("a").expect("a"));
+    let node = panel.node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/a",
+            json!({"wrap": {"__musubi_store_id__": ["x"], "n": 1}}),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(node));
+    assert_eq!(
+        root.value(),
+        json!({
+            "__musubi_store_id__": [],
+            "a": {"wrap": {"__musubi_store_id__": ["x"], "n": 1}},
+            "b": 1
+        })
+    );
+}
+
+#[test]
+fn a_key_rewrite_that_adopts_twice_does_not_hand_the_vacated_key_a_moved_node() {
+    // One value, two adoptions: it *is* the store standing at `/a`, and it nests
+    // the store standing at `/b`, which is the key being written. The first
+    // adoption vacates `/a`, so the exchange that keeps a reorder's two nodes
+    // both standing wants to put the displaced `/b` node there — but the second
+    // adoption has already moved that node under the value being written, and
+    // installing it at `/a` as well gave it two parents.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "a": {"__musubi_store_id__": ["y"], "n": 1},
+        "b": {"__musubi_store_id__": ["x"], "n": 2}
+    }));
+    let root = tree.root::<Value>();
+    let outer = StoreState::from(root.field::<Value>("a").expect("a"));
+    let inner = StoreState::from(root.field::<Value>("b").expect("b"));
+    let (outer_node, inner_node) = (outer.node(), inner.node());
+
+    commit(
+        &tree,
+        &[replace(
+            "/b",
+            json!({
+                "__musubi_store_id__": ["y"],
+                "n": 1,
+                "inner": {"__musubi_store_id__": ["x"], "n": 2}
+            }),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    // Both stores were rendered, so both keep their nodes (§3.2), and `/a` keeps
+    // the placeholder its store left until the server vacates it.
+    assert!(outer.fields().is_live());
+    assert!(inner.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["y"])), Some(outer_node));
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(inner_node));
+    assert_eq!(
+        root.value(),
+        json!({
+            "__musubi_store_id__": [],
+            "a": null,
+            "b": {
+                "__musubi_store_id__": ["y"],
+                "n": 1,
+                "inner": {"__musubi_store_id__": ["x"], "n": 2}
+            }
+        })
+    );
+}
+
+#[test]
+fn an_async_rewrite_whose_result_adopts_the_reason_keeps_both_slots() {
+    // An async node's two slots are not a child list (§3.3), so the rewrite
+    // fills them one after the other — and filling `result` here adopts the
+    // store standing in `reason`, which leaves the `Null` placeholder `detach`
+    // owes the slot it vacated. `reason` was then reconciled against the
+    // snapshot, which still named the store: the write that followed found that
+    // node in the `result` slot, wrote the reason value there, and released the
+    // store the render had just asked for.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "feed": {
+            "__musubi_async__": true,
+            "status": "ok",
+            "result": null,
+            "reason": {"__musubi_store_id__": ["x"], "n": 1}
+        }
+    }));
+    let feed = AsyncState::from(tree.root::<Value>().field::<Value>("feed").expect("feed"));
+    let panel = StoreState::from(feed.reason().cast::<Value>());
+    let node = panel.node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/feed",
+            json!({
+                "__musubi_async__": true,
+                "status": "ok",
+                "result": {"__musubi_store_id__": ["x"], "n": 1},
+                "reason": null
+            }),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    // The store moved between the two slots, so §3.2 owes it its node.
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(node));
+    assert_eq!(feed.result().expect("a result").node(), node);
+    assert_eq!(feed.reason().cast::<Value>().value(), json!(null));
+    assert_eq!(
+        tree.root::<Value>().value(),
+        json!({
+            "__musubi_store_id__": [],
+            "feed": {
+                "__musubi_async__": true,
+                "status": "ok",
+                "result": {"__musubi_store_id__": ["x"], "n": 1},
+                "reason": null
+            }
+        })
+    );
+}
+
+#[test]
+fn an_async_slot_write_that_adopts_what_that_slot_held_still_lands() {
+    // One op, one slot, and the value it writes nests the store that slot is
+    // already holding — so the build adopts it and `detach` puts the `Null`
+    // placeholder in the slot the write is about to fill. The rewire looked for
+    // the node it displaced in order to work out which of the two slots to
+    // write, found neither, and wrote nothing: the value it had just built was
+    // left parented to the async node but reachable from nothing.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "feed": {
+            "__musubi_async__": true,
+            "status": "ok",
+            "result": {"__musubi_store_id__": ["x"], "n": 1},
+            "reason": null
+        }
+    }));
+    let feed = AsyncState::from(tree.root::<Value>().field::<Value>("feed").expect("feed"));
+    let panel = StoreState::from(feed.result().expect("a result"));
+    let node = panel.node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/feed/result",
+            json!({"wrap": {"__musubi_store_id__": ["x"], "n": 1}}),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(node));
+    assert_eq!(
+        feed.result()
+            .expect("a result")
+            .field::<Value>("wrap")
+            .expect("wrap")
+            .node(),
+        node
+    );
+    assert_eq!(
+        feed.result().expect("a result").value(),
+        json!({"wrap": {"__musubi_store_id__": ["x"], "n": 1}})
+    );
+}
+
 // --------------------------------------------------------------- the depth cap
 
 /// `levels` levels of nesting: `nest(1)` is a scalar, `nest(2)` is `{"n": 1}`.
@@ -2889,6 +3198,134 @@ fn a_store_and_a_plain_row_that_swap_places_keep_the_store_node() {
     assert_is_a_tree(&tree);
     assert_eq!(rows.at(1).expect("rows[1]").node(), node);
     assert_eq!(tree.store_node(&store_id(&["panel"])), Some(node));
+}
+
+#[test]
+fn a_position_rewrite_that_adopts_a_store_out_of_its_own_array_does_not_put_it_back() {
+    // One position's new value nests a store that is standing in *another*
+    // position of the same array: `detach` takes that row out of the live list
+    // and leaves the addressable `Null` §3.2 owes the op that vacates it later
+    // in the envelope. A write that rebuilt the list from a snapshot taken
+    // before the reconcile put the row straight back, and the store node then
+    // hung under two parents — the field that adopted it and the position it
+    // no longer stands in.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [
+            {"__musubi_store_id__": ["x"], "n": 1},
+            {"__musubi_store_id__": ["y"], "n": 2}
+        ]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let panel = StoreState::from(rows.at(0).expect("rows[0]"));
+    let node = panel.node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/rows/1",
+            json!({
+                "__musubi_store_id__": ["z"],
+                "inner": {"__musubi_store_id__": ["x"], "n": 1}
+            }),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    // Store `x` left by moving, not by dying: it keeps its node, its subtree
+    // and the index entry (§3.2).
+    assert!(panel.fields().is_live());
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(node));
+    assert_eq!(
+        rows.at(1)
+            .expect("rows[1]")
+            .field::<Value>("inner")
+            .expect("inner")
+            .node(),
+        node
+    );
+    // Store `y` is what the write displaced, and it unmounts.
+    assert_eq!(tree.store_node(&store_id(&["y"])), None);
+    assert_eq!(
+        rows.value(),
+        [
+            json!(null),
+            json!({
+                "__musubi_store_id__": ["z"],
+                "inner": {"__musubi_store_id__": ["x"], "n": 1}
+            })
+        ]
+    );
+
+    // The slot the adoption vacated stays addressable, which is the whole
+    // reason `detach` leaves a node there: the server vacates it in a later op.
+    commit(&tree, &[remove("/rows/0")], &[]);
+
+    assert_is_a_tree(&tree);
+    assert_eq!(rows.len(), 1);
+    assert!(panel.fields().is_live());
+}
+
+#[test]
+fn a_list_rewrite_that_adopts_a_store_out_of_a_later_position_does_not_put_it_back() {
+    // The same shape inside one whole-list `replace`: position 0's value nests
+    // the store standing at position 1, so by the time position 1 is reached the
+    // snapshot names a node that is somebody else's child now. Reconciling
+    // against it took the store's identity fast path and handed one node to two
+    // slots — and because the rebuilt list then compared *equal* to the
+    // snapshot, the write was skipped and the array kept the placeholder the
+    // same call had just released, which commit freed underneath it.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "rows": [{"hole": 1}, {"__musubi_store_id__": ["x"], "n": 1}]
+    }));
+    let rows = tree
+        .root::<Value>()
+        .field::<Vec<Value>>("rows")
+        .expect("rows");
+    let panel = StoreState::from(rows.at(1).expect("rows[1]"));
+    let node = panel.node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/rows",
+            json!([
+                {"hole": {"__musubi_store_id__": ["x"], "n": 1}},
+                {"__musubi_store_id__": ["x"], "n": 1}
+            ]),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    // The first sighting adopts; the second is the duplicate §3.2 hands a node
+    // of its own, and the index follows the node built last.
+    assert!(panel.fields().is_live());
+    assert_eq!(
+        rows.at(0)
+            .expect("rows[0]")
+            .field::<Value>("hole")
+            .expect("hole")
+            .node(),
+        node
+    );
+
+    let copy = rows.at(1).expect("rows[1]").node();
+
+    assert_ne!(copy, node);
+    assert_eq!(tree.store_node(&store_id(&["x"])), Some(copy));
+    assert_eq!(
+        rows.value(),
+        [
+            json!({"hole": {"__musubi_store_id__": ["x"], "n": 1}}),
+            json!({"__musubi_store_id__": ["x"], "n": 1})
+        ]
+    );
 }
 
 // ------------------------------------------------- settling what was adopted
