@@ -114,6 +114,47 @@ struct Journal {
     closed: bool,
 }
 
+/// What one op has already put somewhere, and may not put somewhere a second
+/// time.
+///
+/// A render that carries one `__musubi_store_id__` — or one
+/// `__musubi_stream__` — under two keys is a server bug, and this is what keeps
+/// the second sighting from *adopting* the first, which would alias one node
+/// under two parents (§3.2). The **first** sighting keeps the node it has; the
+/// second gets one of its own.
+///
+/// Scoped to the op — patch op or stream op — and not to the transaction: two
+/// ops in one envelope may legitimately move the same store, or the same
+/// collection, twice. The two halves are cleared together, by the one
+/// [`clear`](Self::clear) every op starts with, because a rule that held for
+/// stores and not for collections is exactly the asymmetry this set exists to
+/// remove.
+#[derive(Default)]
+struct Claimed {
+    /// The store ids this op has already installed somewhere. A positional
+    /// rewrite adds the ids it is going to leave standing where they are, for
+    /// the same reason.
+    stores: HashSet<StoreId>,
+    /// The collection **nodes** this op has already put somewhere: kept where
+    /// they stood, adopted, or built from nothing.
+    ///
+    /// By `NodeId` rather than by the `(owner, name)` a collection is indexed
+    /// under, because one of the three sightings is the hot path. A render
+    /// repeats every marker it has, every cycle, and the slot almost always
+    /// already holds that very collection; a `NodeId` is `Copy`, so claiming
+    /// one there costs a hash and an insert and nothing else, where the index
+    /// key would cost a `StoreId` clone and a `String` per marker per envelope.
+    collections: HashSet<NodeId>,
+}
+
+impl Claimed {
+    /// Starts a new op. The only way to empty either half.
+    fn clear(&mut self) {
+        self.stores.clear();
+        self.collections.clear();
+    }
+}
+
 /// An open transaction. Holds the tree's lock; `!Send`, and lives on whichever
 /// task drives the envelope (the actor task).
 ///
@@ -122,16 +163,8 @@ struct Journal {
 pub struct Transaction<'a> {
     arena: Option<MutexGuard<'a, Arena>>,
     journal: Journal,
-    /// The store ids this op has already installed somewhere. A render that
-    /// carries one `__musubi_store_id__` under two keys is a server bug, and
-    /// this is what keeps the second sighting from *adopting* the first — which
-    /// would alias one node under two parents (§3.2). A positional rewrite adds
-    /// the ids it is going to leave standing where they are, for the same
-    /// reason.
-    ///
-    /// Scoped to the op — patch op or stream op — not to the transaction: two
-    /// ops in one envelope may legitimately move the same store twice.
-    claimed: HashSet<StoreId>,
+    /// What this op has already placed — see [`Claimed`].
+    claimed: Claimed,
 }
 
 impl<'a> Transaction<'a> {
@@ -140,7 +173,7 @@ impl<'a> Transaction<'a> {
         Self {
             arena: Some(tree.lock()),
             journal: Journal::default(),
-            claimed: HashSet::new(),
+            claimed: Claimed::default(),
         }
     }
 
@@ -907,7 +940,9 @@ impl<'a> Transaction<'a> {
     ///
     /// A collection is adopted by the same three rules, filed under
     /// `(owner, name)` rather than under a store id — see
-    /// [`adopt_collection`](Self::adopt_collection).
+    /// [`adopt_collection`](Self::adopt_collection). Rule 2 reads by node
+    /// there: what one op may not place twice is the collection node itself,
+    /// not the key it is indexed under.
     fn reconcile_child(
         &mut self,
         parent: NodeId,
@@ -918,7 +953,7 @@ impl<'a> Transaction<'a> {
     ) -> Result<NodeId, TreeError> {
         match classify(value) {
             Shape::Store { store_id, .. } => {
-                let duplicate = !self.claimed.insert(store_id.clone());
+                let duplicate = !self.claimed.stores.insert(store_id.clone());
 
                 if let Some(node) = existing.filter(|node| self.is_store(*node, &store_id)) {
                     self.reconcile(node, value, owner, depth)?;
@@ -944,17 +979,27 @@ impl<'a> Transaction<'a> {
 
                 return self.build(Some(parent), value, owner, depth);
             }
-            // A stream marker whose slot does **not** already hold that very
-            // collection. The guard is what keeps the hot path free: a render
-            // repeats every marker it has every cycle, and that repeat must not
-            // cost an index lookup to answer.
-            Shape::Collection { name }
-                if !existing.is_some_and(|node| self.is_collection(node, name)) =>
-            {
-                if let Some(found) = self.adopt_collection(parent, existing, owner, name)? {
-                    self.reconcile(found, value, owner, depth)?;
+            Shape::Collection { name } => {
+                // Whether the slot already holds that very collection, decided
+                // under a borrow. This is what keeps the hot path free: a
+                // render repeats every marker it has every cycle, and that
+                // repeat must not cost an index lookup to answer.
+                match existing.filter(|node| self.is_collection(*node, name)) {
+                    // It does. The collection stays where it is — and this op
+                    // claims it, so a later marker for the same stream cannot
+                    // adopt it away. Without the claim the *last* sighting won,
+                    // and a sighting one level down even left the collection
+                    // reachable from two parents.
+                    Some(node) => {
+                        self.claimed.collections.insert(node);
+                    }
+                    None => {
+                        if let Some(found) = self.adopt_collection(parent, existing, owner, name)? {
+                            self.reconcile(found, value, owner, depth)?;
 
-                    return Ok(found);
+                            return Ok(found);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1198,10 +1243,21 @@ impl<'a> Transaction<'a> {
     /// store's stream reads as empty from that op onward even though the store
     /// never unmounted.
     ///
-    /// Refused for the two cases that would stop the tree being one: a node
-    /// already parented here — two markers for one key in one render is a server
-    /// bug, and the second sighting builds its own rather than becoming a second
-    /// parent — and a node the adoption would close a cycle through.
+    /// Refused for the three cases that would stop the tree being one: a node
+    /// this op has already put somewhere, a node already parented here, and a
+    /// node the adoption would close a cycle through.
+    ///
+    /// The first of those is §3.2's duplicate rule, read by node. Two markers
+    /// for one stream in one render is a server bug, and the second sighting
+    /// builds its own collection rather than becoming a second parent for the
+    /// first. "Already parented here" alone answered that only while both
+    /// sightings were direct children of one parent: an earlier key that moved
+    /// the collection one level down put it out of that test's reach, so a later
+    /// key adopted it straight back and the *last* sighting won — while the
+    /// store rule, on the same render, gives the node to the first. Worse, when
+    /// the first sighting was the slot the collection already stood in, its
+    /// parent wrote that slot back at the end of the rewrite and the collection
+    /// came out reachable from two parents.
     fn adopt_collection(
         &mut self,
         parent: NodeId,
@@ -1217,11 +1273,16 @@ impl<'a> Transaction<'a> {
             return Ok(None);
         };
 
-        if Some(found) == existing || held_by == Some(parent) || self.is_ancestor(found, parent) {
+        if Some(found) == existing
+            || self.claimed.collections.contains(&found)
+            || held_by == Some(parent)
+            || self.is_ancestor(found, parent)
+        {
             return Ok(None);
         }
 
         self.adopt(parent, found)?;
+        self.claimed.collections.insert(found);
 
         Ok(Some(found))
     }
@@ -1647,8 +1708,9 @@ impl<'a> Transaction<'a> {
     /// unmounted in the same cycle took its collection with it, so the two
     /// clients still materialize identically.
     fn apply_stream_op(&mut self, op: &StreamOp) -> Result<(), TreeError> {
-        // A stream op is an op: it may legitimately move a store that an
-        // earlier op in the same envelope already placed (§3.2).
+        // A stream op is an op: it may legitimately move a store, or a
+        // collection, that an earlier op in the same envelope already placed
+        // (§3.2).
         self.claimed.clear();
 
         let key = match op {
@@ -2053,6 +2115,11 @@ impl<'a> Transaction<'a> {
             }
             Shape::Collection { name } => {
                 self.set_collection((owner.clone(), name.to_owned()), Some(id));
+                // The third way an op places a collection, and a sighting like
+                // the other two: the index now names this node, so a later
+                // marker for the same stream would otherwise adopt away the
+                // empty collection that has just been stood up here.
+                self.claimed.collections.insert(id);
 
                 NodeKind::Collection {
                     name: Arc::from(name),
@@ -2431,7 +2498,7 @@ impl<'a> Transaction<'a> {
             .collect();
 
         for id in ids {
-            self.claimed.insert(id);
+            self.claimed.stores.insert(id);
         }
     }
 

@@ -1708,6 +1708,33 @@ and a cycle in the same way), and creates a new node only on a miss. The
 re-render of a plain marker that arrives every cycle still takes the "unchanged"
 fast path and pays no index lookup.
 
+**One op places a collection one time only.** The tree records each collection
+node that an op puts somewhere. An op puts a collection somewhere in three ways:
+it keeps the node in the slot that already holds it, it adopts the node, or it
+builds a new node. A second marker for the same stream in the same op does not
+adopt a recorded node. The first sighting keeps the collection node and its
+items. The later sighting gets a new, empty collection node, and the
+`(owner, name)` index then points to that new node. This is the rule that §3.2
+gives to a duplicate store id. The two rules are now one rule.
+
+Without this rule, the last sighting wins. A first sighting that moves the
+collection one level down puts the node out of reach of the "already a child of
+this parent" test, and a later key adopts the node back. A first sighting that
+keeps the collection in place is worse: the parent holds that node in its new
+field map, a later nested key adopts the node away, and the write-back of the
+map makes the collection reachable from two parents.
+
+The record holds node ids, not index keys. A marker that finds its collection
+already in the slot is the re-render that arrives every cycle. A node id is a
+copy type, so the record costs one hash insert for each marker and no
+allocation. An index key costs one store id clone and one string for each
+marker.
+
+The record is scoped to one op. The tree clears it at the start of each patch op
+and at the start of each stream op, together with the record of store ids of
+§3.2. Two ops in one envelope can move the same collection two times. That is
+legal.
+
 **An op that finds no slot is discarded.** The resolution uses the
 `(store_id, stream) -> NodeId` index of the tree; if the key is absent from the
 index, or points to a node that is no longer present, the op does nothing. **No

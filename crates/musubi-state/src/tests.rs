@@ -1984,6 +1984,138 @@ fn one_stream_rendered_under_two_keys_of_one_store_becomes_two_collections() {
 }
 
 #[test]
+fn one_stream_rendered_under_two_nested_keys_of_one_store_becomes_two_collections() {
+    // The same duplicate rule, with the second sighting one level down. The
+    // refusal above reads "the collection is already a child of this very
+    // parent", and a nested key is not that parent, so the second sighting
+    // adopted the collection out of the first one key later in the same
+    // rewrite.
+    //
+    // The first sighting here is the hot path — `messages` sorts before
+    // `mirror`, and the slot it names already holds that very collection — so
+    // the store keeps the collection in its rebuilt field map while `mirror`
+    // walks off with the node. That map is written back at the end of the
+    // rewrite, and the collection came out reachable from two parents.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "panel": {
+            "__musubi_store_id__": ["panel"],
+            "messages": {"__musubi_stream__": "messages"},
+            "mirror": {}
+        }
+    }));
+
+    commit(
+        &tree,
+        &[],
+        &[row_insert_op(&["panel"], "m1", json!({"id": "m1"}))],
+    );
+
+    let panel = tree.root::<Value>().field::<Value>("panel").expect("panel");
+    let messages = panel
+        .field::<Vec<Value>>("messages")
+        .expect("messages")
+        .node();
+
+    commit(
+        &tree,
+        &[replace(
+            "/panel",
+            json!({
+                "__musubi_store_id__": ["panel"],
+                "messages": {"__musubi_stream__": "messages"},
+                "mirror": {"inner": {"__musubi_stream__": "messages"}}
+            }),
+        )],
+        &[],
+    );
+
+    assert_is_a_tree(&tree);
+    // The first sighting keeps the collection node, and its items with it.
+    assert_eq!(
+        panel
+            .field::<Vec<Value>>("messages")
+            .expect("messages")
+            .node(),
+        messages
+    );
+    // The second gets a node of its own, and it is empty.
+    assert_ne!(
+        panel
+            .field::<Value>("mirror")
+            .expect("mirror")
+            .field::<Vec<Value>>("inner")
+            .expect("inner")
+            .node(),
+        messages
+    );
+    assert_eq!(
+        panel.value(),
+        json!({
+            "__musubi_store_id__": ["panel"],
+            "messages": [{"id": "m1"}],
+            "mirror": {"inner": []}
+        })
+    );
+}
+
+#[test]
+fn a_re_rendered_stream_marker_keeps_its_collection_and_its_items() {
+    // The hot path, cycle after cycle: a render repeats every marker it has,
+    // every time, and the slot already holds that very collection. Refusing a
+    // *duplicate* sighting inside one op must not make an ordinary repeat cost
+    // the collection its node, its items or a spurious notification.
+    let tree = seeded(json!({
+        "__musubi_store_id__": [],
+        "panel": {
+            "__musubi_store_id__": ["panel"],
+            "messages": {"__musubi_stream__": "messages"},
+            "n": 1
+        }
+    }));
+
+    commit(
+        &tree,
+        &[],
+        &[row_insert_op(&["panel"], "m1", json!({"id": "m1"}))],
+    );
+
+    let panel = tree.root::<Value>().field::<Value>("panel").expect("panel");
+    let messages = StreamState::from(panel.field::<Vec<Value>>("messages").expect("messages"));
+    let node = messages.node();
+    let log = Log::default();
+    let _watch = log.watch("messages", &messages.as_state().cast::<Value>());
+
+    for n in 2..=4 {
+        commit(
+            &tree,
+            &[replace(
+                "/panel",
+                json!({
+                    "__musubi_store_id__": ["panel"],
+                    "messages": {"__musubi_stream__": "messages"},
+                    "n": n
+                }),
+            )],
+            &[],
+        );
+
+        assert_is_a_tree(&tree);
+        assert_eq!(
+            panel
+                .field::<Vec<Value>>("messages")
+                .expect("messages")
+                .node(),
+            node
+        );
+        assert_eq!(messages.as_state().value(), [json!({"id": "m1"})]);
+    }
+
+    // The marker said nothing about the items, so the collection never changed.
+    assert_eq!(log.taken(), Vec::<&str>::new());
+}
+
+#[test]
 fn a_field_rewrite_that_adopts_a_store_out_of_a_later_key_does_not_put_it_back() {
     // An object rewrite walks its keys in sorted order, so `b` — whose value
     // nests store `x` — is reconciled before `z`, which is the key `x` is
@@ -2040,16 +2172,23 @@ fn a_field_rewrite_that_adopts_a_store_out_of_a_later_key_does_not_put_it_back()
 }
 
 #[test]
-fn a_field_rewrite_that_settles_back_onto_its_snapshot_still_writes_the_live_map() {
-    // The other half of the same call site: the write-back *guard* was also
-    // asked against the snapshot. A collection is adopted by its `(owner, name)`
-    // key rather than by a store id (§3.1), and there is no per-op claim on that
-    // key, so one render naming a stream twice adopts it twice — `b` takes it
-    // out of `z`, leaving the `Null` placeholder, and `z` takes it straight back
-    // out of `b`. The rebuilt map therefore came out *equal* to the snapshot,
-    // the write was skipped, and the map kept the placeholder that
-    // `release_displaced` had released one line earlier — a child id commit then
-    // freed while the node still pointed at it.
+fn a_field_rewrite_that_adopts_a_stream_out_of_a_later_key_does_not_put_it_back() {
+    // The other half of the same call site, key for key: a collection is
+    // adopted by its `(owner, name)` rather than by a store id (§3.1), and the
+    // rule it is adopted under has to be the one above. `b` takes the stream out
+    // of `z` and leaves the `Null` §3.2 owes the op that vacates it; `z` is then
+    // the second sighting of one stream in one render, and it gets a collection
+    // of its own.
+    //
+    // Both halves of this rewrite used to fail. The duplicate rule was read off
+    // the collection's *parent* — "it is already a child of this very parent" —
+    // which the move out of `z` had just made false, so `z` adopted the stream
+    // straight back and the last sighting won where the store rule gives the
+    // node to the first. And with the stream back under `z`, the rebuilt map
+    // came out equal to the snapshot the loop started from: a write-back guard
+    // asked against that snapshot skipped the write, and the map kept the
+    // placeholder `release_displaced` had released one line earlier — a child id
+    // commit then freed while the node still pointed at it.
     let tree = seeded(json!({
         "__musubi_store_id__": [],
         "wide": {"z": {"__musubi_stream__": "messages"}, "b": {}}
@@ -2078,22 +2217,21 @@ fn a_field_rewrite_that_settles_back_onto_its_snapshot_still_writes_the_live_map
     );
 
     assert_is_a_tree(&tree);
-    // The stream node itself is untouched by any of this: it moved twice and
-    // kept its items both times.
+    // The first sighting adopts and keeps the node, and its items with it; the
+    // second is the duplicate §3.2 hands a node of its own, and it is empty.
     assert!(tree.node(node).is_some());
-    assert_eq!(wide.field::<Vec<Value>>("z").expect("z").node(), node);
     assert_eq!(
-        wide.field::<Vec<Value>>("z").expect("z").value(),
-        [json!({"id": "m1"})]
+        wide.field::<Value>("b")
+            .expect("b")
+            .field::<Vec<Value>>("inner")
+            .expect("inner")
+            .node(),
+        node
     );
-    // Which of the two keys ends up holding it is decided by `adopt_collection`
-    // alone, and it has no per-op claim to consult: the *last* sighting wins,
-    // and the key the stream was taken back out of keeps the placeholder as a
-    // plain `null`. That asymmetry with the store rule is not what this test
-    // guards — what it guards is that the node the map commits is a live one.
+    assert_ne!(wide.field::<Vec<Value>>("z").expect("z").node(), node);
     assert_eq!(
         wide.value(),
-        json!({"b": {"inner": null}, "z": [{"id": "m1"}]})
+        json!({"b": {"inner": [{"id": "m1"}]}, "z": []})
     );
 }
 
