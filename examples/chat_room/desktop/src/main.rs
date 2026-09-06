@@ -9,6 +9,7 @@
 //! in another terminal.
 
 mod app;
+mod attachments;
 mod cache_store;
 mod generated;
 mod theme;

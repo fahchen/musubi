@@ -46,12 +46,15 @@
 //! disconnect flips it without a command.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AppContext, AsyncWindowContext, Context, Div, Entity, FontWeight,
-    InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement, PathPromptOptions,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription as InputSubscription,
-    Task, Window, div, linear_color_stop, linear_gradient, list, px, relative,
+    AnyElement, AppContext, AsyncWindowContext, Context, Div, Entity, FontWeight, Image,
+    ImageFormat, InteractiveElement, IntoElement, ListAlignment, ListState, ObjectFit,
+    ParentElement, PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled,
+    StyledImage, Subscription as InputSubscription, Task, Window, div, img, linear_color_stop,
+    linear_gradient, list, px, relative,
 };
 // `when` — the conditional-builder combinator gpui blanket-implements for
 // every element.
@@ -64,6 +67,7 @@ use musubi_client::{
     UploadFile, UploadHandle,
 };
 
+use crate::attachments::Previews;
 use crate::generated::chat_room::stores::chat_room_store::{
     Attach, AttachReply, ChatRoomStore, ChatRoomStoreLastSendStatus as SendStatus, Params,
     SendMessage, SetName, State as ChatState,
@@ -242,6 +246,14 @@ pub struct ChatWindow {
     /// state tree (BDR-0028) — it arrives on a separate `upload_ops` channel
     /// and lands here, so progress repaints without touching a single node.
     attachment: Option<UploadHandle>,
+    /// One thumbnail per attachment URL, plus the link a chip opens.
+    ///
+    /// `Rc` rather than a bare field because the virtualized message list hands
+    /// its row closure to gpui and not to this entity: the closure needs an
+    /// owned handle, and a per-frame clone has to be a refcount bump rather than
+    /// a copy of the map. Writes go through `Rc::make_mut`, which is the reason
+    /// the render path can hold a frame's clone while a fetch settles.
+    previews: Rc<Previews>,
     /// Held rather than detached: dropping the task cancels the mount, which
     /// is the right teardown when the window closes before the join resolves.
     /// It finishes on its own the moment the mount lands.
@@ -257,6 +269,9 @@ pub struct ChatWindow {
     _list_driver: Option<Subscription>,
     /// The upload handle's observation, which comes and goes with the handle.
     _upload_sub: Option<Subscription>,
+    /// The preview scan's observation of the collection node, hung and taken off
+    /// beside [`Self::_list_driver`] and for the same reason.
+    _preview_scan: Option<Subscription>,
     /// Held: gpui's own input-event subscriptions. A different type from the
     /// tree's, hence a different `Vec`.
     _inputs: Vec<InputSubscription>,
@@ -329,6 +344,10 @@ impl ChatWindow {
         });
 
         Self {
+            // The attachment origin is derived here, once, from the same URL
+            // the socket dials — not per chip, and not out of `MUSUBI_URL` in
+            // the render path.
+            previews: Rc::new(Previews::new(&url)),
             url,
             mount_error: None,
             state: None,
@@ -350,6 +369,7 @@ impl ChatWindow {
             _subs: Vec::new(),
             _list_driver: None,
             _upload_sub: None,
+            _preview_scan: None,
             _inputs: inputs,
         }
     }
@@ -396,8 +416,8 @@ impl ChatWindow {
             // (§3.3), so a reconnect dims the list and repaints the header
             // without touching a row; the same callback re-hangs the list
             // driver when the collection appears or goes away.
-            musubi_gpui::observe_with(&feed, window, cx, |view, _feed, _window, cx| {
-                view.rebind_rows(cx);
+            musubi_gpui::observe_with(&feed, window, cx, |view, _feed, window, cx| {
+                view.rebind_rows(window, cx);
                 cx.notify();
             }),
             // The out-of-tree liveness signal (BDR-0033), through the **same**
@@ -432,7 +452,7 @@ impl ChatWindow {
             self.set_draft(name.into(), window, cx);
         }
 
-        self.rebind_rows(cx);
+        self.rebind_rows(window, cx);
         self.watch_upload(window, cx);
         cx.notify();
     }
@@ -454,7 +474,10 @@ impl ChatWindow {
     /// lives until the root is unmounted or the server pushes it back to
     /// `null`, so the driver is installed and removed only when *that* flips.
     /// Ordinary row traffic never reaches this function (§6.3).
-    fn rebind_rows(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// The preview scan is hung on the same node, in the same place, and lives
+    /// exactly as long: it is the second thing a new collection needs.
+    fn rebind_rows(&mut self, window: &Window, cx: &mut Context<Self>) {
         let next = self.feed.as_ref().and_then(AsyncState::ok_stream);
 
         if next.as_ref().map(StreamState::node) == self.rows.as_ref().map(StreamState::node) {
@@ -464,7 +487,76 @@ impl ChatWindow {
         self._list_driver = next
             .as_ref()
             .map(|rows| musubi_gpui::drive_list(rows, &self.list, cx));
+        self._preview_scan = next.as_ref().map(|rows| {
+            musubi_gpui::observe_with(rows, window, cx, |view, rows, _window, cx| {
+                view.scan_previews(&rows, cx);
+            })
+        });
         self.rows = next;
+
+        // Subscribe first, scan second: the rows already in the collection when
+        // the driver is installed never notify again on their own.
+        if let Some(rows) = self.rows.clone() {
+            self.scan_previews(&rows, cx);
+        }
+    }
+
+    /// Starts a preview fetch for every image attachment the collection has
+    /// grown since the last scan.
+    ///
+    /// Runs off the collection node's subscription, **never** off `render`: the
+    /// render path reads [`Previews`] and draws what is already there. Only the
+    /// `attachment` subtree of each row is materialized — the bodies stay in the
+    /// tree — and [`Previews::begin`] reports each URL exactly once, so a scan
+    /// that repeats on every transaction starts no repeated work.
+    fn scan_previews(&mut self, rows: &StreamState<MessageState>, cx: &mut Context<Self>) {
+        for index in 0..rows.len() {
+            let Some(attachment) = rows
+                .at(index)
+                .and_then(|row| row.attachment().as_some())
+                .and_then(|attachment| attachment.try_value().ok())
+            else {
+                continue;
+            };
+
+            let Some((link, format)) = Rc::make_mut(&mut self.previews).begin(&attachment) else {
+                continue;
+            };
+
+            self.fetch_preview(attachment.url, link, format, cx);
+        }
+    }
+
+    /// One fetch, on the background executor, settling one cache entry.
+    ///
+    /// Detached rather than held: the work is bounded by one small file, and a
+    /// window that closes first turns the update into a no-op. Holding a `Task`
+    /// per in-flight preview would buy a cancellation nothing is waiting on.
+    fn fetch_preview(
+        &self,
+        url: String,
+        link: SharedString,
+        format: ImageFormat,
+        cx: &mut Context<Self>,
+    ) {
+        // The decode is gpui's, and it happens later, when the element first
+        // paints. This task only ever holds bytes.
+        let fetch = cx.background_executor().spawn(async move {
+            crate::attachments::fetch(&link)
+                .await
+                .map(|bytes| Arc::new(Image::from_bytes(format, bytes)))
+        });
+
+        cx.spawn(async move |view, cx| {
+            let fetched = fetch.await;
+
+            view.update(cx, |view, cx| {
+                Rc::make_mut(&mut view.previews).finish(&url, fetched);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // -------------------------------------------------------------------------
@@ -1085,9 +1177,12 @@ impl ChatWindow {
         };
 
         let me = self.poster();
+        // One refcount bump per frame, for a closure gpui owns rather than this
+        // entity. The rows read the cache; they never fill it.
+        let previews = Rc::clone(&self.previews);
 
         list(self.list.clone(), move |index, _window, _cx| {
-            message_row(&rows, index, &me, dimmed)
+            message_row(&rows, index, &me, dimmed, &previews)
         })
         .flex_1()
         .into_any_element()
@@ -1626,6 +1721,7 @@ fn message_row(
     index: usize,
     me: &str,
     dimmed: bool,
+    previews: &Previews,
 ) -> AnyElement {
     let Some(row) = rows.at(index) else {
         return div().into_any_element();
@@ -1685,7 +1781,12 @@ fn message_row(
         // `attachment` is an ordinary `Option` field on the message, not upload
         // state: by the time this row exists the entry has been consumed and
         // the handle is back to idle.
-        .children(message.attachment.as_ref().map(attachment_chip));
+        .children(
+            message
+                .attachment
+                .as_ref()
+                .map(|attachment| attachment_chip(attachment, previews)),
+        );
 
     let row = div()
         .flex()
@@ -1713,11 +1814,24 @@ fn message_row(
 /// `<a class="attachment">`: what the `attach` command moved into the example's
 /// agent, as the message row reports it.
 ///
-/// The browser client renders an `<img>` preview off `attachment.url`; this one
-/// shows the name and size, because the Musubi transport carries no images and
-/// the example is not going to grow an HTTP client to fetch one.
-fn attachment_chip(attachment: &AttachmentState) -> AnyElement {
+/// Parity with the browser client, which renders the chip as one `<a>` holding
+/// either an `<img>` or the "FILE" mark. Here the mark is swapped for the
+/// thumbnail [`Previews`] already fetched, and the whole chip — thumbnail and
+/// mark alike — opens the file with `App::open_url`, so a native window
+/// downloads a text file exactly as clicking the link in the browser does.
+///
+/// This function starts nothing. It reads the cache, clones two refcounts and
+/// draws; the fetch behind the thumbnail was started by
+/// [`ChatWindow::scan_previews`] when the row first arrived.
+fn attachment_chip(attachment: &AttachmentState, previews: &Previews) -> AnyElement {
+    let (link, image) = previews.resolve(&attachment.url);
+    let opened = link.clone();
+
     div()
+        // Stateful, because a click listener without an `ElementId` is never
+        // installed. The link is the id: attachment URLs are unique per stored
+        // blob, and it is a `SharedString` already.
+        .id(link)
         .flex()
         .flex_row()
         .items_center()
@@ -1729,20 +1843,17 @@ fn attachment_chip(attachment: &AttachmentState) -> AnyElement {
         .border_color(color(BORDER_SOFT))
         .bg(color(STAT))
         .text_color(color(INK))
+        .cursor_pointer()
+        // The stylesheet gives `.attachment` no hover rule — the browser's own
+        // link affordances cover it. A native chip has none, so it lifts to the
+        // opaque paper and the stronger hairline, both already in the palette.
+        .hover(|chip| chip.bg(color(PAPER)).border_color(color(BORDER_STRONG)))
+        .on_click(move |_event, _window, cx| cx.open_url(&opened))
         .debug_selector(|| "attachment-chip".into())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(AVATAR))
-                .flex_shrink_0()
-                .rounded(px(RADIUS))
-                .bg(color(GOLD))
-                .text_size(px(TEXT_EYEBROW))
-                .font_weight(FontWeight::BLACK)
-                .child("FILE"),
-        )
+        .child(match image {
+            Some(image) => attachment_preview(image),
+            None => attachment_mark(),
+        })
         .child(
             div()
                 .flex()
@@ -1760,6 +1871,43 @@ fn attachment_chip(attachment: &AttachmentState) -> AnyElement {
                         .child(byte_text(attachment.size.max(0) as u64)),
                 ),
         )
+        .into_any_element()
+}
+
+/// `.attachment-preview`: the thumbnail, at the mark's size so the two branches
+/// swap without moving the text beside them.
+///
+/// gpui decodes the bytes lazily, in its asset cache, the first time this
+/// paints — which is where undecodable bytes turn up, since a `200` full of
+/// something that is not a PNG is a perfectly good HTTP response. That failure
+/// has nowhere to be reported, so it is rendered: `with_fallback` puts the mark
+/// back, and the asset cache remembers the error rather than re-decoding.
+fn attachment_preview(image: Arc<Image>) -> AnyElement {
+    img(image)
+        .size(px(AVATAR))
+        .flex_shrink_0()
+        .rounded(px(RADIUS))
+        .object_fit(ObjectFit::Cover)
+        .with_fallback(attachment_mark)
+        .debug_selector(|| "attachment-preview".into())
+        .into_any_element()
+}
+
+/// `.attachment-mark`: the gold square that stands in for a file with no
+/// preview — a text file, an unreachable server, or bytes that would not decode.
+fn attachment_mark() -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(AVATAR))
+        .flex_shrink_0()
+        .rounded(px(RADIUS))
+        .bg(color(GOLD))
+        .text_size(px(TEXT_EYEBROW))
+        .font_weight(FontWeight::BLACK)
+        .debug_selector(|| "attachment-mark".into())
+        .child("FILE")
         .into_any_element()
 }
 
@@ -2234,9 +2382,9 @@ mod tests {
         json!({"op": "complete", "upload": "attachment", "store_id": [], "ref": ENTRY})
     }
 
-    /// The envelope the `attach` command produces: the row the server appended,
-    /// plus the `reset` that consuming the last entry emits.
-    fn attachment_envelope(base: u64, version: u64) -> Value {
+    /// One message row carrying `attachment`, on the ordinary stream, plus the
+    /// `reset` that consuming the last upload entry emits.
+    fn attached_envelope(base: u64, version: u64, id: &str, attachment: Value) -> Value {
         json!({
             "type": "patch",
             "root_id": ROOT,
@@ -2245,23 +2393,45 @@ mod tests {
             "ops": [],
             "stream_ops": [{
                 "op": "insert", "stream": "messages", "ref": "0", "store_id": [],
-                "item_key": "msg-msg-3", "at": 0, "limit": -100,
+                "item_key": format!("msg-{id}"), "at": 0, "limit": -100,
                 "item": {
-                    "id": "msg-3",
-                    "body": "shared musubi-attach.txt",
+                    "id": id,
+                    "body": format!("shared {}", attachment["name"].as_str().unwrap_or_default()),
                     "sender": ME,
-                    "attachment": {
-                        "name": "musubi-attach.txt",
-                        "content_type": "text/plain",
-                        "size": FILE.len(),
-                        "url": "/attachments/att-1"
-                    }
+                    "attachment": attachment
                 }
             }],
             "upload_ops": [{"op": "reset", "upload": "attachment", "store_id": []}],
             "events": []
         })
     }
+
+    /// The attachment the scripted upload produces: a text file, which is the
+    /// half of the chip that never gets a preview.
+    fn text_attachment() -> Value {
+        json!({
+            "name": "musubi-attach.txt",
+            "content_type": "text/plain",
+            "size": FILE.len(),
+            "url": "/attachments/att-1"
+        })
+    }
+
+    /// The envelope the `attach` command produces.
+    fn attachment_envelope(base: u64, version: u64) -> Value {
+        attached_envelope(base, version, "msg-3", text_attachment())
+    }
+
+    /// A 1×1 opaque PNG, small enough to write out. Real bytes rather than a
+    /// stub: gpui decodes them itself, so a placeholder would take the fallback
+    /// branch and prove nothing.
+    const PIXEL: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xb8,
+        0x1e, 0x65, 0xfa, 0x1f, 0x00, 0x05, 0xd8, 0x02, 0x66, 0x73, 0xe6, 0xc5, 0xca, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
 
     // -------------------------------------------------------------------------
     // Rig
@@ -2662,6 +2832,93 @@ mod tests {
         assert!(cx.debug_bounds("attachment-chip").is_some());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A file gpui has no decoder for keeps the plain chip — no fetch is
+    /// started for it at all — and clicking the chip hands the *absolute* URL
+    /// to the platform, built off the socket's own host.
+    #[gpui::test]
+    fn a_text_attachment_keeps_the_chip_and_opens_the_url_the_socket_implies(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut server, _chat, cx) = boot(cx);
+        let join = mount(&mut server, cx);
+
+        server.push_patch(&join, attachment_envelope(1, 2));
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("attachment-chip").is_some());
+        assert!(cx.debug_bounds("attachment-mark").is_some());
+        assert!(
+            cx.debug_bounds("attachment-preview").is_none(),
+            "a text file is never fetched and never previewed"
+        );
+
+        assert_eq!(cx.opened_url(), None);
+
+        let chip = center(cx, "attachment-chip");
+        cx.simulate_click(chip, Modifiers::none());
+        cx.run_until_parked();
+
+        // `boot` dials `ws://test.invalid/socket`, so the origin is that host
+        // with the port the scheme implies — the whole of the URL derivation,
+        // end to end, through the element the user actually clicks.
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("http://test.invalid:80/attachments/att-1")
+        );
+    }
+
+    /// An image attachment draws the thumbnail branch instead of the mark.
+    ///
+    /// The cache is seeded **before** the row arrives, which is what a
+    /// `#[gpui::test]` has in place of a server: the scan then finds the URL
+    /// already resolved and starts no fetch, so nothing here touches a socket
+    /// and nothing here is timing-dependent.
+    ///
+    /// `debug_bounds` is a per-frame-buffer record of everything that has ever
+    /// painted, not a picture of the current frame, so "the mark never painted"
+    /// is a real assertion here: neither the chip's mark branch nor the `img`
+    /// element's `with_fallback` ran.
+    #[gpui::test]
+    fn an_image_attachment_renders_a_thumbnail_instead_of_the_mark(cx: &mut TestAppContext) {
+        let (mut server, chat, cx) = boot(cx);
+        let join = mount(&mut server, cx);
+
+        let attachment = AttachmentState {
+            name: "shot.png".to_owned(),
+            content_type: "image/png".to_owned(),
+            size: PIXEL.len() as i64,
+            url: "/attachments/att-2".to_owned(),
+        };
+
+        chat.update(cx, |chat, _| {
+            Rc::make_mut(&mut chat.previews).seed(&attachment, PIXEL.to_vec());
+        });
+
+        server.push_patch(
+            &join,
+            attached_envelope(
+                1,
+                2,
+                "msg-3",
+                serde_json::to_value(&attachment).expect("the row shape serializes"),
+            ),
+        );
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("attachment-preview").is_some(),
+            "a cached image renders as a thumbnail"
+        );
+        assert!(
+            cx.debug_bounds("attachment-mark").is_none(),
+            "neither the mark branch nor the decoder's fallback ran"
+        );
+        assert!(
+            cx.debug_bounds("attachment-chip").is_some(),
+            "the name and size stay beside it, as in the browser client"
+        );
     }
 
     /// A socket that goes away flips the pill **on its own** (BDR-0033): the

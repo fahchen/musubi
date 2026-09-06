@@ -114,15 +114,17 @@ examples/chat_room/
 +     main.rs                   # Application::new().run(...), window, wiring
 +     app.rs                    # ChatWindow: the single Render entity
 +     transport.rs              # GpuiSpawner, GpuiTimer, SmolConnector, WsSocket
++     attachments.rs            # Previews: the per-URL thumbnail cache + one GET
 +     generated.rs              # COMMITTED. `mix compile.musubi_rust` output
 ```
 
-Four hand-written Rust files in the plan; **as landed** there are five —
-`theme.rs` (the flat color table §9 mentions) and `cache_store.rs` (the
-file-backed `CacheStore` of component row 10) joined the tree. `app.rs` is the
-only one that grows with UI scope; `transport.rs` is the file other gpui
-embedders will copy — as landed it is 294 lines, about 260 of them before the
-unit-test module for the URL parser.
+Four hand-written Rust files in the plan; **as landed** there are six —
+`theme.rs` (the flat color table §9 mentions), `cache_store.rs` (the
+file-backed `CacheStore` of component row 10) and `attachments.rs` (the preview
+cache and the plain-HTTP GET behind component row 11) joined the tree. `app.rs`
+is the only one that grows with UI scope; `transport.rs` is the file other gpui
+embedders will copy, and it owns the one URL parser both it and `attachments.rs`
+call.
 
 Deliberately absent:
 
@@ -412,7 +414,7 @@ server.
 | 8 | Connection pill | `Mounted::status()` (BDR-0033) over reconnect (BDR-0015) | `MountStatus` field fed by one `Subscription` |
 | 9 | Attach button + progress | `upload :attachment` in channel mode, `attach` command | `Button` + `App::prompt_for_paths` + `Upload::subscribe` |
 | 10 | Instant relaunch | SWR mount cache (`docs/rust-client.md` §6.4): `ConnectionBuilder::cache` over a durable `CacheStore` | `cache_store.rs` — one JSON file under `$HOME`, whole-map writes, corrupt-file tolerant |
-| 11 | Attachment chip on a row | the consumed entry, as plain state on `MessageState` | column inside the bubble |
+| 11 | Attachment chip on a row | the consumed entry, as plain state on `MessageState` | clickable column in the bubble: `img` thumbnail or "FILE" mark, `App::open_url` on click |
 
 ### 4.1 `ChatWindow`
 
@@ -641,6 +643,19 @@ directories: false, multiple: false, prompt })`, which returns a
 gets the dialog, and the test passes `Some(path)` for a file it wrote itself —
 everything after the path is the same code the button runs.
 
+**The chip the row grows.** The consumed entry arrives as plain state, and
+`desktop/src/attachments.rs` turns it into the same chip the browser client
+draws: a thumbnail for an image, the "FILE" mark for anything else, and
+`App::open_url` on the whole chip. The origin is derived once from the socket
+URL — `ws://host:port` becomes `http://host:port` — and the bytes come from one
+HTTP/1.1 GET over `async-net`, so the client still links no TLS stack and adds
+no HTTP dependency. `gpui::Image::from_bytes(ImageFormat, bytes)` hands the
+decode to gpui, which already depends on `image`; the crate adds no decoder of
+its own. The fetch runs once per URL, off the collection node's subscription,
+and never off `render`. Every failure — a type gpui cannot decode, a refused
+connection, a status that is not `200`, bytes that will not decode — leaves the
+mark on screen and is remembered, so a redraw starts nothing.
+
 **What this surfaced.** Channel-mode uploads had never run over a real Phoenix
 transport before this example — the wire fixtures use external mode, because a
 channel-mode token is signed per run and could not survive `git diff
@@ -758,7 +773,10 @@ certificate verifier is reachable from the Musubi path, and `authority` rejects
 `wss://` rather than downgrading silently. That is a claim about the transport,
 not about the binary: gpui's own HTTP client pulls rustls in through
 `gpui_http_client`, exactly as it pulls in tokio (§5.4). A production client
-adds `async-tls`/`rustls` here and nowhere else.
+adds `async-tls`/`rustls` here and nowhere else. The attachment previews in
+§4.6 hold the same line — plain HTTP over `async-net`, `https://` refused — and
+they reuse `authority`'s host-and-port rule through `host_port`, so the two
+paths cannot disagree about a default port or a bracketed IPv6 literal.
 
 `WsSocket` is a newtype implementing `Sink<Frame>` and
 `Stream<Item = Result<Frame, TransportError>>` by mapping

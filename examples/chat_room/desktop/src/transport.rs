@@ -236,6 +236,19 @@ fn authority(url: &str) -> Result<String, TransportError> {
         ))
     })?;
 
+    host_port(rest, DEFAULT_WS_PORT)
+        .ok_or_else(|| TransportError::connect(format!("no authority in {url}")))
+}
+
+/// Normalizes the authority of `rest` — everything after a `<scheme>://` — to
+/// `host:port`, supplying `default_port` when the URL omits one. `None` when
+/// there is no authority at all.
+///
+/// Split out of [`authority`] so that the attachment previews in
+/// [`crate::attachments`] can reuse the rule rather than write a second parser:
+/// the bracketed-IPv6 and default-port answers have to agree between the socket
+/// the app dials and the `http://` origin it derives from it.
+pub fn host_port(rest: &str, default_port: u16) -> Option<String> {
     // The authority runs to the first `/`, `?` or `#`.
     let host = rest
         .split(['/', '?', '#'])
@@ -244,7 +257,7 @@ fn authority(url: &str) -> Result<String, TransportError> {
         .trim_start_matches("//");
 
     if host.is_empty() {
-        return Err(TransportError::connect(format!("no authority in {url}")));
+        return None;
     }
 
     // An IPv6 literal is bracketed (`[::1]:4002`), so look for the port
@@ -254,10 +267,10 @@ fn authority(url: &str) -> Result<String, TransportError> {
         None => host.contains(':'),
     };
 
-    Ok(if has_port {
+    Some(if has_port {
         host.to_owned()
     } else {
-        format!("{host}:{DEFAULT_WS_PORT}")
+        format!("{host}:{default_port}")
     })
 }
 

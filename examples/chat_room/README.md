@@ -97,8 +97,8 @@ stream, one envelope after the reply (BDR-0009). Nothing about the file is read
 out of the command reply.
 
 `ChatRoomWeb.Router` serves the stored bytes at `/attachments/:id`, which is
-what `AttachmentState.url` points at, so an uploaded image renders in the
-browser client. `ui/vite.config.ts` proxies that path to port 4002 alongside
+what `AttachmentState.url` points at, so an uploaded image renders in both
+clients. `ui/vite.config.ts` proxies that path to port 4002 alongside
 `/socket`.
 
 ### In the browser
@@ -117,6 +117,14 @@ progress line repaint.
 Press **Attach file** and the native macOS open panel appears
 (`App::prompt_for_paths`). The app reads the bytes itself — `musubi-client`
 never touches a filesystem — and hands them to the crate's `Upload` handle.
+
+The row's chip matches the browser client. An image shows a thumbnail; anything
+else keeps the "FILE" mark. Click the chip and `App::open_url` opens
+`AttachmentState.url` in the system browser, which downloads a file the browser
+cannot display. `desktop/src/attachments.rs` does the fetching: it turns the
+socket's `ws://host:port` into `http://host:port`, GETs the attachment once per
+URL over `async-net`, and hands the bytes to gpui's own decoder. A fetch that
+fails leaves the mark on screen and is not retried.
 
 ## Desktop client
 
@@ -212,10 +220,12 @@ What it demonstrates, beyond what the React client already shows:
   `musubi-client-tokio` is not a dependency, and `async-tungstenite` is pinned
   to `handshake` + `futures-03-sink` with its runtime and TLS features off.
 - **The server URL** comes from `MUSUBI_URL`, defaulting to
-  `ws://127.0.0.1:4002/socket`. There is no config file. The Musubi connector
-  links no TLS stack of its own and rejects `wss://` rather than silently
-  downgrading; gpui's HTTP client brings rustls in independently, and nothing
-  on the Musubi path touches it.
+  `ws://127.0.0.1:4002/socket`. There is no config file. It is also where the
+  attachment previews get their `http://` origin, so one variable configures
+  both. The Musubi connector links no TLS stack of its own and rejects `wss://`
+  rather than silently downgrading; the preview fetcher speaks the same plain
+  HTTP over `async-net` and refuses `https://` for the same reason. gpui's HTTP
+  client brings rustls in independently, and neither path touches it.
 
 ### Reconnect demo
 
