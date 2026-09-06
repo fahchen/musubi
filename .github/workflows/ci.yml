@@ -200,3 +200,43 @@ jobs:
 
       - name: Codegen compile smoke test
         run: mix test --only rust
+
+  # `crates/musubi-gpui` is excluded from the root workspace and carries its own
+  # `[workspace]` and `Cargo.lock` (root `Cargo.toml`), so the `rust` job's
+  # `cargo test --workspace` never reaches it. Without a job of its own the
+  # adapter's suite would not run anywhere.
+  gpui:
+    name: gpui adapter (macOS)
+    # gpui links AppKit and compiles Metal shaders through `xcrun`, so this is
+    # the one leg that cannot be ubuntu. Pinned rather than `macos-latest`: the
+    # Xcode that shader build reaches for should not move under it.
+    runs-on: macos-14
+
+    defaults:
+      run:
+        working-directory: crates/musubi-gpui
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      # The detached workspace has to be named: the default would key on the
+      # root `Cargo.lock` and cache the root `target/`, neither of which this
+      # job touches. gpui is a heavy build and a cold one is the whole job
+      # budget, so the cache is not an optimization here.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/musubi-gpui
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test
