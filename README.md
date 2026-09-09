@@ -179,7 +179,8 @@ React consumers typically go through `createMusubi<Musubi.Stores>()`
 from `@musubi/react`, which binds `R` once and returns the full hook
 set — `MusubiProvider` (accepts `connection` or `socket`),
 `useMusubiConnectionStatus`, `useMusubiRoot`, `useMusubiRootSuspense`,
-`useMusubiSnapshot`, and `useMusubiCommand` (mutation-shaped:
+`useMusubiSnapshot`, `useMusubiSnapshotSuspense`, `useMusubiAsync`, and
+`useMusubiCommand` (mutation-shaped:
 `{ dispatch, isPending, error, data, reset }`). Use `keyOf(proxy)` for
 stable React list keys over child proxies.
 

@@ -11,6 +11,22 @@ not in lockstep yet; entries note which surface they affect.
 
 ## [Unreleased]
 
+### Added
+
+- **`@musubi/client`** — `waitFor(proxy, select)` and `nextSnapshot(proxy)`
+  give the sync snapshot surface a Promise form. `waitFor` re-runs the
+  selector on every patch and resolves with the first non-`undefined`
+  result; a throw from the selector rejects it, which is how an async
+  field's `failed` status surfaces. `nextSnapshot` is the shared
+  per-proxy "next patch" Promise the React Suspense hooks throw.
+- **`@musubi/react`** — `useMusubiSnapshotSuspense(proxy, selector?, equalityFn?)`
+  suspends while the store node is absent from the index instead of
+  returning `undefined`, and `useMusubiAsync(proxy, select)` suspends
+  while the selected `AsyncResult` is `loading`, throws to the nearest
+  error boundary on `failed`, and returns `data` on `ok`. Command
+  dispatch already returns a Promise and works with React 19 actions /
+  `use()` unchanged.
+
 ## [0.13.1] — 2026-08-09
 
 ### Fixed

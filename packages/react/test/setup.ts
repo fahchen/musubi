@@ -16,7 +16,7 @@ afterEach(() => {
 export class FakeStoreProxy<M extends StoreModule<R>, R> {
   readonly __musubi_store_id__: string[] = []
 
-  private snapshotValue: StoreSnapshot<M, R>
+  private snapshotValue: StoreSnapshot<M, R> | undefined
   private readonly subscribers = new Set<() => void>()
 
   readonly dispatchCalls: Array<{ name: string; payload: unknown }> = []
@@ -25,7 +25,9 @@ export class FakeStoreProxy<M extends StoreModule<R>, R> {
 
   private readonly eventHandlers = new Map<string, Set<(payload: unknown) => void>>()
 
-  constructor(initialSnapshot: StoreSnapshot<M, R>) {
+  // `undefined` models a store node absent from the index (not mounted yet, or
+  // a reconnect window that reset it) — what the Suspense hooks wait on.
+  constructor(initialSnapshot?: StoreSnapshot<M, R>) {
     this.snapshotValue = initialSnapshot
   }
 
@@ -36,7 +38,7 @@ export class FakeStoreProxy<M extends StoreModule<R>, R> {
     }
   }
 
-  snapshot = (): StoreSnapshot<M, R> => this.snapshotValue
+  snapshot = (): StoreSnapshot<M, R> | undefined => this.snapshotValue
 
   handleEvent = (name: string, handler: (payload: unknown) => void): (() => void) => {
     const handlers = this.eventHandlers.get(name) ?? new Set<(payload: unknown) => void>()
@@ -57,7 +59,7 @@ export class FakeStoreProxy<M extends StoreModule<R>, R> {
     return this.dispatchImpl(name, payload)
   }
 
-  setSnapshot(next: StoreSnapshot<M, R>): void {
+  setSnapshot(next: StoreSnapshot<M, R> | undefined): void {
     this.snapshotValue = next
     for (const listener of this.subscribers) listener()
   }

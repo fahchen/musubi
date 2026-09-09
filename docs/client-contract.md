@@ -313,6 +313,32 @@ Normalization rules:
   async `result` is the stream marker, and item content still arrives through
   `stream_ops`
 
+## Awaiting Snapshots
+
+`snapshot()` is synchronous and returns `undefined` while the store node
+is absent from the index; async fields carry their own `loading` phase.
+`@musubi/client` exposes two promise-shaped reads over that surface:
+
+```ts
+nextSnapshot<M, R>(proxy: StoreProxy<M, R>): Promise<void>
+waitFor<M, R, T>(
+  proxy: StoreProxy<M, R>,
+  select: (snapshot: StoreSnapshot<M, R> | undefined) => T | undefined
+): Promise<T>
+```
+
+- `nextSnapshot` resolves on the next patch applied to the proxy's
+  connection. Calls made before it settles share one Promise, keyed by
+  proxy identity — that stable identity is what makes it throwable from
+  a React render
+- `waitFor` re-runs `select` on every patch and resolves with the first
+  non-`undefined` result. A throw from `select` rejects the Promise,
+  which is how an async field's `failed` status surfaces
+- neither helper mounts, unmounts, or retains a store; the caller still
+  owns the mount lifetime
+- no cancellation token: a `waitFor` whose condition never holds keeps
+  one subscription alive until the next patch
+
 ## Command Errors
 
 `dispatchCommand` and the React `useMusubiCommand` dispatcher both
@@ -363,6 +389,11 @@ interface MusubiFactory<R> {
   useMusubiRoot: <M>(options: UseMusubiRootOptions<M, R>) => MusubiRootMount<M, R>
   useMusubiRootSuspense: <M>(options: UseMusubiRootOptions<M, R>) => StoreProxy<M, R>
   useMusubiSnapshot: { /* selector + optional equalityFn (defaults to shallowEqual) */ }
+  useMusubiSnapshotSuspense: { /* same shape; suspends until the node exists */ }
+  useMusubiAsync: <M, T>(
+    proxy: StoreProxy<M, R>,
+    select: (snapshot: StoreSnapshot<M, R>) => AsyncResult<T>
+  ) => T
   useMusubiCommand: <M, K>(proxy: StoreProxy<M, R>, name: K) => MusubiCommandResult<M, K, R>
 }
 
@@ -398,6 +429,17 @@ Rules:
   and a cached Error for the nearest error boundary
 - `useMusubiSnapshot` defaults `equalityFn` to `shallowEqual` when a
   selector is supplied; pass an explicit `equalityFn` to override
+- `useMusubiSnapshotSuspense` suspends while `snapshot()` is `undefined`
+  (store node absent from the index) and otherwise behaves like
+  `useMusubiSnapshot`. A selector that returns `undefined` on a present
+  snapshot does **not** suspend
+- `useMusubiAsync` suspends while the selected `AsyncResult` is
+  `loading`, throws an `Error` (`cause` = the wire reason) to the
+  nearest error boundary on `failed`, and returns `data` on `ok`. It is
+  the Suspense counterpart to reading the field's `status` by hand
+- both Suspense hooks throw the shared per-proxy Promise returned by
+  `nextSnapshot(proxy)`, which resolves on the next applied patch; the
+  identity is stable across Suspense retries
 - `useMusubiCommand` sequences concurrent `dispatch` calls with a
   monotonic request token: only the latest call's outcome lands in
   `data` / `error`; `reset()` clears both

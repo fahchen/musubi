@@ -15,6 +15,7 @@ import * as clientModule from "@musubi/client"
 import { FakeStoreProxy } from "./setup"
 
 import type {
+  AsyncResult,
   MountStoreOptions,
   MountedStore,
   MusubiConnection,
@@ -38,6 +39,13 @@ type ReactTestStores = {
       toast: { payload: { msg: string } }
     }
   >
+  "React.Test.Async": Musubi.StoreDef<
+    "React.Test.Async",
+    {
+      report: Musubi.AsyncField<string>
+    },
+    {}
+  >
 }
 
 type Root = "React.Test.Root"
@@ -50,7 +58,9 @@ const {
   useMusubiEvent,
   useMusubiRoot,
   useMusubiRootSuspense,
-  useMusubiSnapshot
+  useMusubiSnapshot,
+  useMusubiSnapshotSuspense,
+  useMusubiAsync
 } = createMusubi<ReactTestStores>()
 
 function buildProxy(title = "Inbox", counter = 0): FakeStoreProxy<Root, ReactTestStores> {
@@ -58,6 +68,15 @@ function buildProxy(title = "Inbox", counter = 0): FakeStoreProxy<Root, ReactTes
     __musubi_store_id__: [],
     title,
     counter
+  })
+}
+
+function buildAsyncProxy(
+  report: AsyncResult<string>
+): FakeStoreProxy<"React.Test.Async", ReactTestStores> {
+  return new FakeStoreProxy<"React.Test.Async", ReactTestStores>({
+    __musubi_store_id__: [],
+    report
   })
 }
 
@@ -278,6 +297,105 @@ describe("useMusubiSnapshot", () => {
 
     expect(screen.getByText("Inbox")).toBeTruthy()
     expect(renders).toBe(1)
+  })
+})
+
+describe("useMusubiSnapshotSuspense", () => {
+  test("suspends while the store node is absent, then renders", async () => {
+    const fake = new FakeStoreProxy<Root, ReactTestStores>()
+
+    function Reader() {
+      const snapshot = useMusubiSnapshotSuspense(fake.asProxy())
+      return <span>title:{snapshot.title}</span>
+    }
+
+    render(
+      <React.Suspense fallback={<span>pending</span>}>
+        <Reader />
+      </React.Suspense>
+    )
+
+    expect(screen.getByText("pending")).toBeTruthy()
+
+    await act(async () => {
+      fake.setSnapshot({ __musubi_store_id__: [], title: "Inbox", counter: 0 })
+    })
+
+    expect(screen.getByText("title:Inbox")).toBeTruthy()
+  })
+
+  test("a selector returning undefined on a ready snapshot does not suspend", () => {
+    const fake = buildProxy("Inbox", 0)
+
+    function Reader() {
+      const missing = useMusubiSnapshotSuspense(
+        fake.asProxy(),
+        (snapshot) => (snapshot.title === "Inbox" ? undefined : snapshot.title)
+      )
+      return <span>missing:{String(missing)}</span>
+    }
+
+    render(
+      <React.Suspense fallback={<span>pending</span>}>
+        <Reader />
+      </React.Suspense>
+    )
+
+    expect(screen.getByText("missing:undefined")).toBeTruthy()
+  })
+})
+
+describe("useMusubiAsync", () => {
+  test("suspends while loading, renders the value on ok", async () => {
+    const fake = buildAsyncProxy({ status: "loading", data: null, error: null })
+
+    function Reader() {
+      const report = useMusubiAsync(fake.asProxy(), (snapshot) => snapshot.report)
+      return <span>report:{report}</span>
+    }
+
+    render(
+      <React.Suspense fallback={<span>pending</span>}>
+        <Reader />
+      </React.Suspense>
+    )
+
+    expect(screen.getByText("pending")).toBeTruthy()
+
+    await act(async () => {
+      fake.setSnapshot({
+        __musubi_store_id__: [],
+        report: { status: "ok", data: "42 rows", error: null }
+      })
+    })
+
+    expect(screen.getByText("report:42 rows")).toBeTruthy()
+  })
+
+  test("throws to the error boundary on failed", async () => {
+    const fake = buildAsyncProxy({ status: "loading", data: null, error: null })
+
+    function Reader() {
+      const report = useMusubiAsync(fake.asProxy(), (snapshot) => snapshot.report)
+      return <span>report:{report}</span>
+    }
+
+    render(
+      <TestErrorBoundary>
+        <React.Suspense fallback={<span>pending</span>}>
+          <Reader />
+        </React.Suspense>
+      </TestErrorBoundary>
+    )
+
+    await act(async () => {
+      fake.setSnapshot({
+        __musubi_store_id__: [],
+        report: { status: "failed", data: null, error: { kind: "error", value: "boom" } }
+      })
+    })
+
+    expect(screen.getByText("[musubi] async field failed")).toBeTruthy()
   })
 })
 

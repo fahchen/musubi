@@ -14,6 +14,7 @@ import {
   canonicalStringify,
   connect as baseConnect,
   MusubiCommandError,
+  nextSnapshot,
   storeCacheKey,
   type ConnectOptions,
   type MountStoreOptions,
@@ -23,6 +24,7 @@ import {
   type StoreModule,
   type StoreProxy,
   type StoreSnapshot,
+  type AsyncResult,
   type CommandName,
   type CommandPayload,
   type CommandReply,
@@ -143,6 +145,18 @@ export interface MusubiFactory<R> {
       equalityFn?: (a: Selected, b: Selected) => boolean
     ): Selected
   }
+  useMusubiSnapshotSuspense: {
+    <M extends StoreModule<R>>(proxy: StoreProxy<M, R>): StoreSnapshot<M, R>
+    <M extends StoreModule<R>, Selected>(
+      proxy: StoreProxy<M, R>,
+      selector: (snapshot: StoreSnapshot<M, R>) => Selected,
+      equalityFn?: (a: Selected, b: Selected) => boolean
+    ): Selected
+  }
+  useMusubiAsync: <M extends StoreModule<R>, T>(
+    proxy: StoreProxy<M, R>,
+    select: (snapshot: StoreSnapshot<M, R>) => AsyncResult<T>
+  ) => T
   useMusubiCommand: <M extends StoreModule<R>, K extends CommandName<M, R>>(
     proxy: StoreProxy<M, R>,
     name: K
@@ -529,6 +543,63 @@ export function createMusubi<R>(): MusubiFactory<R> {
 
   const useMusubiSnapshot = useMusubiSnapshotImpl as MusubiFactory<R>["useMusubiSnapshot"]
 
+  function useMusubiSnapshotSuspenseImpl<M extends StoreModule<R>, Selected>(
+    proxy: StoreProxy<M, R>,
+    selector?: (snapshot: StoreSnapshot<M, R>) => Selected,
+    equalityFn?: (a: Selected, b: Selected) => boolean
+  ): Selected | StoreSnapshot<M, R> {
+    type Value = Selected | StoreSnapshot<M, R> | typeof NOT_READY
+
+    // Mirror the sync hook's defaults: shallowEqual only when the caller
+    // supplies a selector, plain identity otherwise (snapshots are cached
+    // per store, so identity is already the right granularity).
+    const resolvedEquality = (equalityFn ?? (selector ? shallowEqual : Object.is)) as (
+      a: Value,
+      b: Value
+    ) => boolean
+
+    const selected = useMusubiSnapshotImpl<M, Value>(
+      proxy,
+      (snapshot) =>
+        snapshot === undefined ? NOT_READY : selector ? selector(snapshot) : snapshot,
+      resolvedEquality
+    ) as Value
+
+    // Sentinel rather than `undefined`: a selector may legitimately select an
+    // absent field, and that must not suspend forever.
+    if (selected === NOT_READY) {
+      throw nextSnapshot(proxy)
+    }
+
+    return selected as Selected | StoreSnapshot<M, R>
+  }
+
+  const useMusubiSnapshotSuspense =
+    useMusubiSnapshotSuspenseImpl as MusubiFactory<R>["useMusubiSnapshotSuspense"]
+
+  function useMusubiAsync<M extends StoreModule<R>, T>(
+    proxy: StoreProxy<M, R>,
+    select: (snapshot: StoreSnapshot<M, R>) => AsyncResult<T>
+  ): T {
+    const result = useMusubiSnapshotImpl<M, AsyncResult<T> | undefined>(
+      proxy,
+      (snapshot) => (snapshot === undefined ? undefined : select(snapshot)),
+      shallowEqual as (a: AsyncResult<T> | undefined, b: AsyncResult<T> | undefined) => boolean
+    ) as AsyncResult<T> | undefined
+
+    if (result === undefined || result.status === "loading") {
+      throw nextSnapshot(proxy)
+    }
+
+    if (result.status === "failed") {
+      // ponytail: plain Error carrying the wire reason as `cause`. Add a typed
+      // MusubiAsyncError once a caller needs to branch on `kind`.
+      throw new Error("[musubi] async field failed", { cause: result.error })
+    }
+
+    return result.data
+  }
+
   function useMusubiCommand<M extends StoreModule<R>, K extends CommandName<M, R>>(
     proxy: StoreProxy<M, R>,
     name: K
@@ -617,10 +688,17 @@ export function createMusubi<R>(): MusubiFactory<R> {
     useMusubiRoot,
     useMusubiRootSuspense,
     useMusubiSnapshot,
+    useMusubiSnapshotSuspense,
+    useMusubiAsync,
     useMusubiCommand,
     useMusubiEvent
   }
 }
+
+// Marks "store node absent from the index" inside a selector result, so the
+// Suspense snapshot hook can tell it apart from a selector that returned
+// `undefined` on a ready snapshot.
+const NOT_READY = Symbol("musubi.not-ready")
 
 // ---------------------------------------------------------------------------
 // Shared mount ref-counting across hook callers
