@@ -47,6 +47,30 @@ Dispatch a declared command:
 await dashboard.dispatchCommand("refresh", {})
 ```
 
+State arrives over time: `snapshot()` returns `undefined` until the store
+node lands in the index, and async fields sit in `status: "loading"`
+first. `waitFor` turns that into a Promise — it re-runs the selector on
+every change affecting that store and resolves with the first
+non-`undefined` result:
+
+```ts
+import { waitFor } from "@musubi/client"
+
+const title = await waitFor(dashboard, (snapshot) => snapshot?.header.title)
+
+// Async field: throw from the selector to reject on `failed`.
+const polls = await waitFor(dashboard, (snapshot) => {
+  const result = snapshot?.polls
+  if (result?.status === "failed") throw new Error("polls failed to load")
+  return result?.status === "ok" ? result.data : undefined
+})
+```
+
+`nextSnapshot(proxy)` is the lower-level primitive: one shared Promise
+per proxy that resolves on the next change affecting that store. Both
+are store-scoped — a patch touching only a sibling store does not wake
+them.
+
 Unmount when the root is no longer needed by calling the `unmount`
 closure returned from `mountStore`:
 
@@ -206,6 +230,48 @@ export function DashboardPage() {
   )
 }
 ```
+
+### Suspending On Snapshots And Async Fields
+
+Mounting is not the only wait. After the root resolves, a child store node
+can still be absent, and an async field starts out `loading`. Two hooks
+suspend on those instead of making every component branch on
+`undefined` / `status`:
+
+```tsx
+import { Suspense } from "react"
+import { useMusubiAsync, useMusubiSnapshotSuspense } from "./musubi"
+
+function Header({ store }) {
+  // Suspends while `store.snapshot()` is undefined. Same selector +
+  // equalityFn shape as `useMusubiSnapshot`.
+  const title = useMusubiSnapshotSuspense(store, (snapshot) => snapshot.title)
+  return <h1>{title}</h1>
+}
+
+function Report({ store }) {
+  // Suspends while `report` is loading; throws to the nearest error
+  // boundary when it is `failed`; returns `data` on `ok`.
+  const report = useMusubiAsync(store, (snapshot) => snapshot.report)
+  return <ReportTable rows={report} />
+}
+
+function Dashboard({ store }) {
+  return (
+    <Suspense fallback={<Spinner />}>
+      <Header store={store} />
+      <Report store={store} />
+    </Suspense>
+  )
+}
+```
+
+A selector that returns `undefined` on a **present** snapshot does not
+suspend — only an absent store node does. That keeps optional fields
+readable through the Suspense hook.
+
+Both hooks suspend on the shared `nextSnapshot(proxy)` Promise, so a
+Suspense retry never re-arms a new waiter.
 
 ## Stale-While-Revalidate Cache
 
@@ -401,6 +467,26 @@ async function onSubmit() {
 }
 ```
 
+`dispatch` already returns a Promise, so it drops straight into React 19
+actions and `use()` — no separate Suspense hook is needed for commands:
+
+```tsx
+const { dispatch } = useMusubiCommand(cart, "checkout")
+
+// `isPending` here comes from React; the hook's own `isPending` still
+// works if you prefer it.
+const [error, submit, isPending] = useActionState(async () => {
+  try {
+    await dispatch({})
+    return null
+  } catch (e) {
+    return MusubiCommandError.is(e) ? e.message : "Checkout failed"
+  }
+}, null)
+
+return <form action={submit}>{/* ... */}</form>
+```
+
 ## Push Events
 
 The server can push transient, fire-and-forget events to the client (a toast, a
@@ -550,3 +636,6 @@ type AsyncResult<T> =
 
 Streams are materialized as arrays. The server sends stream ops; the client
 owns list materialization and limit trimming.
+
+Read them synchronously by branching on `status`, or let a component
+suspend on `ok` with `useMusubiAsync` (React) / `waitFor` (plain TS).

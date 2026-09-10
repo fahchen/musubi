@@ -24,6 +24,7 @@ export type {
 } from "./cache"
 
 export { applyPatch, parsePointer } from "./patch"
+export { nextSnapshot, waitFor } from "./wait"
 export { applyStreamOps, getStream, pruneStreams } from "./streams"
 export { applyUploadOps, getUploadHandle, pruneUploads, UploadHandleImpl } from "./uploads"
 
