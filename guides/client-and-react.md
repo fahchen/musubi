@@ -50,7 +50,8 @@ await dashboard.dispatchCommand("refresh", {})
 State arrives over time: `snapshot()` returns `undefined` until the store
 node lands in the index, and async fields sit in `status: "loading"`
 first. `waitFor` turns that into a Promise — it re-runs the selector on
-every patch and resolves with the first non-`undefined` result:
+every change affecting that store and resolves with the first
+non-`undefined` result:
 
 ```ts
 import { waitFor } from "@musubi/client"
@@ -66,7 +67,9 @@ const polls = await waitFor(dashboard, (snapshot) => {
 ```
 
 `nextSnapshot(proxy)` is the lower-level primitive: one shared Promise
-per proxy that resolves on the next applied patch.
+per proxy that resolves on the next change affecting that store. Both
+are store-scoped — a patch touching only a sibling store does not wake
+them.
 
 Unmount when the root is no longer needed by calling the `unmount`
 closure returned from `mountStore`:

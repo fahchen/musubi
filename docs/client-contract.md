@@ -327,17 +327,19 @@ waitFor<M, R, T>(
 ): Promise<T>
 ```
 
-- `nextSnapshot` resolves on the next patch applied to the proxy's
-  connection. Calls made before it settles share one Promise, keyed by
-  proxy identity — that stable identity is what makes it throwable from
-  a React render
-- `waitFor` re-runs `select` on every patch and resolves with the first
-  non-`undefined` result. A throw from `select` rejects the Promise,
-  which is how an async field's `failed` status surfaces
+- `nextSnapshot` resolves on the next change that affects the proxy —
+  its own node, streams, or uploads. A patch touching only a sibling
+  store does not resolve it. Calls made before it settles share one
+  Promise, keyed by proxy identity — that stable identity is what makes
+  it throwable from a React render
+- `waitFor` re-runs `select` on every change that affects the proxy and
+  resolves with the first non-`undefined` result. A throw from `select`
+  rejects the Promise, which is how an async field's `failed` status
+  surfaces
 - neither helper mounts, unmounts, or retains a store; the caller still
   owns the mount lifetime
 - no cancellation token: a `waitFor` whose condition never holds keeps
-  one subscription alive until the next patch
+  one subscription alive until the next change to that store
 
 ## Command Errors
 
@@ -438,8 +440,8 @@ Rules:
   nearest error boundary on `failed`, and returns `data` on `ok`. It is
   the Suspense counterpart to reading the field's `status` by hand
 - both Suspense hooks throw the shared per-proxy Promise returned by
-  `nextSnapshot(proxy)`, which resolves on the next applied patch; the
-  identity is stable across Suspense retries
+  `nextSnapshot(proxy)`, which resolves on the next change affecting
+  that proxy; the identity is stable across Suspense retries
 - `useMusubiCommand` sequences concurrent `dispatch` calls with a
   monotonic request token: only the latest call's outcome lands in
   `data` / `error`; `reset()` clears both

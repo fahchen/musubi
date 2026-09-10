@@ -31,6 +31,19 @@ describe("nextSnapshot", () => {
     expect(fake.subscriberCount).toBe(0)
     expect(nextSnapshot(fake.proxy)).not.toBe(first)
   })
+
+  test("does not cache a promise that settled during subscribe", async () => {
+    // Guards the sync-notify path: `settle()` runs inside the promise executor,
+    // so a naive `set()` after the constructor re-caches an already-settled
+    // promise and every later waiter resolves instantly.
+    const fake = fakeProxy(undefined, { notifyOnSubscribe: true })
+
+    const first = nextSnapshot(fake.proxy)
+    await first
+
+    expect(fake.subscriberCount).toBe(0)
+    expect(nextSnapshot(fake.proxy)).not.toBe(first)
+  })
 })
 
 describe("waitFor", () => {
@@ -94,7 +107,10 @@ type FakeProxy = {
   readonly subscriberCount: number
 }
 
-function fakeProxy(initial?: { title: string; report?: AsyncResult<string> }): FakeProxy {
+function fakeProxy(
+  initial?: { title: string; report?: AsyncResult<string> },
+  options?: { notifyOnSubscribe?: boolean }
+): FakeProxy {
   const subscribers = new Set<() => void>()
   let snapshot: Snapshot | undefined = initial ? buildSnapshot(initial) : undefined
 
@@ -102,6 +118,8 @@ function fakeProxy(initial?: { title: string; report?: AsyncResult<string> }): F
     __musubi_store_id__: [],
     subscribe(listener: () => void): () => void {
       subscribers.add(listener)
+      // Models a transport that notifies from inside `subscribe` itself.
+      if (options?.notifyOnSubscribe) listener()
       return () => {
         subscribers.delete(listener)
       }

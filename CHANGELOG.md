@@ -15,10 +15,12 @@ not in lockstep yet; entries note which surface they affect.
 
 - **`@musubi/client`** — `waitFor(proxy, select)` and `nextSnapshot(proxy)`
   give the sync snapshot surface a Promise form. `waitFor` re-runs the
-  selector on every patch and resolves with the first non-`undefined`
-  result; a throw from the selector rejects it, which is how an async
-  field's `failed` status surfaces. `nextSnapshot` is the shared
-  per-proxy "next patch" Promise the React Suspense hooks throw.
+  selector on every change affecting that store and resolves with the
+  first non-`undefined` result; a throw from the selector rejects it,
+  which is how an async field's `failed` status surfaces. `nextSnapshot`
+  is the shared per-proxy "next change" Promise the React Suspense hooks
+  throw. Both are store-scoped: a patch touching only a sibling store
+  does not wake them.
 - **`@musubi/react`** — `useMusubiSnapshotSuspense(proxy, selector?, equalityFn?)`
   suspends while the store node is absent from the index instead of
   returning `undefined`, and `useMusubiAsync(proxy, select)` suspends
